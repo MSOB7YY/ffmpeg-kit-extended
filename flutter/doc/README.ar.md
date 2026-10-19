@@ -13,7 +13,7 @@
 [الإنجليزية](../README.md) | [Español](README.es.md) | [简体中文](README.zh-CN.md) | [हिन्दी](README.hi.md) | **العربية** | [Français](README.fr.md) | [Português (Brasil)](README.pt-BR.md) | [日本語](README.ja.md)
 
 
-`ffmpeg-kit-extended` هو إضافة Flutter شاملة لتنفيذ أوامر `FFmpeg` و`FFprobe` و`FFplay` باستخدام `9.0.1 API` على `Android` و`iOS` و`macOS` و`Linux` و`Windows`. يستخدم Dart `FFI` للتعامل مباشرة مع مكتبات FFmpeg الأصلية، مما يوفر أداءً عاليًا ومرونة وقدرات كاملة لتشغيل الفيديو.
+`ffmpeg-kit-extended` هو إضافة Flutter شاملة لتنفيذ أوامر `FFmpeg` و`FFprobe` و`FFplay` باستخدام `9.0.2 API` على `Android` و`iOS` و`macOS` و`Linux` و`Windows`. يستخدم Dart `FFI` للتعامل مباشرة مع مكتبات FFmpeg الأصلية، مما يوفر أداءً عاليًا ومرونة وقدرات كاملة لتشغيل الفيديو.
 تستخدم إصدارات Web تقنية WebAssembly في Flutter مع واجهة API العامة نفسها؛ بينما تستخدم المنصات الأصلية Dart FFI.
 
 إذا أعجبك المشروع وتستخدمه في تطبيقك، ضع ⭐ على [ffmpeg-kit-builders](https://github.com/akashskypatel/ffmpeg-kit-builders) و[ffmpeg-kit-extended](https://github.com/akashskypatel/ffmpeg-kit-extended)، وضع 👍 على [pub.dev](https://pub.dev/packages/ffmpeg_kit_extended_flutter).
@@ -26,7 +26,7 @@
   - **iOS وmacOS**: تشغيل فيديو عالي الأداء باستخدام `CVPixelBuffer` وتكامل Metal.
   - **Linux**: يستخدم أسطح مخزن البكسل Flutter مع استدعاءات الإطارات.
 - **Web (Wasm)**: ينزّل حزمة wasm32 المطابقة عبر خطاف البناء، ويعرض إطارات FFplay بصيغة RGBA باستخدام واجهة surface API الموحدة في Flutter. استخدم `flutter build web --wasm`.
-- **`FFmpeg` و`FFprobe` و`FFplay`**: دعم [أحدث `9.0.1 API`](https://www.ffmpeg.org/download.html) لمعالجة الوسائط، واسترجاع المعلومات، وتشغيل الصوت/الفيديو.
+- **`FFmpeg` و`FFprobe` و`FFplay`**: دعم [أحدث `9.0.2 API`](https://www.ffmpeg.org/download.html) لمعالجة الوسائط، واسترجاع المعلومات، وتشغيل الصوت/الفيديو.
 - **تشغيل الفيديو**: تشغيل فيديو كامل متعدد المنصات باستخدام API موحد للسطح.
 - **البث في الوقت الحقيقي**: تدفقات لموضع التشغيل وأبعاد الفيديو لمراقبة التشغيل المباشر.
 - **Dart FFI**: روابط أصلية مباشرة لأفضل أداء.

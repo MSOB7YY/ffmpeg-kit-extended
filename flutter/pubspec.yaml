@@ -1,10 +1,10 @@
 name: ffmpeg_kit_extended_flutter
-description: A comprehensive Flutter plugin for executing FFmpeg, FFprobe, and FFplay commands using FFmpeg 9.0.1 API. Supports Android, iOS, macOS, Linux, Windows, and WebAssembly web builds.
+description: A comprehensive Flutter plugin for executing FFmpeg, FFprobe, and FFplay commands using FFmpeg 9.0.2 API. Supports Android, iOS, macOS, Linux, Windows, and WebAssembly web builds.
 repository: https://github.com/akashskypatel/ffmpeg-kit-extended
 issue_tracker: https://github.com/akashskypatel/ffmpeg-kit-extended/issues
 homepage: https://github.com/akashskypatel/ffmpeg-kit-extended
 documentation: https://github.com/akashskypatel/ffmpeg-kit-extended/tree/master/flutter/doc
-version: 1.0.0
+version: 1.0.1
 
 # Explicit platform overrides select their artifact directly, independently
 # of the automatic type/gpl/small bundle selectors.

@@ -12,7 +12,7 @@
 
 [अंग्रेज़ी](../README.md) | [Español](README.es.md) | [简体中文](README.zh-CN.md) | **हिन्दी** | [العربية](README.ar.md) | [Français](README.fr.md) | [Português (Brasil)](README.pt-BR.md) | [日本語](README.ja.md)
 
-`ffmpeg-kit-extended` एक व्यापक Flutter प्लगइन है, जिससे `Android`, `iOS`, `macOS`, `Linux` और `Windows` पर `FFmpeg`, `FFprobe` और `FFplay` के `9.0.1 API` कमांड चलाए जा सकते हैं। यह Dart `FFI` के माध्यम से मूल FFmpeg पुस्तकालयों से सीधे संपर्क करता है, जिससे उच्च प्रदर्शन, लचीलापन और पूर्ण वीडियो-प्लेबैक क्षमता मिलती है।
+`ffmpeg-kit-extended` एक व्यापक Flutter प्लगइन है, जिससे `Android`, `iOS`, `macOS`, `Linux` और `Windows` पर `FFmpeg`, `FFprobe` और `FFplay` के `9.0.2 API` कमांड चलाए जा सकते हैं। यह Dart `FFI` के माध्यम से मूल FFmpeg पुस्तकालयों से सीधे संपर्क करता है, जिससे उच्च प्रदर्शन, लचीलापन और पूर्ण वीडियो-प्लेबैक क्षमता मिलती है।
 Web बिल्ड Flutter WebAssembly का उपयोग करते हैं और वही सार्वजनिक API प्रदान करते हैं; मूल प्लेटफ़ॉर्म Dart FFI का उपयोग करते हैं।
 
 यदि आपको यह परियोजना उपयोगी लगती है और आप इसे अपने ऐप में इस्तेमाल कर रहे हैं, तो [ffmpeg-kit-builders](https://github.com/akashskypatel/ffmpeg-kit-builders) और [ffmpeg-kit-extended](https://github.com/akashskypatel/ffmpeg-kit-extended) पर ⭐ दें, और [pub.dev](https://pub.dev/packages/ffmpeg_kit_extended_flutter) पर 👍 दें। इससे बहुत मदद मिलती है 🙏! कोडिंग का आनंद लें 🚀!
@@ -25,7 +25,7 @@ Web बिल्ड Flutter WebAssembly का उपयोग करते ह�
   - **iOS और macOS**: `CVPixelBuffer` और Metal एकीकरण के साथ उच्च-प्रदर्शन वीडियो प्लेबैक।
   - **Linux**: Flutter pixel-buffer textures और frame callbacks का उपयोग करता है।
 - **Web (Wasm)**: बिल्ड हुक के दौरान संबंधित wasm32 बंडल डाउनलोड करता है और Flutter की एकीकृत surface API के माध्यम से FFplay RGBA फ़्रेम रेंडर करता है। `flutter build web --wasm` का उपयोग करें।
-- **`FFmpeg`, `FFprobe` और `FFplay`**: मीडिया संसाधन, जानकारी निकालने और ऑडियो/वीडियो चलाने के लिए [नवीनतम `9.0.1 API`](https://www.ffmpeg.org/download.html) समर्थन।
+- **`FFmpeg`, `FFprobe` और `FFplay`**: मीडिया संसाधन, जानकारी निकालने और ऑडियो/वीडियो चलाने के लिए [नवीनतम `9.0.2 API`](https://www.ffmpeg.org/download.html) समर्थन।
 - **वीडियो प्लेबैक**: एकीकृत सर्फ़ेस API के साथ पूर्ण बहु-प्लेटफ़ॉर्म वीडियो प्लेबैक।
 - **रीयल-टाइम स्ट्रीमिंग**: लाइव प्लेबैक निगरानी के लिए स्थिति और वीडियो-आयाम स्ट्रीम।
 - **Dart FFI**: सर्वोत्तम प्रदर्शन के लिए प्रत्यक्ष मूल बाइंडिंग।

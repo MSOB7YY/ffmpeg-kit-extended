@@ -13,7 +13,7 @@
 [Anglais](../README.md) | [Español](README.es.md) | [简体中文](README.zh-CN.md) | [हिन्दी](README.hi.md) | [العربية](README.ar.md) | **Français** | [Português (Brasil)](README.pt-BR.md) | [日本語](README.ja.md)
 
 
-`ffmpeg-kit-extended` est une extension Flutter complète permettant d’exécuter des commandes de l’`API 9.0.1` de `FFmpeg`, `FFprobe` et `FFplay` sur `Android`, `iOS`, `macOS`, `Linux` et `Windows`. Elle utilise `FFI` de Dart pour interagir directement avec les bibliothèques natives FFmpeg, avec de hautes performances, de la flexibilité et une prise en charge complète de la lecture vidéo.
+`ffmpeg-kit-extended` est une extension Flutter complète permettant d’exécuter des commandes de l’`API 9.0.2` de `FFmpeg`, `FFprobe` et `FFplay` sur `Android`, `iOS`, `macOS`, `Linux` et `Windows`. Elle utilise `FFI` de Dart pour interagir directement avec les bibliothèques natives FFmpeg, avec de hautes performances, de la flexibilité et une prise en charge complète de la lecture vidéo.
 Les compilations Web utilisent WebAssembly de Flutter avec la même API publique; les plateformes natives utilisent Dart FFI.
 
 Si vous aimez le projet et l’utilisez dans votre application, ajoutez une ⭐ à [ffmpeg-kit-builders](https://github.com/akashskypatel/ffmpeg-kit-builders) et [ffmpeg-kit-extended](https://github.com/akashskypatel/ffmpeg-kit-extended), ainsi qu’un 👍 sur [pub.dev](https://pub.dev/packages/ffmpeg_kit_extended_flutter).
@@ -26,7 +26,7 @@ Si vous aimez le projet et l’utilisez dans votre application, ajoutez une ⭐ 
   - **iOS et macOS** : lecture vidéo haute performance avec `CVPixelBuffer` et intégration Metal.
   - **Linux** : utilise des textures de tampon de pixels Flutter avec des callbacks d’images.
 - **Web (Wasm)** : télécharge le paquet wasm32 correspondant pendant le mécanisme de compilation et restitue les images RGBA de FFplay via l’API de surface Flutter unifiée. Utilisez `flutter build web --wasm`.
-- **`FFmpeg`, `FFprobe` et `FFplay`** : prise en charge de la [dernière `API 9.0.1`](https://www.ffmpeg.org/download.html) pour la manipulation multimédia, l’extraction d’informations et la lecture audio/vidéo.
+- **`FFmpeg`, `FFprobe` et `FFplay`** : prise en charge de la [dernière `API 9.0.2`](https://www.ffmpeg.org/download.html) pour la manipulation multimédia, l’extraction d’informations et la lecture audio/vidéo.
 - **Lecture vidéo** : lecture vidéo multiplateforme complète avec une API de surface unifiée.
 - **Diffusion en temps réel** : flux de position et de dimensions vidéo pour un suivi en direct.
 - **Dart FFI** : liaisons natives directes pour des performances optimales.

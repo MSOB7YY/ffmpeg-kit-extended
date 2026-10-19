@@ -16,7 +16,7 @@
 
 </div>
 
-`ffmpeg-kit-extended` is a comprehensive Flutter plugin for executing `FFmpeg`, `FFprobe`, and `FFplay` `9.0.1 API` commands on `Android`, `iOS`, `macOS`, `Linux`, `Windows`, and WebAssembly web builds. Native platforms use Dart `FFI` to interact directly with FFmpeg libraries.
+`ffmpeg-kit-extended` is a comprehensive Flutter plugin for executing `FFmpeg`, `FFprobe`, and `FFplay` `9.0.2 API` commands on `Android`, `iOS`, `macOS`, `Linux`, `Windows`, and WebAssembly web builds. Native platforms use Dart `FFI` to interact directly with FFmpeg libraries.
 
 The current minimum requirements are Flutter **3.47.0** and Dart **3.12.0**.
 
@@ -35,7 +35,7 @@ If you like the project and are using it in your app give it a ⭐ on [ffmpeg-ki
     - Supported artifact architectures are `arm64` and `x86_64`.
   - **Windows**: Supported artifact architectures are `arm64` and `x86_64`.
   - **Web**: Stages the configured base/small/LGPL `wasm32` runtime through the Flutter build hook and renders FFplay RGBA frames through the unified Flutter surface API. Build with `flutter build web --wasm`.
-- **`FFmpeg`, `FFprobe` & `FFplay`**: [Latest `9.0.1 API`](https://www.ffmpeg.org/download.html) support for media manipulation, information retrieval, and audio/video playback.
+- **`FFmpeg`, `FFprobe` & `FFplay`**: [Latest `9.0.2 API`](https://www.ffmpeg.org/download.html) support for media manipulation, information retrieval, and audio/video playback.
 - **Video Playback**: Complete cross-platform video playback with unified surface API.
 - **Real-time Streaming**: Position and video dimension streams for live playback monitoring.
 - **Dart FFI**: Direct native bindings for optimal performance.

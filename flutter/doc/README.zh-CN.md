@@ -13,7 +13,7 @@
 [英文](../README.md) | [Español](README.es.md) | **简体中文** | [हिन्दी](README.hi.md) | [العربية](README.ar.md) | [Français](README.fr.md) | [Português (Brasil)](README.pt-BR.md) | [日本語](README.ja.md)
 
 
-`ffmpeg-kit-extended` 是一个完整的 Flutter 插件，可在 `Android`、`iOS`、`macOS`、`Linux` 和 `Windows` 上执行 `FFmpeg`、`FFprobe` 与 `FFplay` 的 `9.0.1 API` 命令。它使用 Dart `FFI` 直接与原生 FFmpeg 库交互，提供高性能、灵活性以及完整的视频播放能力。
+`ffmpeg-kit-extended` 是一个完整的 Flutter 插件，可在 `Android`、`iOS`、`macOS`、`Linux` 和 `Windows` 上执行 `FFmpeg`、`FFprobe` 与 `FFplay` 的 `9.0.2 API` 命令。它使用 Dart `FFI` 直接与原生 FFmpeg 库交互，提供高性能、灵活性以及完整的视频播放能力。
 Web 构建使用 Flutter WebAssembly，并提供相同的公共 API；原生平台使用 Dart FFI。
 
 如果你喜欢这个项目并在应用中使用它，请在 [ffmpeg-kit-builders](https://github.com/akashskypatel/ffmpeg-kit-builders) 和 [ffmpeg-kit-extended](https://github.com/akashskypatel/ffmpeg-kit-extended) 上点 ⭐，并在 [pub.dev](https://pub.dev/packages/ffmpeg_kit_extended_flutter) 上点 👍。
@@ -26,7 +26,7 @@ Web 构建使用 Flutter WebAssembly，并提供相同的公共 API；原生平�
   - **iOS 与 macOS**：通过 `CVPixelBuffer` 和 Metal 集成实现高性能视频播放。
   - **Linux**：使用带帧回调的 Flutter 像素缓冲纹理。
 - **Web (Wasm)**：构建钩子会下载匹配的 wasm32 软件包，并通过 Flutter 统一的 surface API 渲染 FFplay RGBA 帧。请使用 `flutter build web --wasm`。
-- **`FFmpeg`、`FFprobe` 和 `FFplay`**：支持最新 [`9.0.1 API`](https://www.ffmpeg.org/download.html)，用于媒体处理、信息读取以及音视频播放。
+- **`FFmpeg`、`FFprobe` 和 `FFplay`**：支持最新 [`9.0.2 API`](https://www.ffmpeg.org/download.html)，用于媒体处理、信息读取以及音视频播放。
 - **视频播放**：使用统一 surface API 的完整跨平台视频播放。
 - **实时流**：提供播放位置和视频尺寸流，便于实时监控。
 - **Dart FFI**：直接原生绑定，以获得最佳性能。

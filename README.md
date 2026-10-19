@@ -16,7 +16,7 @@
 
 </div>
 
-`ffmpeg-kit-extended` is a comprehensive Flutter and React-native plugin for executing `FFmpeg`, `FFprobe`, and `FFplay` `9.0.1 API` commands on `Android`, `iOS`, `macOS`, `Linux`, `Windows`, and Flutter WebAssembly builds. Flutter Web uses the same Dart SDK and public API as native platforms; only the platform integration layer differs. Native Flutter platforms use Dart `FFI`, while Web uses generated Wasm bindings and Emscripten memory.
+`ffmpeg-kit-extended` is a comprehensive Flutter and React-native plugin for executing `FFmpeg`, `FFprobe`, and `FFplay` `9.0.2 API` commands on `Android`, `iOS`, `macOS`, `Linux`, `Windows`, and Flutter WebAssembly builds. Flutter Web uses the same Dart SDK and public API as native platforms; only the platform integration layer differs. Native Flutter platforms use Dart `FFI`, while Web uses generated Wasm bindings and Emscripten memory.
 
 If you like the project and are using it in your app give it a ⭐ on [ffmpeg-kit-builders](https://github.com/akashskypatel/ffmpeg-kit-builders) and [ffmpeg-kit-extended](https://github.com/akashskypatel/ffmpeg-kit-extended), and a 👍 on [pub.dev](https://pub.dev/packages/ffmpeg_kit_extended_flutter). It helps a lot 🙏! Happy coding 🚀!
 
@@ -32,7 +32,7 @@ If you like the project and are using it in your app give it a ⭐ on [ffmpeg-ki
   - **Linux**: Full video playback support with `OpenGL` integration.
     - **arm64**: `arm64` architecture currently not supported, coming soon!
   - **Flutter Web**: FFmpeg, FFprobe, and FFplay run from the staged `wasm32` bundle. FFplay renders RGBA frames through the unified Flutter surface API.
-- **`FFmpeg`, `FFprobe` & `FFplay`**: [Latest `9.0.1 API`](https://www.ffmpeg.org/download.html) support for media manipulation, information retrieval, and audio/video playback.
+- **`FFmpeg`, `FFprobe` & `FFplay`**: [Latest `9.0.2 API`](https://www.ffmpeg.org/download.html) support for media manipulation, information retrieval, and audio/video playback.
 - **Video Playback**: Complete cross-platform video playback with unified surface API.
 - **Real-time Streaming**: Position and video dimension streams for live playback monitoring.
 - **Dart FFI**: Direct native bindings for optimal performance.

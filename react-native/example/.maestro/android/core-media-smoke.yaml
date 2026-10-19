@@ -1,0 +1,35 @@
+appId: com.akashskypatel.ffmpegkitextendedexample
+---
+- launchApp
+- extendedWaitUntil:
+    visible:
+      id: tab.ffmpeg
+    timeout: 120000
+- assertVisible:
+    id: app.root
+- assertVisible:
+    id: tab.ffmpeg
+- assertVisible:
+    id: tab.stream
+- assertVisible:
+    id: tab.ffprobe
+- assertVisible:
+    id: tab.ffplay
+- assertVisible:
+    id: tab.transcode
+- runFlow:
+    file: ../shared/ffmpeg-version.yaml
+    env:
+      APP_ID: com.akashskypatel.ffmpegkitextendedexample
+- runFlow:
+    file: ../shared/generated-media-probe.yaml
+    env:
+      APP_ID: com.akashskypatel.ffmpegkitextendedexample
+- runFlow:
+    file: ../shared/ffplay-control-cycle.yaml
+    env:
+      APP_ID: com.akashskypatel.ffmpegkitextendedexample
+- runFlow:
+    file: ../shared/transcode-generated-media.yaml
+    env:
+      APP_ID: com.akashskypatel.ffmpegkitextendedexample

@@ -1,7 +1,10 @@
-import NativeFFmpegKitExtended from './NativeFFmpegKitExtended';
-import {argumentsToString} from './arguments';
-import {FFplaySession} from './session';
-import type {ExecuteOptions} from './types';
+import { getBackend } from './platform/backend-registry';
+import { argumentsToString } from './arguments';
+import { FFplaySession } from './session';
+import type { ExecuteOptions } from './types';
+import { FFmpegKitExtended } from './ffmpeg-kit-extended';
+
+const NativeFFmpegKitExtended = getBackend();
 
 /**
  * High-level FFplay API for native audio and video playback.
@@ -10,9 +13,21 @@ import type {ExecuteOptions} from './types';
  * require a view. Playback controls are session-based; retain the returned
  * `FFplaySession` when your UI needs pause, resume, seek, stop, position, or
  * volume operations.
+ *
+ * On Web, async playback accepts local/MEMFS files and direct HTTP(S)/HLS
+ * with the pinned streaming runtime. Use the FFplay surface and SDL audio,
+ * and retain the session to request playback stop.
+ *
+ * @hideconstructor
+ * @category FFplay UI
  */
 export class FFplayKit {
-  private static activeSession?: FFplaySession;
+  private static readonly unsettledSessions = new Map<number, FFplaySession>();
+  private static getNewestUnsettledSession(): FFplaySession | undefined {
+    let newest: FFplaySession | undefined;
+    for (const session of this.unsettledSessions.values()) newest = session;
+    return newest;
+  }
 
   /**
    * Creates a playback session without starting it.
@@ -25,20 +40,20 @@ export class FFplayKit {
     return new FFplaySession(
       NativeFFmpegKitExtended.createFFplaySession(command),
       command,
-      timeoutMs,
+      timeoutMs
     );
   }
 
   /** Creates a playback session from pre-tokenized FFplay arguments. */
   static createSessionFromArguments(
     arguments_: readonly string[],
-    timeoutMs = 500,
+    timeoutMs = 500
   ): FFplaySession {
     if (arguments_.length === 0) throw new Error('arguments must not be empty');
     return new FFplaySession(
       NativeFFmpegKitExtended.createFFplaySessionFromArguments(arguments_),
       argumentsToString(arguments_),
-      timeoutMs,
+      timeoutMs
     );
   }
 
@@ -46,7 +61,7 @@ export class FFplayKit {
   static async execute(
     command: string,
     options: ExecuteOptions<FFplaySession> = {},
-    timeoutMs = 500,
+    timeoutMs = 500
   ): Promise<FFplaySession> {
     return this.executeAsync(command, options, timeoutMs);
   }
@@ -56,49 +71,53 @@ export class FFplayKit {
    *
    * The promise normally remains pending for the playback lifetime. Keep the
    * session from `createSession()` when controls are needed before completion,
-   * or read `currentSession` after calling this method.
+   * or read `currentSession` after calling this method. The current global
+   * control owner is the newest submitted high-level FFplay session whose
+   * execution Promise remains unsettled. When that newest session settles,
+   * control falls back to the next newest unsettled session. Retain an
+   * explicitly created `FFplaySession` when controlling a particular playback
+   * identity.
    */
   static async executeAsync(
     command: string,
     options: ExecuteOptions<FFplaySession> = {},
-    timeoutMs = 500,
+    timeoutMs = 500
   ): Promise<FFplaySession> {
     const session = this.createSession(command, timeoutMs);
-    this.activeSession = session;
-    return session.executeAsync({
-      ...options,
-      completeCallback: completed => {
-        if (this.activeSession?.sessionId === completed.sessionId) {
-          this.activeSession = undefined;
-        }
-        options.completeCallback?.(completed);
-      },
-    });
+    this.unsettledSessions.set(session.sessionId, session);
+    try {
+      return await session.executeAsync(options);
+    } finally {
+      this.unsettledSessions.delete(session.sessionId);
+    }
   }
 
-  /** Requests cancellation of a playback session. */
-  static cancel(session: FFplaySession): void {
-    session.cancel();
+  /** Requests cancellation of a created, queued, or running playback session. */
+  static cancel(session: FFplaySession): Promise<void> {
+    return session.cancel();
   }
 
-  /** Returns the session most recently started through `executeAsync()`. */
+  /**
+   * Returns the most recently submitted high-level FFplay session whose
+   * `executeAsync()` Promise has not yet settled.
+   */
   static getCurrentSession(): FFplaySession | undefined {
-    return this.activeSession;
+    return this.getNewestUnsettledSession();
   }
 
   /** Property form of `getCurrentSession()`. */
   static get currentSession(): FFplaySession | undefined {
-    return this.activeSession;
+    return this.getNewestUnsettledSession();
   }
 
-  /** Whether the current session reports active playback. */
+  /** Whether the current high-level session reports active playback. */
   static get playing(): boolean {
-    return this.activeSession?.isPlaying() ?? false;
+    return this.getNewestUnsettledSession()?.isPlaying() ?? false;
   }
 
-  /** Whether the current session reports a paused state. */
+  /** Whether the current high-level session reports a paused state. */
   static get paused(): boolean {
-    return this.activeSession?.isPaused() ?? false;
+    return this.getNewestUnsettledSession()?.isPaused() ?? false;
   }
 
   /**
@@ -106,6 +125,8 @@ export class FFplayKit {
    *
    * Use this to decide whether a visible `FFplayView` is required before
    * starting playback.
+   * On Web, failed local opens return false. Network URLs throw an Error;
+   * use asynchronous FFprobe for remote media information instead.
    */
   static hasVideoStream(path: string): boolean {
     return NativeFFmpegKitExtended.ffplayHasVideoStream(path);
@@ -113,9 +134,6 @@ export class FFplayKit {
 
   /** Returns FFplay sessions currently retained in native history. */
   static getFFplaySessions(): FFplaySession[] {
-    const data = JSON.parse(
-      NativeFFmpegKitExtended.getSessionsJson('ffplay') || '[]',
-    ) as Array<{sessionId: number; command: string}>;
-    return data.map(item => new FFplaySession(item.sessionId, item.command));
+    return FFmpegKitExtended.getFFplaySessions();
   }
 }

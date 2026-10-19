@@ -18,22 +18,32 @@ library;
 
 import 'dart:async';
 import 'dart:developer';
-import 'dart:ffi';
 
-import 'package:ffi/ffi.dart';
+import 'package:meta/meta.dart';
 
 import '../ffmpeg_kit_extended_flutter.dart';
 import 'callback_manager.dart';
-import 'generated/ffmpeg_kit_bindings.dart' as ffmpeg;
+import 'platform/backend.dart';
+import 'platform/backend_selector.dart';
+
+/// Message for the rejected synchronous FFplay path (AUTH-FFPLAY-SYNC).
+const _synchronousFFplayRejectedMessage =
+    'FFplaySession.execute() is not supported on any platform because it '
+    'blocks the calling thread for the whole playback. Use '
+    'FFplayKit.executeAsync() or FFplaySession.executeAsync() instead.';
 
 /// Session for playing media using FFplay.
 ///
 /// Provides methods to control playback (start, pause, resume, stop, seek)
 /// and query/playback properties such as position and volume.
+/// Playback commands enable FFplay's auto-exit behavior on every platform.
 ///
 /// ### Lifecycle
 /// Use [FFplayKit] to create and execute sessions for global tracking.
 /// Deprecated static helpers still work but bypass tracking.
+/// The direct [execute] method is not supported on any platform and always
+/// throws [UnsupportedError]. Use [FFplayKit.executeAsync] for long-running
+/// playback from the Flutter UI isolate and for queue-managed execution.
 class FFplaySession extends Session {
   FFplaySessionCompleteCallback? _completeCallback;
   FFmpegLogCallback? _logCallback;
@@ -44,10 +54,10 @@ class FFplaySession extends Session {
 
   int _timeout;
 
-  StreamController<double> _positionController =
-      StreamController<double>.broadcast();
+  StreamController<double>? _positionController;
   Timer? _positionTimer;
   Timer? _positionSyncTimer;
+  bool _telemetryExecutionActive = false;
   double _syncedPos = 0.0;
   double _cachedDuration = 0.0;
   bool _locallyPlaying = false;
@@ -80,78 +90,90 @@ class FFplaySession extends Session {
   // by the sync timer resetting _positionStopwatch.
   final Stopwatch _emitStopwatch = Stopwatch();
 
-  StreamController<(int, int)> _videoSizeController =
-      StreamController<(int, int)>.broadcast();
+  StreamController<(int, int)>? _videoSizeController;
   Timer? _videoSizeTimer;
+  int _lastVideoWidth = 0;
+  int _lastVideoHeight = 0;
+  Future<void>? _executionFutureForTracking;
 
   // ---------------------------------------------------------------------------
   // Constructors
   // ---------------------------------------------------------------------------
 
+  /// Creates an in-memory session for package lifecycle tests.
+  @visibleForTesting
+  FFplaySession.test({
+    int sessionId = 1,
+    FFplaySessionCompleteCallback? completeCallback,
+    FFmpegLogCallback? logCallback,
+  }) : _timeout = 500,
+       super.noFinalizer() {
+    handle = const SessionHandle(Object());
+    this.sessionId = sessionId;
+    command = 'test';
+    _completeCallback = completeCallback;
+    _logCallback = logCallback;
+  }
+
   /// Restores an [FFplaySession] from existing native [handle].
   /// Used internally when wrapping handles from session-history API.
   /// No callbacks registered; call [setCompleteCallback] if needed.
-  FFplaySession.fromHandle(Pointer<Void> handle, String command)
-    : _timeout = 500 {
+  FFplaySession.fromHandle(Object handle, String command) : _timeout = 500 {
     FFmpegKitExtended.requireInitialized();
-    this.handle = handle;
+    final ownedHandle = handle is SessionHandle
+        ? handle
+        : SessionHandle(handle);
     this.command = command;
     try {
-      sessionId = ffmpeg.ffmpeg_kit_session_get_session_id(handle);
+      adoptOwnedHandle(
+        ownedHandle,
+        readSessionId: ffmpegKitBackend.getSessionId,
+        restoredSession: true,
+      );
     } catch (e, st) {
       log(
-        'FFplaySession: error in native function ffmpeg_kit_session_get_session_id',
+        'FFplaySession: error adopting a history session handle',
         error: e,
         stackTrace: st,
       );
       rethrow;
     }
-    registerFinalizer();
   }
 
   /// Creates a new [FFplaySession] for [command].
   /// **Prefer [FFplayKit.createSession]** for proper global tracking.
   /// - [completeCallback]: Invoked once when playback ends.
-  /// - [timeout]: Connection timeout in milliseconds (default 500).
+  /// - [_timeout]: Connection timeout in milliseconds (default 500).
   FFplaySession(
     String command, {
     FFplaySessionCompleteCallback? completeCallback,
-    int timeout = 500,
-  }) : _timeout = timeout {
+    this._timeout = 500,
+  }) {
     FFmpegKitExtended.requireInitialized();
-    // toNativeUtf8 uses the calloc allocator by default.
-    final cmdPtr = command.toNativeUtf8(allocator: calloc);
     try {
-      try {
-        handle = ffmpeg.ffplay_kit_create_session(cmdPtr.cast());
-      } catch (e, st) {
-        log(
-          'FFplaySession: error in native function ffplay_kit_create_session',
-          error: e,
-          stackTrace: st,
-        );
-        rethrow;
-      }
-      this.command = command;
-      try {
-        sessionId = ffmpeg.ffmpeg_kit_session_get_session_id(handle);
-      } catch (e, st) {
-        log(
-          'FFplaySession: error in native function ffmpeg_kit_session_get_session_id',
-          error: e,
-          stackTrace: st,
-        );
-        rethrow;
-      }
-      registerFinalizer();
-    } finally {
-      calloc.free(cmdPtr); // must match the allocator used by toNativeUtf8
+      final effectiveCommand = _addAutoExit(command);
+      final ownedHandle = ffmpegKitBackend.createFFplaySession(
+        effectiveCommand,
+      );
+      this.command = effectiveCommand;
+      adoptOwnedHandle(
+        ownedHandle,
+        readSessionId: ffmpegKitBackend.getSessionId,
+      );
+    } catch (e, st) {
+      log(
+        'FFplaySession: error creating FFplay session',
+        error: e,
+        stackTrace: st,
+      );
+      rethrow;
     }
-
     _completeCallback = completeCallback;
+    FFmpegKitExtended.registerCreatedSession(this);
 
-    CallbackManager().registerFFplaySession(this);
-    _registered = true;
+    if (completeCallback != null) {
+      _ensureRegisteredForSinkDemand();
+    }
   }
 
   /// Creates a new [FFplaySession] from pre-tokenized [arguments].
@@ -161,42 +183,40 @@ class FFplaySession extends Session {
   FFplaySession.fromArguments(
     List<String> arguments, {
     FFplaySessionCompleteCallback? completeCallback,
-    int timeout = 500,
-  }) : _timeout = timeout {
+    this._timeout = 500,
+  }) {
     FFmpegKitExtended.requireInitialized();
     if (arguments.isEmpty) {
       throw ArgumentError.value(arguments, 'arguments', 'must not be empty');
     }
 
-    final argv = calloc<Pointer<Char>>(arguments.length);
-    final nativeStrings = <Pointer<Utf8>>[];
-    try {
-      for (var i = 0; i < arguments.length; i++) {
-        final nativeString = arguments[i].toNativeUtf8(allocator: calloc);
-        nativeStrings.add(nativeString);
-        argv[i] = nativeString.cast<Char>();
-      }
-
-      handle = ffmpeg.ffplay_kit_create_session_from_argv(
-        arguments.length,
-        argv,
-      );
-      if (handle == nullptr) {
-        throw StateError('Failed to create FFplay session from arguments.');
-      }
-      command = FFmpegKitExtended.argumentsToString(arguments);
-      sessionId = ffmpeg.ffmpeg_kit_session_get_session_id(handle);
-      registerFinalizer();
-    } finally {
-      for (final nativeString in nativeStrings) {
-        calloc.free(nativeString);
-      }
-      calloc.free(argv);
-    }
+    final effectiveArguments = _addAutoExitArgument(arguments);
+    final displayCommand = FFmpegKitExtended.argumentsToString(
+      effectiveArguments,
+    );
+    final ownedHandle = ffmpegKitBackend.createFFplaySessionFromArguments(
+      effectiveArguments,
+    );
+    command = displayCommand;
+    adoptOwnedHandle(ownedHandle, readSessionId: ffmpegKitBackend.getSessionId);
 
     _completeCallback = completeCallback;
-    CallbackManager().registerFFplaySession(this);
-    _registered = true;
+    FFmpegKitExtended.registerCreatedSession(this);
+    if (completeCallback != null) {
+      _ensureRegisteredForSinkDemand();
+    }
+  }
+
+  static String _addAutoExit(String command) {
+    if (RegExp(r'(^|\s)-autoexit(?=\s|$)').hasMatch(command)) {
+      return command;
+    }
+    return '-autoexit $command';
+  }
+
+  static List<String> _addAutoExitArgument(List<String> arguments) {
+    if (arguments.contains('-autoexit')) return arguments;
+    return <String>['-autoexit', ...arguments];
   }
 
   // ---------------------------------------------------------------------------
@@ -262,11 +282,16 @@ class FFplaySession extends Session {
 
   /// A batched stream of buffered logs drained from the native session.
   Stream<List<Log>> get logBatchStream {
-    final controller =
-        _logBatchStreamController ??= StreamController<List<Log>>.broadcast(
+    final controller = _logBatchStreamController ??=
+        StreamController<List<Log>>.broadcast(
           onListen: () {
-            _ensureRegistered();
+            _ensureRegisteredForSinkDemand();
+            _syncLogBridgeLease();
             dispatchPendingLogs();
+          },
+          onCancel: () {
+            _syncLogBridgeLease();
+            _unregisterIfIdle();
           },
         );
     return controller.stream;
@@ -278,26 +303,62 @@ class FFplaySession extends Session {
 
   /// Sets or replaces the completion callback.
   void setCompleteCallback(FFplaySessionCompleteCallback? completeCallback) {
+    final previous = _completeCallback;
+    final hadBridgeLease = hasBridgeLease(CallbackBridgeKind.ffplayCompletion);
     _completeCallback = completeCallback;
-    _ensureRegistered();
+    if (completeCallback == null) {
+      _syncCompletionBridgeLease();
+      _unregisterIfIdle();
+    } else {
+      try {
+        _ensureRegisteredForSinkDemand();
+        _syncCompletionBridgeLease();
+      } catch (_) {
+        _completeCallback = previous;
+        if (!hadBridgeLease) {
+          releaseBridgeLease(CallbackBridgeKind.ffplayCompletion);
+        }
+        _unregisterIfIdle();
+        rethrow;
+      }
+    }
   }
 
   /// Sets or replaces the log callback.
   void setLogCallback(FFmpegLogCallback? logCallback) {
+    final previous = _logCallback;
+    final hadBridgeLease = hasBridgeLease(CallbackBridgeKind.log);
     _logCallback = logCallback;
-    _ensureRegistered();
+    if (logCallback == null) {
+      _syncLogBridgeLease();
+      _unregisterIfIdle();
+    } else {
+      try {
+        _ensureRegisteredForSinkDemand();
+        _syncLogBridgeLease();
+      } catch (_) {
+        _logCallback = previous;
+        if (!hadBridgeLease) {
+          releaseBridgeLease(CallbackBridgeKind.log);
+        }
+        _unregisterIfIdle();
+        rethrow;
+      }
+    }
   }
 
   /// Clears completion callback and unregisters session from
   /// [CallbackManager] if no other callbacks remain.
   void removeCompleteCallback() {
     _completeCallback = null;
+    _syncCompletionBridgeLease();
     _unregisterIfIdle();
   }
 
   /// Clears the log callback.
   void removeLogCallback() {
     _logCallback = null;
+    _syncLogBridgeLease();
     _unregisterIfIdle();
   }
 
@@ -319,7 +380,7 @@ class FFplaySession extends Session {
   void start() {
     FFmpegKitExtended.requireInitialized();
     try {
-      ffmpeg.ffplay_kit_session_start(handle);
+      ffmpegKitBackend.startFFplaySession(handle);
     } catch (e, st) {
       log(
         'FFplaySession: error in native function ffplay_kit_session_start',
@@ -334,7 +395,7 @@ class FFplaySession extends Session {
   void pause() {
     FFmpegKitExtended.requireInitialized();
     try {
-      ffmpeg.ffplay_kit_session_pause(handle);
+      ffmpegKitBackend.pauseFFplaySession(handle);
     } catch (e, st) {
       log(
         'FFplaySession: error in native function ffplay_kit_session_pause',
@@ -344,7 +405,7 @@ class FFplaySession extends Session {
       rethrow;
     }
     try {
-      final pausePos = ffmpeg.ffplay_kit_session_get_position(handle);
+      final pausePos = ffmpegKitBackend.getFFplayPosition(handle);
       _syncedPos = pausePos.isNaN ? _lastEmittedPos : pausePos;
     } catch (e, st) {
       log(
@@ -362,7 +423,7 @@ class FFplaySession extends Session {
   void resume() {
     FFmpegKitExtended.requireInitialized();
     try {
-      ffmpeg.ffplay_kit_session_resume(handle);
+      ffmpegKitBackend.resumeFFplaySession(handle);
     } catch (e, st) {
       log(
         'FFplaySession: error in native function ffplay_kit_session_resume',
@@ -372,7 +433,7 @@ class FFplaySession extends Session {
       rethrow;
     }
     try {
-      final resumePos = ffmpeg.ffplay_kit_session_get_position(handle);
+      final resumePos = ffmpegKitBackend.getFFplayPosition(handle);
       _syncedPos = resumePos.isNaN ? _lastEmittedPos : resumePos;
     } catch (e, st) {
       log(
@@ -390,7 +451,7 @@ class FFplaySession extends Session {
   void stop() {
     FFmpegKitExtended.requireInitialized();
     try {
-      ffmpeg.ffplay_kit_session_stop(handle);
+      ffmpegKitBackend.stopFFplaySession(handle);
     } catch (e, st) {
       log(
         'FFplaySession: error in native function ffplay_kit_session_stop',
@@ -405,7 +466,7 @@ class FFplaySession extends Session {
   void close() {
     FFmpegKitExtended.requireInitialized();
     try {
-      ffmpeg.ffplay_kit_session_close(handle);
+      ffmpegKitBackend.closeFFplaySession(handle);
     } catch (e, st) {
       log(
         'FFplaySession: error in native function ffplay_kit_session_close',
@@ -416,11 +477,44 @@ class FFplaySession extends Session {
     }
   }
 
-  /// Cancels session — stops playback then delegates to [Session.cancel].
+  /// Cancels the session and stops playback after cancellation is recorded.
+  ///
+  /// [Session.cancel] records intent before it performs fallible state or
+  /// native work. The playback-specific stop is only relevant after the queue
+  /// has handed the session to its executor; a stop failure never erases the
+  /// cancellation request or replaces an earlier cancellation failure.
   @override
   void cancel() {
-    stop();
-    super.cancel();
+    Object? primaryError;
+    StackTrace? primaryStackTrace;
+
+    try {
+      super.cancel();
+    } catch (error, stackTrace) {
+      primaryError = error;
+      primaryStackTrace = stackTrace;
+    }
+
+    if (hasExecutionStarted) {
+      try {
+        stop();
+      } catch (error, stackTrace) {
+        if (primaryError == null) {
+          primaryError = error;
+          primaryStackTrace = stackTrace;
+        } else {
+          log(
+            'FFplaySession.cancel: stop failed after cancellation error',
+            error: error,
+            stackTrace: stackTrace,
+          );
+        }
+      }
+    }
+
+    if (primaryError != null) {
+      Error.throwWithStackTrace(primaryError, primaryStackTrace!);
+    }
   }
 
   /// Seeks to [seconds] from the start of the media.
@@ -428,7 +522,7 @@ class FFplaySession extends Session {
     if (seconds.isNaN || seconds.isInfinite) return;
     FFmpegKitExtended.requireInitialized();
     try {
-      ffmpeg.ffplay_kit_session_seek(handle, seconds);
+      ffmpegKitBackend.seekFFplaySession(handle, seconds);
     } catch (e, st) {
       log(
         'FFplaySession: error in native function ffplay_kit_session_seek',
@@ -454,39 +548,30 @@ class FFplaySession extends Session {
   // Execution
   // ---------------------------------------------------------------------------
 
-  /// Enqueues session for synchronous native execution and returns `this` immediately.
+  /// Synchronous execution is rejected on every platform.
+  ///
+  /// Playback blocks the calling thread until it ends. On Web that is the
+  /// browser main thread, so frames, audio, network callbacks and controls
+  /// cannot run. On native platforms the Dart isolate is blocked, so pause,
+  /// stop, seek, callbacks and streams cannot reach Dart.
+  ///
+  /// This method throws [UnsupportedError] before any backend call and changes
+  /// no session state. The session stays created, unregistered and
+  /// unsubmitted, so it can still be started with [executeAsync]. The
+  /// rejection does not use the synchronous cleanup path because that path
+  /// calls `FFplaySurface.endPlayback`, which would stop frame copying for a
+  /// Web playback that is already running.
+  @Deprecated(
+    'Synchronous FFplay execution is not supported on any platform. '
+    'Use FFplayKit.executeAsync or FFplaySession.executeAsync instead.',
+  )
   FFplaySession execute() {
-    SessionQueueManager()
-        .executeSession(this, () async {
-          FFmpegKitExtended.requireInitialized();
-          _enableNativeLogCallback();
-          try {
-            ffmpeg.ffplay_kit_session_execute(handle, _timeout);
-          } catch (e, st) {
-            log(
-              'FFplaySession: error in native function ffplay_kit_session_execute',
-              error: e,
-              stackTrace: st,
-            );
-            rethrow;
-          }
-          dispatchPendingLogs();
-          try {
-            _completeCallback?.call(this);
-          } catch (e, st) {
-            log('FFplaySession.execute: error in completeCallback: $e\n$st');
-            rethrow;
-          }
-          _closeLogStreams();
-          _unregister();
-        })
-        .catchError((Object e, StackTrace st) {
-          log('FFplaySession.execute: queue error: $e\n$st');
-        });
-    return this;
+    throw UnsupportedError(_synchronousFFplayRejectedMessage);
   }
 
   /// @deprecated Use [FFplayKit.execute] for proper global session management.
+  /// Synchronous execution is rejected, so this helper always throws
+  /// [UnsupportedError].
   @Deprecated('Use FFplayKit.execute for proper global session management')
   static FFplaySession executeCommand(
     String command, {
@@ -511,21 +596,42 @@ class FFplaySession extends Session {
     completeCallback: completeCallback,
   ).executeAsync(logCallback: logCallback);
 
-  /// Executes this session asynchronously and returns a [Future] that
-  /// resolves once playback finishes or is cancelled.
+  /// Executes this session asynchronously and completes after playback ends.
+  ///
+  /// [FFplayKit.executeAsync] uses the startup handoff internally so callers
+  /// that need the global playback session can continue without waiting for
+  /// terminal playback completion.
   Future<FFplaySession> executeAsync({
     int? timeout,
     FFplaySessionCompleteCallback? completeCallback,
     FFmpegLogCallback? logCallback,
   }) async {
+    claimExecutionSubmission();
     if (timeout != null) _timeout = timeout;
     if (completeCallback != null) _completeCallback = completeCallback;
     if (logCallback != null) _logCallback = logCallback;
-    _ensureRegistered();
 
-    await SessionQueueManager().executeSession(this, _runAsync);
+    final startup = Completer<void>();
+    final execution = SessionQueueManager().executeSession(
+      this,
+      () => _runAsync(startup),
+    );
+    _executionFutureForTracking = execution;
+    _startupFutureForTracking = startup.future;
+    unawaited(_observeQueuedExecution(execution, startup));
+    await startup.future;
+    await execution;
     return this;
   }
+
+  Future<void>? _startupFutureForTracking;
+
+  /// The startup future used by [FFplayKit] to return after native handoff.
+  Future<void>? get startupFutureForTracking => _startupFutureForTracking;
+
+  /// The queue-owned completion future used by [FFplayKit] to retain global
+  /// ownership after the startup handoff returned from [executeAsync].
+  Future<void>? get executionFutureForTracking => _executionFutureForTracking;
 
   // ---------------------------------------------------------------------------
   // Playback properties
@@ -535,7 +641,7 @@ class FFplaySession extends Session {
   double getMediaDuration() {
     FFmpegKitExtended.requireInitialized();
     try {
-      final d = ffmpeg.ffplay_kit_session_get_duration(handle);
+      final d = ffmpegKitBackend.getFFplayDuration(handle);
       return d;
     } catch (e, st) {
       log(
@@ -551,7 +657,7 @@ class FFplaySession extends Session {
   double getPosition() {
     FFmpegKitExtended.requireInitialized();
     try {
-      final p = ffmpeg.ffplay_kit_session_get_position(handle);
+      final p = ffmpegKitBackend.getFFplayPosition(handle);
       return p;
     } catch (e, st) {
       log(
@@ -567,7 +673,7 @@ class FFplaySession extends Session {
   void setPosition(double seconds) {
     FFmpegKitExtended.requireInitialized();
     try {
-      ffmpeg.ffplay_kit_session_set_position(handle, seconds);
+      ffmpegKitBackend.setFFplayPosition(handle, seconds);
     } catch (e, st) {
       log(
         'FFplaySession: error in native function ffplay_kit_session_set_position',
@@ -589,7 +695,7 @@ class FFplaySession extends Session {
     // (or has been torn down); any value >= 0 is a real reading, including 0.0
     // for a legitimately muted session.
     try {
-      final v = ffmpeg.ffplay_kit_session_get_volume(handle);
+      final v = ffmpegKitBackend.getFFplayVolume(handle);
       if (v >= 0) _cachedVolume = v;
       return _cachedVolume;
     } catch (e, st) {
@@ -612,7 +718,7 @@ class FFplaySession extends Session {
     // as a 0.0–1.0 fraction (multiplies by 100 to get a percentage).
     // Do NOT pre-scale to SDL_MIX_MAXVOLUME (0–128) here.
     try {
-      ffmpeg.ffplay_kit_session_set_volume(handle, clamped);
+      ffmpegKitBackend.setFFplayVolume(handle, clamped);
     } catch (e, st) {
       log(
         'FFplaySession: error in native function ffplay_kit_session_set_volume',
@@ -627,7 +733,7 @@ class FFplaySession extends Session {
   bool isPlaying() {
     FFmpegKitExtended.requireInitialized();
     try {
-      final playing = ffmpeg.ffplay_kit_session_is_playing(handle);
+      final playing = ffmpegKitBackend.isFFplayPlaying(handle);
       return playing;
     } catch (e, st) {
       log(
@@ -643,7 +749,7 @@ class FFplaySession extends Session {
   int getVideoWidth() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.ffplay_kit_session_get_video_width(handle);
+      return ffmpegKitBackend.getFFplayVideoWidth(handle);
     } catch (e, st) {
       log(
         'FFplaySession: error in native function ffplay_kit_session_get_video_width',
@@ -658,7 +764,7 @@ class FFplaySession extends Session {
   int getVideoHeight() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.ffplay_kit_session_get_video_height(handle);
+      return ffmpegKitBackend.getFFplayVideoHeight(handle);
     } catch (e, st) {
       log(
         'FFplaySession: error in native function ffplay_kit_session_get_video_height',
@@ -673,7 +779,7 @@ class FFplaySession extends Session {
   bool isPaused() {
     FFmpegKitExtended.requireInitialized();
     try {
-      final paused = ffmpeg.ffplay_kit_session_is_paused(handle);
+      final paused = ffmpegKitBackend.isFFplayPaused(handle);
       return paused;
     } catch (e, st) {
       log(
@@ -710,87 +816,199 @@ class FFplaySession extends Session {
   // ---------------------------------------------------------------------------
 
   /// Stream of playback positions in seconds, polled every 200 ms by default.
-  /// Subscribe before calling [executeAsync]. Stream emits positions at
-  /// configured interval and closes automatically when playback ends.
-  Stream<double> get positionStream => _positionController.stream;
+  /// Timers run only while this stream has a listener and playback is active;
+  /// the stream closes automatically when playback ends.
+  Stream<double> get positionStream {
+    final controller = _positionController;
+    if (controller == null || controller.isClosed) {
+      _positionController = _createPositionController();
+    }
+    return _positionController!.stream;
+  }
 
   /// Stream of `(width, height)` video dimension records, polled every 500 ms.
   /// Emits new value only when dimensions change (e.g., when first frame
   /// is decoded and video size becomes known). Closes when playback ends.
-  /// Subscribe before calling [executeAsync] to receive initial dimensions.
-  Stream<(int, int)> get videoSizeStream => _videoSizeController.stream;
+  /// Subscriptions may be attached before or after startup; each new listener
+  /// receives the current dimensions on the next listener-owned poll.
+  Stream<(int, int)> get videoSizeStream {
+    final controller = _videoSizeController;
+    if (controller == null || controller.isClosed) {
+      _videoSizeController = _createVideoSizeController();
+    }
+    return _videoSizeController!.stream;
+  }
+
+  StreamController<double> _createPositionController() =>
+      StreamController<double>.broadcast(
+        onListen: () {
+          if (_telemetryExecutionActive) _startPositionStream();
+        },
+        onCancel: () {
+          if (!(_positionController?.hasListener ?? false)) {
+            _stopPositionTimers();
+          }
+        },
+      );
+
+  StreamController<(int, int)> _createVideoSizeController() =>
+      StreamController<(int, int)>.broadcast(
+        onListen: () {
+          if (_telemetryExecutionActive) _startVideoSizeStream();
+        },
+        onCancel: () {
+          if (!(_videoSizeController?.hasListener ?? false)) {
+            _stopVideoSizeTimer();
+          }
+        },
+      );
 
   // ---------------------------------------------------------------------------
   // Private implementation
   // ---------------------------------------------------------------------------
 
   /// Core async execution body, called by [executeAsync] through the queue.
-  Future<void> _runAsync() async {
-    final sessionCompleter = Completer<void>();
-    final userCompleteCallback = _completeCallback;
-
-    _completeCallback = (FFplaySession s) {
-      dispatchPendingLogs();
-      try {
-        userCompleteCallback?.call(s);
-      } catch (e, st) {
-        log('FFplaySession: error in completeCallback: $e\n$st');
-        rethrow;
-      }
-      if (!sessionCompleter.isCompleted) sessionCompleter.complete();
-      _closeLogStreams();
-      _unregister();
-      _stopPositionStream();
-      _stopVideoSizeStream();
-    };
-
-    _enableNativeLogCallback();
+  Future<void> _runAsync(Completer<void> startup) async {
     try {
-      ffmpeg.ffmpeg_kit_config_enable_ffplay_session_complete_callback(
-        nativeFFplayComplete.nativeFunction,
-        nullptr,
-      );
-    } catch (e, st) {
-      log('FFplaySession: error enabling complete callback: $e\n$st');
-      _completeCallback = userCompleteCallback;
-      _closeLogStreams();
-      _unregister();
-      _stopPositionStream();
-      _stopVideoSizeStream();
-      if (!sessionCompleter.isCompleted) sessionCompleter.complete();
+      validateExecutionHandoff();
+    } catch (error, stackTrace) {
+      if (!startup.isCompleted) startup.completeError(error, stackTrace);
       rethrow;
     }
+    _ensureRegistered();
+    final sessionCompleter = Completer<void>();
+    trackExecution(sessionCompleter);
+    final userCompleteCallback = _completeCallback;
+
+    var completionHandled = false;
+    void handleExecutionError(Object error, StackTrace stackTrace) {
+      if (completionHandled) return;
+      completionHandled = true;
+      clearExecutionErrorHandler();
+      _completeCallback = userCompleteCallback;
+      completeExecutionWithError(
+        completer: sessionCompleter,
+        error: error,
+        stackTrace: stackTrace,
+        cleanup: () {
+          try {
+            _closeLogStreams();
+          } finally {
+            try {
+              _unregister();
+            } finally {
+              releaseAllBridgeLeases();
+              FFplaySurface.endPlayback();
+              _telemetryExecutionActive = false;
+              _stopPositionStream();
+              _stopVideoSizeStream();
+            }
+          }
+        },
+      );
+    }
+
+    registerExecutionErrorHandler(handleExecutionError);
+    _completeCallback = (FFplaySession s) {
+      if (completionHandled) return;
+      completionHandled = true;
+      clearExecutionErrorHandler();
+
+      try {
+        if (_hasLogDemand) dispatchPendingLogs();
+      } catch (e, st) {
+        log(
+          'FFplaySession: error flushing logs for session $sessionId',
+          error: e,
+          stackTrace: st,
+        );
+      } finally {
+        _completeCallback = userCompleteCallback;
+        _telemetryExecutionActive = false;
+        try {
+          _closeLogStreams();
+        } finally {
+          try {
+            _unregister();
+          } finally {
+            releaseAllBridgeLeases();
+            FFplaySurface.endPlayback();
+            _stopPositionStream();
+            _stopVideoSizeStream();
+            commitTerminalHistory();
+            CallbackManager().invokeSafely(
+              'FFplay completion callback',
+              sessionId,
+              () => userCompleteCallback?.call(s),
+            );
+            // Complete last — callback failures are reported separately and
+            // never prevent the execution future from settling.
+            if (!sessionCompleter.isCompleted) sessionCompleter.complete();
+          }
+        }
+      }
+    };
 
     try {
-      ffmpeg.ffplay_kit_session_execute_async(handle, _timeout);
+      _acquireExecutionBridgeLeases();
+      executeAsynchronously();
+      notifyPlaybackStarted();
+      // Start polling only after the native session is executing so timers
+      // never fire against a not-yet-started session during queue delays.
+      _telemetryExecutionActive = true;
+      _startPositionStream();
+      _startVideoSizeStream();
+      if (!startup.isCompleted) startup.complete();
     } catch (e, st) {
       log(
         'FFplaySession: error starting async session ffplay_kit_session_execute_async $sessionId',
         error: e,
         stackTrace: st,
       );
+      clearExecutionErrorHandler();
       _completeCallback = userCompleteCallback;
+      _telemetryExecutionActive = false;
       _closeLogStreams();
-      _unregister();
+      try {
+        _unregister();
+      } finally {
+        releaseAllBridgeLeases();
+      }
       _stopPositionStream();
       _stopVideoSizeStream();
+      FFplaySurface.endPlayback();
+      if (!startup.isCompleted) startup.completeError(e, st);
       if (!sessionCompleter.isCompleted) sessionCompleter.complete();
       rethrow;
     }
 
-    // Start polling only after the native session is executing so timers never
-    // fire against a not-yet-started session during SessionQueueManager delays.
-    _startPositionStream();
-    _startVideoSizeStream();
-
     await sessionCompleter.future;
+  }
+
+  Future<void> _observeQueuedExecution(
+    Future<void> execution,
+    Completer<void> startup,
+  ) async {
+    try {
+      await execution;
+    } catch (error, stackTrace) {
+      if (!startup.isCompleted) {
+        startup.completeError(error, stackTrace);
+      }
+    }
   }
 
   /// Ensures session is registered with the callback manager.
   void _ensureRegistered() {
+    if (isDisposed) return;
     if (_registered) return;
     CallbackManager().registerFFplaySession(this);
     _registered = true;
+  }
+
+  void _ensureRegisteredForSinkDemand() {
+    if (isDisposed || _registered) return;
+    ensureRoutingForSinkDemand(_ensureRegistered);
   }
 
   @override
@@ -805,25 +1023,58 @@ class FFplaySession extends Session {
     }
 
     for (final logObj in batch) {
-      try {
-        CallbackManager().globalLogCallback?.call(logObj);
-        _logCallback?.call(logObj);
-      } catch (e, st) {
-        log(
-          'FFplaySession: error dispatching log for session '
-          '$sessionId: $e\n$st',
-        );
-        rethrow;
-      }
+      CallbackManager().invokeSafely(
+        'FFplay global log callback',
+        sessionId,
+        () => CallbackManager().globalLogCallback?.call(logObj),
+      );
+      CallbackManager().invokeSafely(
+        'FFplay session log callback',
+        sessionId,
+        () => _logCallback?.call(logObj),
+      );
     }
   }
 
-  void _enableNativeLogCallback() {
+  /// Configures the native FFplay completion callback for sync execution.
+  @protected
+  void configureSynchronousNativeCallbacks() {
+    // Synchronous completion is dispatched by the blocking return path and
+    // does not need a process-global native completion callback.
+  }
+
+  /// Rejected synchronous playback hook, kept with its protected signature.
+  ///
+  /// [execute] does not call this method; it throws [UnsupportedError] itself.
+  /// This override point therefore cannot re-enable blocking playback.
+  @protected
+  void executeSynchronously() {
+    throw UnsupportedError(_synchronousFFplayRejectedMessage);
+  }
+
+  /// Submits the non-blocking native playback handoff.
+  ///
+  /// Kept as a protected seam so lifecycle tests can exercise the public
+  /// direct-session path without starting a real decoder.
+  @protected
+  void executeAsynchronously() {
+    ffmpegKitBackend.executeFFplaySessionAsync(handle, _timeout);
+  }
+
+  /// Commits the rendering identity after the native playback handoff has
+  /// succeeded. The Web surface uses this to accept a reused native frame
+  /// generation on every public FFplay execution path.
+  @protected
+  void notifyPlaybackStarted() {
+    FFplaySurface.beginPlayback(
+      isReady: () => ffmpegKitBackend.getFFplayVolume(handle) >= 0,
+    );
+  }
+
+  @protected
+  void enableNativeLogCallback() {
     try {
-      ffmpeg.ffmpeg_kit_config_enable_log_callback(
-        nativeFFmpegLog.nativeFunction,
-        nullptr,
-      );
+      ffmpegKitBackend.enableFFmpegLogCallback();
     } catch (e, st) {
       log(
         'FFplaySession: error enabling ffmpeg log callback for session $sessionId',
@@ -834,11 +1085,94 @@ class FFplaySession extends Session {
     }
   }
 
+  bool get _hasLocalLogDemand =>
+      _logCallback != null || (_logBatchStreamController?.hasListener ?? false);
+
+  bool get _hasLogDemand =>
+      _hasLocalLogDemand || CallbackManager().globalLogCallback != null;
+
+  void _acquireOptionalBridgeLeases() {
+    if (_hasLocalLogDemand) {
+      acquireBridgeLease(
+        CallbackBridgeKind.log,
+        install: ffmpegKitBackend.configureLogCallback,
+        uninstall: ffmpegKitBackend.disableLogCallback,
+      );
+    }
+  }
+
+  void _acquireExecutionBridgeLeases() {
+    _acquireOptionalBridgeLeases();
+    acquireBridgeLease(
+      CallbackBridgeKind.ffplayCompletion,
+      install: ffmpegKitBackend.configureFFplaySessionCompleteCallback,
+      uninstall: ffmpegKitBackend.disableFFplaySessionCompleteCallback,
+    );
+  }
+
+  void _syncCompletionBridgeLease() {
+    final needsLease =
+        _completeCallback != null &&
+        ((hasExecutionStarted && !hasExecutionSettled) ||
+            isRestoredObserverRunning);
+    if (needsLease) {
+      acquireBridgeLease(
+        CallbackBridgeKind.ffplayCompletion,
+        install: ffmpegKitBackend.configureFFplaySessionCompleteCallback,
+        uninstall: ffmpegKitBackend.disableFFplaySessionCompleteCallback,
+      );
+    } else if (_completeCallback == null ||
+        (isRestoredSession && hasTerminalCompletionBeenObserved)) {
+      releaseBridgeLease(CallbackBridgeKind.ffplayCompletion);
+    }
+  }
+
+  void _syncLogBridgeLease() {
+    final needsLease =
+        _hasLocalLogDemand &&
+        ((hasExecutionStarted && !hasExecutionSettled) ||
+            isRestoredObserverRunning);
+    if (needsLease) {
+      _acquireOptionalBridgeLeases();
+    } else if (!_hasLocalLogDemand ||
+        (isRestoredSession && hasTerminalCompletionBeenObserved)) {
+      releaseBridgeLease(CallbackBridgeKind.log);
+    }
+  }
+
   void _closeLogStreams() {
     final controller = _logBatchStreamController;
     if (controller != null && !controller.isClosed) {
       controller.close();
     }
+  }
+
+  @override
+  void onDispose() {
+    _completeCallback = null;
+    _logCallback = null;
+    _telemetryExecutionActive = false;
+    _stopPositionStream();
+    _stopVideoSizeStream();
+    _closeLogStreams();
+    _unregister();
+  }
+
+  @override
+  @protected
+  void onRestoredCompletionSettled() {
+    removeCompleteCallback();
+    releaseBridgeLease(CallbackBridgeKind.ffplayCompletion);
+    releaseBridgeLease(CallbackBridgeKind.log);
+  }
+
+  @override
+  void onCancelledBeforeStart() {
+    _telemetryExecutionActive = false;
+    _stopPositionStream();
+    _stopVideoSizeStream();
+    _closeLogStreams();
+    _unregister();
   }
 
   /// Unregisters session from the callback manager.
@@ -851,7 +1185,8 @@ class FFplaySession extends Session {
   void _unregisterIfIdle() {
     if (_completeCallback == null &&
         _logCallback == null &&
-        !(_logBatchStreamController?.hasListener ?? false)) {
+        !(_logBatchStreamController?.hasListener ?? false) &&
+        !hasPendingExecutionRouting) {
       _unregister();
     }
   }
@@ -871,17 +1206,21 @@ class FFplaySession extends Session {
   /// the interval up by [_emitStepMs]; five consecutive on-time fires step it
   /// back down, with hysteresis to prevent thrashing.
   void _startPositionStream({int syncMs = 200}) {
+    final controller = _positionController;
+    if (!_telemetryExecutionActive ||
+        controller == null ||
+        controller.isClosed ||
+        !controller.hasListener) {
+      return;
+    }
     _positionTimer?.cancel();
     _positionSyncTimer?.cancel();
-    if (_positionController.isClosed) {
-      _positionController = StreamController<double>.broadcast();
-    }
 
     // Initial ground truth.  Guard NaN in case the native context isn't ready
     // yet (e.g., called before the first frame is decoded).  A NaN here would
     // poison _lastEmittedPos and cause ArgumentError inside .clamp() later.
     try {
-      _syncedPos = ffmpeg.ffplay_kit_session_get_position(handle);
+      _syncedPos = ffmpegKitBackend.getFFplayPosition(handle);
     } catch (e, st) {
       log(
         'FFplaySession: error getting position ffplay_kit_session_get_position $sessionId',
@@ -892,7 +1231,7 @@ class FFplaySession extends Session {
     }
     if (_syncedPos.isNaN) _syncedPos = 0.0;
     try {
-      _cachedDuration = ffmpeg.ffplay_kit_session_get_duration(handle);
+      _cachedDuration = ffmpegKitBackend.getFFplayDuration(handle);
     } catch (e, st) {
       log(
         'FFplaySession: error getting duration ffplay_kit_session_get_duration $sessionId',
@@ -902,7 +1241,7 @@ class FFplaySession extends Session {
       _cachedDuration = 0;
     }
     try {
-      _locallyPlaying = ffmpeg.ffplay_kit_session_is_playing(handle);
+      _locallyPlaying = ffmpegKitBackend.isFFplayPlaying(handle);
     } catch (e, st) {
       log(
         'FFplaySession: error checking playing state ffplay_kit_session_is_playing $sessionId',
@@ -924,13 +1263,17 @@ class FFplaySession extends Session {
 
     // Periodic native sync — corrects drift at low, fixed overhead.
     _positionSyncTimer = Timer.periodic(Duration(milliseconds: syncMs), (_) {
+      if (!_telemetryExecutionActive || !controller.hasListener) {
+        _stopPositionTimers();
+        return;
+      }
       final prevPos = _syncedPos;
       final prevPlaying = _locallyPlaying;
       double newPos;
       bool newPlaying;
       try {
-        newPos = ffmpeg.ffplay_kit_session_get_position(handle);
-        newPlaying = ffmpeg.ffplay_kit_session_is_playing(handle);
+        newPos = ffmpegKitBackend.getFFplayPosition(handle);
+        newPlaying = ffmpegKitBackend.isFFplayPlaying(handle);
       } catch (e, st) {
         log(
           'FFplaySession: error getting position or playing state ffplay_kit_session_get_position/ffplay_kit_session_is_playing $sessionId',
@@ -944,7 +1287,7 @@ class FFplaySession extends Session {
       // Keep retrying until we get a valid value so the Dart clamp activates.
       if (_cachedDuration <= 0.0 || _cachedDuration.isNaN) {
         try {
-          _cachedDuration = ffmpeg.ffplay_kit_session_get_duration(handle);
+          _cachedDuration = ffmpegKitBackend.getFFplayDuration(handle);
         } catch (e, st) {
           log(
             'FFplaySession: error getting duration ffplay_kit_session_get_duration $sessionId',
@@ -979,9 +1322,20 @@ class FFplaySession extends Session {
 
     // Adaptive recursive emit timer.
     void scheduleEmit() {
+      if (!_telemetryExecutionActive ||
+          controller.isClosed ||
+          !controller.hasListener) {
+        _stopPositionTimers();
+        return;
+      }
       _emitStopwatch.reset();
       _positionTimer = Timer(Duration(milliseconds: _currentEmitMs), () {
-        if (_positionController.isClosed) return;
+        if (!_telemetryExecutionActive ||
+            controller.isClosed ||
+            !controller.hasListener) {
+          _stopPositionTimers();
+          return;
+        }
 
         // Measure lateness against _emitStopwatch, which is independent of
         // the sync timer and only reset at the start of each emit tick.
@@ -1035,7 +1389,7 @@ class FFplaySession extends Session {
         );
         _lastEmittedPos = pos;
 
-        _positionController.add(pos);
+        controller.add(pos);
 
         scheduleEmit();
       });
@@ -1044,31 +1398,49 @@ class FFplaySession extends Session {
     scheduleEmit();
   }
 
-  /// Cancels both timers and closes [positionStream].
-  void _stopPositionStream() {
+  /// Cancels position timers while keeping the controller reusable.
+  void _stopPositionTimers() {
     _positionTimer?.cancel();
     _positionTimer = null;
     _positionSyncTimer?.cancel();
     _positionSyncTimer = null;
     _positionStopwatch.stop();
     _emitStopwatch.stop();
-    if (!_positionController.isClosed) _positionController.close();
+  }
+
+  /// Cancels position timers and closes [positionStream] at terminal cleanup.
+  void _stopPositionStream() {
+    _stopPositionTimers();
+    final controller = _positionController;
+    if (controller != null && !controller.isClosed) controller.close();
   }
 
   /// Starts polling [getVideoWidth]/[getVideoHeight] every 500 ms and pushes
   /// `(width, height)` onto [videoSizeStream] whenever dimensions change.
   void _startVideoSizeStream({int intervalMs = 500}) {
-    _videoSizeTimer?.cancel();
-    if (_videoSizeController.isClosed) {
-      _videoSizeController = StreamController<(int, int)>.broadcast();
+    final controller = _videoSizeController;
+    if (!_telemetryExecutionActive ||
+        controller == null ||
+        controller.isClosed ||
+        !controller.hasListener) {
+      return;
     }
-    int lastW = 0, lastH = 0;
-    _videoSizeTimer = Timer.periodic(Duration(milliseconds: intervalMs), (_) {
+    _videoSizeTimer?.cancel();
+    _lastVideoWidth = 0;
+    _lastVideoHeight = 0;
+
+    void pollVideoSize() {
+      if (!_telemetryExecutionActive ||
+          controller.isClosed ||
+          !controller.hasListener) {
+        _stopVideoSizeTimer();
+        return;
+      }
       int w;
       int h;
       try {
-        w = ffmpeg.ffplay_kit_session_get_video_width(handle);
-        h = ffmpeg.ffplay_kit_session_get_video_height(handle);
+        w = ffmpegKitBackend.getFFplayVideoWidth(handle);
+        h = ffmpegKitBackend.getFFplayVideoHeight(handle);
       } catch (e, st) {
         log(
           'FFplaySession: error getting video width or height ffplay_kit_session_get_video_width/ffplay_kit_session_get_video_height $sessionId',
@@ -1077,18 +1449,39 @@ class FFplaySession extends Session {
         );
         return;
       }
-      if ((w != lastW || h != lastH) && w > 0 && h > 0) {
-        lastW = w;
-        lastH = h;
-        if (!_videoSizeController.isClosed) _videoSizeController.add((w, h));
+      if ((w != _lastVideoWidth || h != _lastVideoHeight) && w > 0 && h > 0) {
+        _lastVideoWidth = w;
+        _lastVideoHeight = h;
+        controller.add((w, h));
       }
-    });
+    }
+
+    // Poll once on each listener-owned start so a late subscriber receives the
+    // current dimensions even when they were already emitted to an earlier
+    // subscriber.
+    pollVideoSize();
+    if (!_telemetryExecutionActive ||
+        controller.isClosed ||
+        !controller.hasListener) {
+      return;
+    }
+    _videoSizeTimer = Timer.periodic(
+      Duration(milliseconds: intervalMs),
+      (_) => pollVideoSize(),
+    );
   }
 
-  /// Cancels video-size polling timer and closes [videoSizeStream].
-  void _stopVideoSizeStream() {
+  /// Cancels video-size polling while keeping the controller reusable.
+  void _stopVideoSizeTimer() {
     _videoSizeTimer?.cancel();
     _videoSizeTimer = null;
-    if (!_videoSizeController.isClosed) _videoSizeController.close();
+  }
+
+  /// Cancels video-size polling and closes [videoSizeStream] at terminal
+  /// cleanup.
+  void _stopVideoSizeStream() {
+    _stopVideoSizeTimer();
+    final controller = _videoSizeController;
+    if (controller != null && !controller.isClosed) controller.close();
   }
 }

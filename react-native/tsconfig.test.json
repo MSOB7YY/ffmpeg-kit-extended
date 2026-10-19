@@ -13,6 +13,21 @@
     "src/arguments.ts",
     "src/media-information.ts",
     "src/session-queue-manager.ts",
-    "src/types.ts"
+    "src/types.ts",
+    "src/log-format.ts",
+    "src/callback-demand.ts",
+    "src/platform/web/session-registry.ts",
+    "src/platform/web/session-history-registry.ts",
+    "src/platform/web/wasm-loader.ts",
+    "src/platform/web/wasm-files.ts",
+    "src/platform/web/ffplay-frame-reader.ts",
+    "src/platform/backend-registry.ts",
+    "src/platform/native-session-reconciliation.ts",
+    "src/platform/backend.web.ts",
+    "src/platform/backend.web.register.ts",
+    "src/ffplay-kit.ts",
+    "src/ffmpeg-kit-config.ts",
+    "src/ffmpeg-kit-extended.ts",
+    "src/session.ts"
   ]
 }

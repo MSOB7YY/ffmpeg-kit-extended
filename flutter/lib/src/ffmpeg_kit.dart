@@ -23,26 +23,40 @@ import 'ffmpeg_session.dart';
 
 /// A convenience class for executing FFmpeg commands.
 class FFmpegKit {
-  /// Executes an FFmpeg [command] synchronously.
+  /// Executes an FFmpeg [command] synchronously and blocks until it finishes.
+  ///
+  /// The returned session is already terminal and can be inspected without
+  /// calling `SessionQueueManager().waitForAll()`. Avoid this path for long
+  /// work on the Flutter UI isolate; use [executeAsync] instead.
   static FFmpegSession execute(String command) =>
       FFmpegSession.executeCommand(command);
 
   /// Executes an FFmpeg [command] asynchronously.
   ///
+  /// The Future is managed by `SessionQueueManager` and honors its concurrency
+  /// limit.
+  ///
   /// - [command]: The FFmpeg command to execute.
   /// - [onComplete]: Optional callback invoked when execution completes.
   /// - [onLog]: Optional callback invoked for each log message.
   /// - [onStatistics]: Optional callback invoked for each statistics update.
-  static Future<FFmpegSession> executeAsync(String command,
-          {callback_manager.FFmpegSessionCompleteCallback? onComplete,
-          callback_manager.FFmpegLogCallback? onLog,
-          callback_manager.FFmpegStatisticsCallback? onStatistics}) =>
-      FFmpegSession.executeCommandAsync(command,
-          completeCallback: onComplete,
-          logCallback: onLog,
-          statisticsCallback: onStatistics);
+  static Future<FFmpegSession> executeAsync(
+    String command, {
+    callback_manager.FFmpegSessionCompleteCallback? onComplete,
+    callback_manager.FFmpegLogCallback? onLog,
+    callback_manager.FFmpegStatisticsCallback? onStatistics,
+  }) => FFmpegSession.executeCommandAsync(
+    command,
+    completeCallback: onComplete,
+    logCallback: onLog,
+    statisticsCallback: onStatistics,
+  );
 
-  /// Cancels a [session] if it is currently running.
+  /// Requests cancellation of a [session].
+  ///
+  /// The request is recorded immediately. Queued and startup sessions may not
+  /// have a native cancellation to deliver yet, and a repeated call may retry
+  /// an earlier failed delivery.
   static void cancel(FFmpegSession session) => session.cancel();
 
   /// Creates a new [FFmpegSession] without executing it.
@@ -53,11 +67,11 @@ class FFmpegKit {
   static FFmpegSession createSessionFromArguments(List<String> arguments) =>
       FFmpegSession.createFromArguments(arguments);
 
-  /// Returns the last executed FFmpeg session.
+  /// Returns the most recently created FFmpeg session retained in session history.
   static FFmpegSession? getLastFFmpegSession() =>
       FFmpegKitExtended.getLastFFmpegSession();
 
-  /// Returns all active FFmpeg sessions.
+  /// Returns all retained FFmpeg sessions in session history.
   static List<FFmpegSession> getFFmpegSessions() =>
       FFmpegKitExtended.getFFmpegSessions();
 }

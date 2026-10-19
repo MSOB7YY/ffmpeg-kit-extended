@@ -1,28 +1,44 @@
-import NativeFFmpegKitExtended from './NativeFFmpegKitExtended';
+import {getBackend} from './platform/backend-registry';
 import {argumentsToString, parseArguments} from './arguments';
 import {LogLevel, SessionState, Signal} from './types';
 import {SessionQueueManager} from './session-queue-manager';
+import {FFmpegKitExtended} from './ffmpeg-kit-extended';
+
+const NativeFFmpegKitExtended = getBackend();
 
 /**
  * Global FFmpegKit runtime configuration and utility methods.
  *
  * Settings apply process-wide and affect subsequently executed sessions. Call
  * `FFmpegKitExtended.initialize()` before using native configuration methods.
+ *
+ * @hideconstructor
+ * @category Configuration
  */
 export class FFmpegKitConfig {
-  /** Enables collection/redirection of native logs for session callbacks. */
-  static enableRedirection(): void {
-    NativeFFmpegKitExtended.enableRedirection();
+  /**
+   * Explicitly enables process-wide native log redirection.
+   *
+   * Installing an internal completion/log/statistics bridge does not call this
+   * method implicitly; the native redirection setting remains user authority.
+   */
+  static async enableRedirection(): Promise<void> {
+    await NativeFFmpegKitExtended.enableRedirection();
   }
 
-  /** Disables native log redirection. Session callback delivery may stop. */
-  static disableRedirection(): void {
-    NativeFFmpegKitExtended.disableRedirection();
+  /**
+   * Explicitly disables process-wide native log redirection.
+   *
+   * This is authoritative even when a session has an optional log consumer;
+   * completion transport remains independent of log/statistics delivery.
+   */
+  static async disableRedirection(): Promise<void> {
+    await NativeFFmpegKitExtended.disableRedirection();
   }
 
   /** Sets the minimum process-wide FFmpeg log level. */
-  static setLogLevel(level: LogLevel): void {
-    NativeFFmpegKitExtended.setLogLevel(level);
+  static async setLogLevel(level: LogLevel): Promise<void> {
+    await NativeFFmpegKitExtended.setLogLevel(level);
   }
 
   /** Returns the current process-wide FFmpeg log level. */
@@ -41,29 +57,29 @@ export class FFmpegKitConfig {
    *
    * `mapping` optionally maps font family names to filenames in the directory.
    */
-  static setFontDirectory(path: string, mapping?: Record<string, string>): void {
-    NativeFFmpegKitExtended.setFontDirectory(
+  static async setFontDirectory(path: string, mapping?: Record<string, string>): Promise<void> {
+    await NativeFFmpegKitExtended.setFontDirectory(
       path,
       mapping ? JSON.stringify(mapping) : '',
     );
   }
 
   /** Sets a native environment variable used by FFmpeg and its libraries. */
-  static setEnvironmentVariable(name: string, value: string): void {
-    NativeFFmpegKitExtended.setEnvironmentVariable(name, value);
+  static async setEnvironmentVariable(name: string, value: string): Promise<void> {
+    await NativeFFmpegKitExtended.setEnvironmentVariable(name, value);
   }
 
   /** Configures the native runtime to ignore one supported process signal. */
-  static ignoreSignal(signal: Signal): void {
-    NativeFFmpegKitExtended.ignoreSignal(signal);
+  static async ignoreSignal(signal: Signal): Promise<void> {
+    await NativeFFmpegKitExtended.ignoreSignal(signal);
   }
 
   /**
    * Selects the native audio output device by the name returned from
    * `listAudioOutputDevices()`.
    */
-  static setAudioOutputDevice(deviceName: string): void {
-    NativeFFmpegKitExtended.setAudioOutputDevice(deviceName);
+  static async setAudioOutputDevice(deviceName: string): Promise<void> {
+    await NativeFFmpegKitExtended.setAudioOutputDevice(deviceName);
   }
 
   /**
@@ -93,8 +109,8 @@ export class FFmpegKitConfig {
    * Sets the maximum number of completed/created sessions retained natively.
    * Reducing the value may discard older history entries.
    */
-  static setSessionHistorySize(size: number): void {
-    NativeFFmpegKitExtended.setSessionHistorySize(size);
+  static async setSessionHistorySize(size: number): Promise<void> {
+    await NativeFFmpegKitExtended.setSessionHistorySize(size);
   }
 
   /** Returns the native session-history capacity. */
@@ -103,11 +119,16 @@ export class FFmpegKitConfig {
   }
 
   /**
-   * Clears retained native session history. Do not clear history while code
-   * still expects to inspect those session IDs.
+   * Clears the native session registry and retained session history using the
+   * same lifecycle-aware transaction as `FFmpegKitExtended.clearSessions()`.
+   *
+   * After the backend clear succeeds, restored observer/callback state and
+   * cancellation-delivery bookkeeping are invalidated. Do not call this while
+   * sessions are running. Clearing sessions can cancel/invalidate active
+   * session handles, and Session getters for cleared IDs may subsequently fail.
    */
-  static clearSessions(): void {
-    NativeFFmpegKitExtended.clearSessions();
+  static clearSessions(): Promise<void> {
+    return FFmpegKitExtended.clearSessions();
   }
 
   /**
@@ -119,8 +140,8 @@ export class FFmpegKitConfig {
   }
 
   /** Closes and removes a pipe created by `registerNewFFmpegPipe()`. */
-  static closeFFmpegPipe(path: string): void {
-    NativeFFmpegKitExtended.closeFFmpegPipe(path);
+  static async closeFFmpegPipe(path: string): Promise<void> {
+    await NativeFFmpegKitExtended.closeFFmpegPipe(path);
   }
 
   /** Returns the enum name for a `SessionState`. */

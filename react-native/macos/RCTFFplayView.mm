@@ -103,6 +103,11 @@ static void ResolveFFplayFrameSymbols(void) {
           gFFmpegKitHandle, "ffplay_kit_unregister_frame_callback");
     }
   }
+
+  if (!gRegisterFrameCallback || !gUnregisterFrameCallback) {
+    gRegisterFrameCallback = NULL;
+    gUnregisterFrameCallback = NULL;
+  }
 }
 
 static void FillPermuteMap(const char *pixelFormat, uint8_t map[4]) {
@@ -241,11 +246,17 @@ static void FFplayFrameCallback(void *userdata,
   [self resetFrameState];
 }
 
+- (void)stopAcceptingFrames {
+  [_frameLock lock];
+  _acceptFrames = NO;
+  [_frameLock unlock];
+}
+
 // Activates this mounted component as the process-wide FFplay video target.
 - (void)activateFrameOutput {
   ResolveFFplayFrameSymbols();
-  if (!gRegisterFrameCallback) {
-    NSLog(@"FFmpegKitExtended: ffplay_kit_register_frame_callback was not found");
+  if (!gRegisterFrameCallback || !gUnregisterFrameCallback) {
+    NSLog(@"FFmpegKitExtended: complete FFplay callback API was not found");
     return;
   }
 
@@ -253,6 +264,11 @@ static void FFplayFrameCallback(void *userdata,
   @synchronized(coordinator) {
     if (coordinator.view == self && _acceptFrames) {
       return;
+    }
+
+    RCTFFplayView *previousView = coordinator.view;
+    if (previousView && previousView != self) {
+      [previousView stopAcceptingFrames];
     }
 
     if (gUnregisterFrameCallback) {
@@ -273,6 +289,7 @@ static void FFplayFrameCallback(void *userdata,
   FFplayFrameCoordinator *coordinator = FFplayCoordinator();
   @synchronized(coordinator) {
     if (coordinator.view != self) {
+      [self stopAcceptingFrames];
       return;
     }
 
@@ -283,9 +300,7 @@ static void FFplayFrameCallback(void *userdata,
     }
 
     coordinator.view = nil;
-    [_frameLock lock];
-    _acceptFrames = NO;
-    [_frameLock unlock];
+    [self stopAcceptingFrames];
   }
 }
 

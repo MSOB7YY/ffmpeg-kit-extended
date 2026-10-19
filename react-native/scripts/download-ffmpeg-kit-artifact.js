@@ -9,6 +9,8 @@ const path = require('path');
 const DEFAULT_RETRIES = 3;
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_REDIRECTS = 10;
+const LOCK_POLL_MS = 25;
+const LOCK_STALE_MS = 30 * 60 * 1000;
 
 function fail(message) {
   throw new Error(`FFmpegKit [Download]: ${message}`);
@@ -18,6 +20,21 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function clientFor(url) {
+  let protocol;
+  try {
+    protocol = new URL(url).protocol.toLowerCase();
+  } catch (_) {
+    fail(`Invalid download URL: ${url}`);
+  }
+  if (protocol !== 'http:' && protocol !== 'https:') {
+    fail(
+      `Unsupported download URL scheme "${protocol}"; only http:// and https:// URLs are supported.`,
+    );
+  }
+  return protocol === 'https:' ? https : http;
+}
+
 function requestBuffer(url, {timeoutMs = DEFAULT_TIMEOUT_MS, redirects = 0} = {}) {
   return new Promise((resolve, reject) => {
     if (redirects > MAX_REDIRECTS) {
@@ -25,7 +42,7 @@ function requestBuffer(url, {timeoutMs = DEFAULT_TIMEOUT_MS, redirects = 0} = {}
       return;
     }
 
-    const client = url.startsWith('https:') ? https : http;
+    const client = clientFor(url);
     const request = client.get(
       url,
       {
@@ -80,22 +97,54 @@ async function withRetries(operation, {retries = DEFAULT_RETRIES, label, quiet =
   throw lastError;
 }
 
-async function downloadToFile(url, target, options = {}) {
-  const tempTarget = `${target}.downloading`;
-  fs.mkdirSync(path.dirname(target), {recursive: true});
-  fs.rmSync(tempTarget, {force: true});
+async function withDirectoryLock(lockPath, operation) {
+  for (;;) {
+    try {
+      fs.mkdirSync(lockPath);
+      fs.writeFileSync(
+        path.join(lockPath, 'owner'),
+        `${process.pid}\n${new Date().toISOString()}\n`,
+      );
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      try {
+        if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+          fs.rmSync(lockPath, {recursive: true, force: true});
+          continue;
+        }
+      } catch (statError) {
+        if (statError.code !== 'ENOENT') throw statError;
+      }
+      await sleep(LOCK_POLL_MS);
+    }
+  }
 
   try {
-    const data = await withRetries(
-      () => requestBuffer(url, options),
-      {...options, label: `Download ${url}`},
-    );
-    fs.writeFileSync(tempTarget, data);
-    fs.renameSync(tempTarget, target);
-  } catch (error) {
-    fs.rmSync(tempTarget, {force: true});
-    throw error;
+    return await operation();
+  } finally {
+    fs.rmSync(lockPath, {recursive: true, force: true});
   }
+}
+
+async function downloadToFile(url, target, options = {}) {
+  fs.mkdirSync(path.dirname(target), {recursive: true});
+  return withDirectoryLock(`${target}.download.lock`, async () => {
+    const tempTarget = `${target}.downloading.${process.pid}.${Date.now()}.${crypto.randomBytes(8).toString('hex')}`;
+    try {
+      const data = await withRetries(
+        () => requestBuffer(url, options),
+        {...options, label: `Download ${url}`},
+      );
+      fs.writeFileSync(tempTarget, data);
+      if (process.platform === 'win32' && fs.existsSync(target)) {
+        fs.rmSync(target, {force: true});
+      }
+      fs.renameSync(tempTarget, target);
+    } finally {
+      fs.rmSync(tempTarget, {force: true});
+    }
+  });
 }
 
 function computeSha256(file) {
@@ -161,12 +210,11 @@ async function ensureArtifact({
   retries = DEFAULT_RETRIES,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   quiet = false,
+  reuseCached = true,
 }) {
   const options = {retries, timeoutMs, quiet};
-  const tempTarget = `${output}.downloading`;
-  fs.rmSync(tempTarget, {force: true});
 
-  if (fs.existsSync(output) && fs.statSync(output).size > 0) {
+  if (reuseCached && fs.existsSync(output) && fs.statSync(output).size > 0) {
     if (checksum) {
       try {
         const result = await verifyFile(output, checksum, options);
@@ -202,10 +250,6 @@ async function ensureArtifact({
     }
     return output;
   } catch (error) {
-    fs.rmSync(tempTarget, {force: true});
-    if (fs.existsSync(output) && (!checksum || fs.statSync(output).size === 0)) {
-      fs.rmSync(output, {force: true});
-    }
     throw error;
   }
 }

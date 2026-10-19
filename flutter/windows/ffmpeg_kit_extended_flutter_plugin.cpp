@@ -7,12 +7,17 @@
 // option) any later version.
 
 #include "include/ffmpeg_kit_extended_flutter/ffmpeg_kit_extended_flutter_plugin.h"
+#include "../native/ffplay_owner_coordinator.h"
+#include "../native/registered_texture_lifetime.h"
+#include "../native/texture_registration_transaction.h"
+#include "../native/packed_rgba_frame.h"
 
 #include <flutter/standard_method_codec.h>
 #include <windows.h>
 
 #include <cstring>
 #include <mutex>
+#include <string>
 
 // --- FFmpegKit ABI (runtime-resolved) ----------------------------------------
 // Resolve the frame-callback symbols at runtime via GetProcAddress so that the
@@ -30,74 +35,72 @@ using UnregisterFn = void (*)();
 
 static RegisterFn   g_register_fn   = nullptr;
 static UnregisterFn g_unregister_fn = nullptr;
-static std::once_flag g_resolve_once;
+static std::mutex g_resolve_mutex;
 
-static void ResolveFFplayProcs() {
-  std::call_once(g_resolve_once, [] {
-    static const char* kDllNames[] = {"libffmpegkit.dll", "ffmpegkit.dll",
-                                      nullptr};
-    for (const char** name = kDllNames; *name; ++name) {
-      HMODULE h = ::GetModuleHandleA(*name);
-      if (!h) {
-        ::OutputDebugStringA(
-            ("[ffmpegkit_plugin] GetModuleHandle(\"" + std::string(*name) +
-             "\") -> not loaded\n").c_str());
-        continue;
-      }
+static bool ResolveFFplayProcs() {
+  std::lock_guard<std::mutex> lock(g_resolve_mutex);
+  if (g_register_fn && g_unregister_fn) return true;
 
-      // Log the actual DLL path so we can confirm which file is in use.
-      char dllPath[MAX_PATH] = {};
-      ::GetModuleFileNameA(h, dllPath, MAX_PATH);
+  RegisterFn resolved_register = nullptr;
+  UnregisterFn resolved_unregister = nullptr;
+  static const char* kDllNames[] = {"libffmpegkit.dll", "ffmpegkit.dll",
+                                    nullptr};
+  for (const char** name = kDllNames; *name; ++name) {
+    HMODULE h = ::GetModuleHandleA(*name);
+    if (!h) {
       ::OutputDebugStringA(
-          ("[ffmpegkit_plugin] found DLL: " + std::string(dllPath) + "\n")
-              .c_str());
-
-      g_register_fn = reinterpret_cast<RegisterFn>(
-          ::GetProcAddress(h, "ffplay_kit_register_frame_callback"));
-      g_unregister_fn = reinterpret_cast<UnregisterFn>(
-          ::GetProcAddress(h, "ffplay_kit_unregister_frame_callback"));
-
-      // Probe additional symbols to confirm the DLL export table is complete.
-      auto video_w_fn =
-          ::GetProcAddress(h, "ffplay_kit_session_get_video_width");
-      using BuildStampFn = const char* (*)();
-      auto build_stamp_fn = reinterpret_cast<BuildStampFn>(
-          ::GetProcAddress(h, "ffmpeg_kit_get_build_stamp"));
-
-      char msg[512];
-      ::snprintf(msg, sizeof(msg),
-                 "[ffmpegkit_plugin] symbol probe - "
-                 "register_frame_callback: %s  "
-                 "unregister_frame_callback: %s  "
-                 "session_get_video_width: %s  "
-                 "get_build_stamp: %s  "
-                 "build: %s\n",
-                 g_register_fn ? "OK" : "MISSING",
-                 g_unregister_fn ? "OK" : "MISSING",
-                 video_w_fn ? "OK" : "MISSING",
-                 build_stamp_fn ? "OK" : "MISSING",
-                 build_stamp_fn ? build_stamp_fn() : "n/a");
-      ::OutputDebugStringA(msg);
-
-      if (g_register_fn && g_unregister_fn) break;
+          ("[ffmpegkit_plugin] GetModuleHandle(\"" + std::string(*name) +
+           "\") -> not loaded\n").c_str());
+      continue;
     }
-  });
+
+    char dllPath[MAX_PATH] = {};
+    ::GetModuleFileNameA(h, dllPath, MAX_PATH);
+    ::OutputDebugStringA(
+        ("[ffmpegkit_plugin] found DLL: " + std::string(dllPath) + "\n")
+            .c_str());
+
+    auto candidate_register = reinterpret_cast<RegisterFn>(
+        ::GetProcAddress(h, "ffplay_kit_register_frame_callback"));
+    auto candidate_unregister = reinterpret_cast<UnregisterFn>(
+        ::GetProcAddress(h, "ffplay_kit_unregister_frame_callback"));
+    if (candidate_register && candidate_unregister) {
+      resolved_register = candidate_register;
+      resolved_unregister = candidate_unregister;
+      break;
+    }
+  }
+
+  // Commit the pair atomically. A miss remains retryable and never publishes
+  // one half of the frame API.
+  if (!resolved_register || !resolved_unregister) {
+    g_register_fn = nullptr;
+    g_unregister_fn = nullptr;
+    return false;
+  }
+  g_register_fn = resolved_register;
+  g_unregister_fn = resolved_unregister;
+  return true;
 }
 
-static void ffplay_kit_register_frame_callback(FFplayKitFrameCallback cb,
-                                                void* ud) {
-  ResolveFFplayProcs();
-  if (g_register_fn) g_register_fn(cb, ud);
+static bool ffplay_kit_register_frame_callback(FFplayKitFrameCallback cb,
+                                               void* ud) {
+  if (!ResolveFFplayProcs() || !g_register_fn) return false;
+  g_register_fn(cb, ud);
+  return true;
 }
 
-static void ffplay_kit_unregister_frame_callback() {
-  ResolveFFplayProcs();
-  if (g_unregister_fn) g_unregister_fn();
+static bool ffplay_kit_unregister_frame_callback() {
+  if (!ResolveFFplayProcs() || !g_unregister_fn) return false;
+  g_unregister_fn();
+  return true;
 }
 
 }  // namespace
 
 namespace ffmpeg_kit_extended_flutter {
+
+static FfplayOwnerCoordinator<TextureState> g_ffplay_owner;
 
 // --- Frame callback (FFplay background thread) --------------------------------
 
@@ -106,25 +109,21 @@ static void OnFrameCallback(void* userdata, const uint8_t* pixels, int width,
   auto* state = reinterpret_cast<TextureState*>(userdata);
   if (!state || !pixels || width <= 0 || height <= 0) return;
 
+  ffmpeg_kit_extended_flutter::PackedRgbaFrame frame;
+  if (!ffmpeg_kit_extended_flutter::NormalizePackedRgbaFrame(
+          pixels, width, height, linesize, pixel_format, &frame)) {
+    return;
+  }
+
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     // Early exit if texture is being destroyed
     if (state->destroyed) {
       return;
     }
-    size_t row_bytes = static_cast<size_t>(linesize);
-    state->write_buf.resize(row_bytes * static_cast<size_t>(height));
-    memcpy(state->write_buf.data(), pixels, state->write_buf.size());
-    if (pixel_format && strcmp(pixel_format, "rgb0") == 0) {
-      uint8_t* buf = state->write_buf.data();
-      for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-          buf[y * linesize + x * 4 + 3] = 0xFF;
-        }
-      }
-    }
-    state->width = static_cast<uint32_t>(width);
-    state->height = static_cast<uint32_t>(height);
+    state->write_buf.swap(frame.bytes);
+    state->width = frame.width;
+    state->height = frame.height;
     // Swap write_buf <-> read_buf so the render callback always gets the latest
     // complete frame without blocking the decoder thread.
     std::swap(state->write_buf, state->read_buf);
@@ -135,11 +134,13 @@ static void OnFrameCallback(void* userdata, const uint8_t* pixels, int width,
 // --- CopyPixelBuffer callback (Flutter render thread) ------------------------
 
 static const FlutterDesktopPixelBuffer* CopyPixelBuffer(size_t /*width*/,
-                                                         size_t /*height*/,
-                                                         void* userdata) {
+                                                          size_t /*height*/,
+                                                          void* userdata) {
   auto* state = reinterpret_cast<TextureState*>(userdata);
+  if (!state) return nullptr;
   std::lock_guard<std::mutex> lock(state->mutex);
-  if (state->read_buf.empty() || state->width == 0 || state->height == 0)
+  if (state->destroyed || state->read_buf.empty() || state->width == 0 ||
+      state->height == 0)
     return nullptr;
 
   // Copy under the mutex so render_buf.data() remains stable after we return
@@ -193,15 +194,20 @@ void FfmpegKitExtendedFlutterPlugin::HandleMethodCall(
 
 void FfmpegKitExtendedFlutterPlugin::HandleCreateTexture(
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  if (!ResolveFFplayProcs()) {
+    result->Error("FFPLAY_UNAVAILABLE",
+                  "FFplay frame callback API is not available yet");
+    return;
+  }
+
   // Release any existing texture before creating a new one.
   ReleaseTextureState();
 
   auto state = std::make_unique<TextureState>();
   state->texture_registrar = texture_registrar_;
 
-  // Build the TextureVariant with a PixelBufferTexture.  The lambda captures
-  // the raw state pointer; the TextureVariant is owned by the TextureState so
-  // it is always destroyed before the state itself.
+  // Build the TextureVariant with a PixelBufferTexture. The retirement owner
+  // keeps the state and callback object alive until Flutter unregisters it.
   TextureState* state_ptr = state.get();
   state->texture_variant = std::make_unique<flutter::TextureVariant>(
       flutter::PixelBufferTexture(
@@ -212,8 +218,30 @@ void FfmpegKitExtendedFlutterPlugin::HandleCreateTexture(
   state->texture_id =
       texture_registrar_->RegisterTexture(state->texture_variant.get());
 
+  if (state->texture_id < 0) {
+    result->Error("TEXTURE_REGISTRATION_FAILED",
+                  "Flutter could not register the FFplay texture");
+    return;
+  }
+
   // Register frame callback - decoded frames will now flow into this texture.
-  ffplay_kit_register_frame_callback(OnFrameCallback, state_ptr);
+  // Only the latest successful wrapper binding owns the process-global target.
+  if (!InstallOwnerAfterTextureRegistration(
+          state->texture_id,
+          [state_ptr] {
+            return g_ffplay_owner.install(
+                state_ptr, [state_ptr] {
+                  return ffplay_kit_register_frame_callback(OnFrameCallback,
+                                                            state_ptr);
+                });
+          },
+           [registrar = texture_registrar_, &state](int64_t texture_id) mutable {
+             if (state) state->texture_id = texture_id;
+             RetireRegisteredTexture(registrar, std::move(state));
+           })) {
+    result->Error("FFPLAY_OWNER", "Could not claim FFplay output ownership");
+    return;
+  }
 
   texture_state_ = std::move(state);
 
@@ -262,8 +290,10 @@ void FfmpegKitExtendedFlutterPlugin::ReleaseTextureState() {
   auto state_to_release = std::move(texture_state_);
   texture_state_ = nullptr;
 
-  // 1. Stop frame delivery before touching the texture.
-  ffplay_kit_unregister_frame_callback();
+  // 1. Stop frame delivery only if this exact state still owns the
+  // process-global callback. A stale plugin must not clear a newer texture.
+  g_ffplay_owner.uninstallIfOwned(
+      state_to_release.get(), [] { ffplay_kit_unregister_frame_callback(); });
 
   // 2. Drain any in-flight callback: acquire then immediately release the mutex
   //    to guarantee the callback (which now holds the mutex for its entire
@@ -280,14 +310,10 @@ void FfmpegKitExtendedFlutterPlugin::ReleaseTextureState() {
     state_to_release->height = 0;
   }
 
-  // 3. Unregister the texture from Flutter's TextureRegistrar.
-  if (state_to_release->texture_id >= 0) {
-    texture_registrar_->UnregisterTexture(state_to_release->texture_id);
-    state_to_release->texture_id = -1;
-  }
-
-  // 4. Destroy the state (and the TextureVariant inside it).
-  // state_to_release goes out of scope here, automatically destroying the TextureState
+  // 3. Keep the callback-captured state and TextureVariant alive until Flutter
+  // confirms that external-texture retirement is complete. This callback does
+  // not capture the plugin, so plugin destruction is safe.
+  RetireRegisteredTexture(texture_registrar_, std::move(state_to_release));
 }
 
 }  // namespace ffmpeg_kit_extended_flutter

@@ -1,6 +1,9 @@
-import NativeFFmpegKitExtended from './NativeFFmpegKitExtended';
-import {FFprobeSession, MediaInformationSession} from './session';
-import type {ExecuteOptions} from './types';
+import { getBackend } from './platform/backend-registry';
+import { FFprobeSession, MediaInformationSession } from './session';
+import type { ExecuteOptions } from './types';
+import { FFmpegKitExtended } from './ffmpeg-kit-extended';
+
+const NativeFFmpegKitExtended = getBackend();
 
 const MEDIA_INFO_COMMAND =
   '-v error -hide_banner -print_format json -show_format -show_streams -show_chapters -i';
@@ -11,6 +14,13 @@ const MEDIA_INFO_COMMAND =
  * Call `FFmpegKitExtended.initialize()` once before use. Commands omit the
  * `ffprobe` executable name. For common structured metadata, prefer
  * `getMediaInformation()` over manually parsing FFprobe JSON output.
+ *
+ * On Web, execute and media-information methods return Promises and support
+ * local/MEMFS files and direct HTTP(S)/HLS with the pinned streaming runtime.
+ * No synchronous network probe is exposed.
+ *
+ * @hideconstructor
+ * @category Media information
  */
 export class FFprobeKit {
   /** Creates an FFprobe session without starting it. */
@@ -18,14 +28,14 @@ export class FFprobeKit {
     requireCommand(command);
     return new FFprobeSession(
       NativeFFmpegKitExtended.createFFprobeSession(command),
-      command,
+      command
     );
   }
 
   /** Alias of `executeAsync()`; resolves when FFprobe finishes. */
   static execute(
     command: string,
-    options: ExecuteOptions<FFprobeSession> = {},
+    options: ExecuteOptions<FFprobeSession> = {}
   ): Promise<FFprobeSession> {
     return this.executeAsync(command, options);
   }
@@ -38,15 +48,15 @@ export class FFprobeKit {
    */
   static executeAsync(
     command: string,
-    options: ExecuteOptions<FFprobeSession> = {},
+    options: ExecuteOptions<FFprobeSession> = {}
   ): Promise<FFprobeSession> {
     const session = this.createSession(command);
     return session.executeAsync(options);
   }
 
-  /** Requests cancellation of an FFprobe session. */
-  static cancel(session: FFprobeSession): void {
-    session.cancel();
+  /** Requests cancellation of a created, queued, or running FFprobe session. */
+  static cancel(session: FFprobeSession): Promise<void> {
+    return session.cancel();
   }
 
   /**
@@ -58,14 +68,14 @@ export class FFprobeKit {
    */
   static createMediaInformationSession(
     path: string,
-    timeoutMs = 500,
+    timeoutMs = 500
   ): MediaInformationSession {
     requireCommand(path);
     const command = `${MEDIA_INFO_COMMAND} ${formatMediaPathForDisplay(path)}`;
     return new MediaInformationSession(
       NativeFFmpegKitExtended.createMediaInformationSessionFromPath(path),
       command,
-      timeoutMs,
+      timeoutMs
     );
   }
 
@@ -75,7 +85,7 @@ export class FFprobeKit {
    */
   static async getMediaInformation(
     path: string,
-    timeoutMs = 500,
+    timeoutMs = 500
   ): Promise<MediaInformationSession> {
     const session = this.createMediaInformationSession(path, timeoutMs);
     return session.executeAsync();
@@ -83,18 +93,12 @@ export class FFprobeKit {
 
   /** Returns the newest FFprobe session retained in native history. */
   static getLastFFprobeSession(): FFprobeSession | undefined {
-    const json = NativeFFmpegKitExtended.getLastSessionJson('ffprobe');
-    if (!json) return undefined;
-    const data = JSON.parse(json) as {sessionId: number; command: string};
-    return new FFprobeSession(data.sessionId, data.command);
+    return FFmpegKitExtended.getLastFFprobeSession();
   }
 
   /** Returns FFprobe sessions currently retained in native history. */
   static getFFprobeSessions(): FFprobeSession[] {
-    const data = JSON.parse(
-      NativeFFmpegKitExtended.getSessionsJson('ffprobe') || '[]',
-    ) as Array<{sessionId: number; command: string}>;
-    return data.map(item => new FFprobeSession(item.sessionId, item.command));
+    return FFmpegKitExtended.getFFprobeSessions();
   }
 }
 
@@ -103,7 +107,5 @@ function requireCommand(command: string): void {
 }
 
 function formatMediaPathForDisplay(path: string): string {
-  return /[\s"\\]/.test(path)
-    ? `"${path.replace(/(["\\])/g, '\\$1')}"`
-    : path;
+  return /[\s"\\]/.test(path) ? `"${path.replace(/(["\\])/g, '\\$1')}"` : path;
 }

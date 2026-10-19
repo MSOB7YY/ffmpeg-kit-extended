@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const {afterEach, test} = require('node:test');
+const { afterEach, test } = require('node:test');
 
 const {
   SessionCancelledException,
@@ -17,15 +17,29 @@ function deferred() {
     resolve = resolvePromise;
     reject = rejectPromise;
   });
-  return {promise, resolve, reject};
+  return { promise, resolve, reject };
 }
 
-function createSession() {
+let nextSessionId = 1;
+
+function createSession(sessionId = nextSessionId++) {
   return {
+    sessionId,
     cancelCount: 0,
+    preExecutionCancellationCount: 0,
+    getSessionId() {
+      return this.sessionId;
+    },
     cancel() {
       this.cancelCount += 1;
     },
+  };
+}
+
+function markBeforeExecution(session) {
+  return () => {
+    session.preExecutionCancellationCount += 1;
+    session.isCancelled = true;
   };
 }
 
@@ -36,18 +50,12 @@ afterEach(async () => {
 });
 
 test('maxConcurrentSessions rejects invalid values', () => {
-  assert.throws(
-    () => {
-      manager.maxConcurrentSessions = 0;
-    },
-    /integer of at least 1/,
-  );
-  assert.throws(
-    () => {
-      manager.maxConcurrentSessions = 1.5;
-    },
-    /integer of at least 1/,
-  );
+  assert.throws(() => {
+    manager.maxConcurrentSessions = 0;
+  }, /integer of at least 1/);
+  assert.throws(() => {
+    manager.maxConcurrentSessions = 1.5;
+  }, /integer of at least 1/);
 });
 
 test('executeSession respects the configured concurrency limit', async () => {
@@ -81,6 +89,147 @@ test('executeSession respects the configured concurrency limit', async () => {
   ]);
 });
 
+test('duplicate object admission does not undercount active work', async () => {
+  manager.maxConcurrentSessions = 2;
+  const session = createSession();
+  const gate = deferred();
+  const first = manager.executeSession(session, () => gate.promise);
+
+  await assert.rejects(
+    manager.executeSession(session, async () => 'duplicate'),
+    /already queued or active/
+  );
+  assert.equal(manager.activeSessionCount, 1);
+
+  gate.resolve();
+  await first;
+  assert.equal(manager.activeSessionCount, 0);
+});
+
+test('duplicate queued admission is rejected without discard cleanup', async () => {
+  manager.maxConcurrentSessions = 1;
+  const activeGate = deferred();
+  const queuedSession = createSession();
+  const active = manager.executeSession(
+    createSession(),
+    () => activeGate.promise
+  );
+  const queued = manager.executeSession(queuedSession, async () => 'queued');
+  let discardCalls = 0;
+
+  await assert.rejects(
+    manager.executeSession(
+      queuedSession,
+      async () => 'duplicate queued',
+      () => {
+        discardCalls += 1;
+      }
+    ),
+    /already queued or active/
+  );
+  assert.equal(discardCalls, 0);
+  assert.equal(manager.queueLength, 1);
+
+  activeGate.resolve();
+  await active;
+  assert.equal(await queued, 'queued');
+});
+
+test('waitForAll remains pending while the admitted executor is active', async () => {
+  manager.maxConcurrentSessions = 2;
+  const gate = deferred();
+  const session = createSession();
+  const active = manager.executeSession(session, () => gate.promise);
+  await assert.rejects(
+    manager.executeSession(session, async () => 'duplicate'),
+    /already queued or active/
+  );
+
+  let settled = false;
+  const all = manager.waitForAll().then(() => {
+    settled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+
+  gate.resolve();
+  await active;
+  await all;
+  assert.equal(settled, true);
+});
+
+test('distinct wrappers for one native session ID cannot both be admitted', async () => {
+  manager.maxConcurrentSessions = 2;
+  const firstSession = createSession(9001);
+  const secondSession = createSession(9001);
+  const gate = deferred();
+  const first = manager.executeSession(firstSession, () => gate.promise);
+
+  await assert.rejects(
+    manager.executeSession(secondSession, async () => 'duplicate native ID'),
+    /Session 9001 is already queued or active/
+  );
+  assert.equal(manager.queueLength, 0);
+
+  gate.resolve();
+  await first;
+});
+
+test('synchronous executor failure releases the slot and starts the next item', async () => {
+  manager.maxConcurrentSessions = 1;
+  const firstError = new Error('synchronous executor failure');
+  const starts = [];
+  const first = manager.executeSession(createSession(), () => {
+    starts.push('first');
+    throw firstError;
+  });
+  const second = manager.executeSession(createSession(), async () => {
+    starts.push('second');
+    return 'second';
+  });
+
+  await assert.rejects(first, (reason) => reason === firstError);
+  assert.equal(await second, 'second');
+  assert.deepEqual(starts, ['first', 'second']);
+  assert.equal(manager.activeSessionCount, 0);
+});
+
+test('asynchronous executor rejection preserves the original error and releases the slot', async () => {
+  manager.maxConcurrentSessions = 1;
+  const failure = new Error('asynchronous executor failure');
+  const rejected = manager.executeSession(createSession(), async () => {
+    await Promise.resolve();
+    throw failure;
+  });
+  const next = manager.executeSession(createSession(), async () => 'next');
+
+  await assert.rejects(rejected, (reason) => reason === failure);
+  assert.equal(await next, 'next');
+  assert.equal(manager.activeSessionCount, 0);
+});
+
+test('handoff state rejection releases admission without discard cleanup', async () => {
+  manager.maxConcurrentSessions = 1;
+  const rejectedSession = createSession();
+  let discardCalls = 0;
+  rejectedSession.prepareForExecution = () => {
+    throw new Error('session is already terminal');
+  };
+  const rejected = manager.executeSession(
+    rejectedSession,
+    async () => 'must not execute',
+    () => {
+      discardCalls += 1;
+    }
+  );
+  const next = manager.executeSession(createSession(), async () => 'next');
+
+  await assert.rejects(rejected, /already terminal/);
+  assert.equal(discardCalls, 0);
+  assert.equal(await next, 'next');
+  assert.equal(manager.activeSessionCount, 0);
+});
+
 test('clearQueue rejects pending work without cancelling the active session', async () => {
   manager.maxConcurrentSessions = 1;
   const activeSession = createSession();
@@ -91,16 +240,179 @@ test('clearQueue rejects pending work without cancelling the active session', as
     await gate.promise;
     return 'active';
   });
-  const pending = manager.executeSession(pendingSession, async () => 'pending');
+  const pending = manager.executeSession(
+    pendingSession,
+    async () => 'pending',
+    undefined,
+    markBeforeExecution(pendingSession)
+  );
 
   manager.clearQueue();
 
   await assert.rejects(pending, SessionCancelledException);
   assert.equal(activeSession.cancelCount, 0);
   assert.equal(pendingSession.cancelCount, 0);
+  assert.equal(activeSession.preExecutionCancellationCount, 0);
+  assert.equal(pendingSession.preExecutionCancellationCount, 1);
+  assert.equal(pendingSession.isCancelled, true);
 
   gate.resolve();
   assert.equal(await active, 'active');
+});
+
+test('queue cancellation marks retained work without invoking its full cancel method', async () => {
+  manager.maxConcurrentSessions = 1;
+  const activeGate = deferred();
+  const active = manager.executeSession(
+    createSession(),
+    () => activeGate.promise
+  );
+  const queuedSession = createSession();
+  let cleanupStarted = false;
+  const queued = manager.executeSession(
+    queuedSession,
+    async () => {
+      throw new Error('queued executor must not start');
+    },
+    () => {
+      cleanupStarted = true;
+    },
+    markBeforeExecution(queuedSession)
+  );
+
+  assert.equal(await manager.cancelQueued(queuedSession), true);
+  await assert.rejects(queued, SessionCancelledException);
+  assert.equal(queuedSession.isCancelled, true);
+  assert.equal(queuedSession.preExecutionCancellationCount, 1);
+  assert.equal(queuedSession.cancelCount, 0);
+  assert.equal(cleanupStarted, true);
+  assert.equal(manager.queueLength, 0);
+
+  activeGate.resolve();
+  await active;
+});
+
+test('clearQueue settles every pending item after discard cleanup failure', async () => {
+  manager.maxConcurrentSessions = 1;
+  const activeGate = deferred();
+  const active = manager.executeSession(createSession(), async () => {
+    await activeGate.promise;
+  });
+  const cleanupError = new Error('discard cleanup failed');
+  let pendingBCleanupCount = 0;
+  const pendingA = manager.executeSession(
+    createSession(),
+    async () => 'pending A',
+    () => {
+      throw cleanupError;
+    }
+  );
+  const pendingB = manager.executeSession(
+    createSession(),
+    async () => 'pending B',
+    () => {
+      pendingBCleanupCount += 1;
+    }
+  );
+
+  assert.doesNotThrow(() => manager.clearQueue());
+
+  await assert.rejects(pendingA, SessionCancelledException);
+  await assert.rejects(pendingB, SessionCancelledException);
+  assert.equal(pendingBCleanupCount, 1);
+  assert.equal(manager.queueLength, 0);
+
+  activeGate.resolve();
+  await active;
+});
+
+test('cancelQueued removes only the targeted session and preserves later work', async () => {
+  manager.maxConcurrentSessions = 1;
+  const activeGate = deferred();
+  const starts = [];
+  const active = manager.executeSession(createSession(), async () => {
+    starts.push('A');
+    await activeGate.promise;
+  });
+  const sessionB = createSession();
+  const sessionC = createSession();
+  const pendingB = manager.executeSession(sessionB, async () => {
+    starts.push('B');
+  });
+  const pendingC = manager.executeSession(sessionC, async () => {
+    starts.push('C');
+    return 'C';
+  });
+
+  assert.equal(manager.cancelQueued(sessionB), true);
+  await assert.rejects(pendingB, SessionCancelledException);
+  assert.equal(manager.queueLength, 1);
+
+  activeGate.resolve();
+  await active;
+  assert.equal(await pendingC, 'C');
+  assert.deepEqual(starts, ['A', 'C']);
+});
+
+test('cancelQueued preserves later work when targeted discard cleanup fails', async () => {
+  manager.maxConcurrentSessions = 1;
+  const activeGate = deferred();
+  const starts = [];
+  const active = manager.executeSession(createSession(), async () => {
+    starts.push('A');
+    await activeGate.promise;
+  });
+  const cleanupError = new Error('targeted discard cleanup failed');
+  const sessionB = createSession();
+  const sessionC = createSession();
+  const pendingB = manager.executeSession(
+    sessionB,
+    async () => {
+      starts.push('B');
+    },
+    () => {
+      throw cleanupError;
+    }
+  );
+  const pendingC = manager.executeSession(sessionC, async () => {
+    starts.push('C');
+    return 'C';
+  });
+
+  assert.equal(manager.cancelQueued(sessionB), true);
+  await assert.rejects(pendingB, SessionCancelledException);
+  assert.equal(manager.queueLength, 1);
+
+  activeGate.resolve();
+  await active;
+  assert.equal(await pendingC, 'C');
+  assert.deepEqual(starts, ['A', 'C']);
+});
+
+test('cancelBySessionId routes a managed target through its cancellation method', async () => {
+  manager.maxConcurrentSessions = 1;
+  const activeGate = deferred();
+  const activeSession = createSession(7001);
+  const queuedSession = createSession(7002);
+  const active = manager.executeSession(
+    activeSession,
+    () => activeGate.promise
+  );
+  const queued = manager.executeSession(
+    queuedSession,
+    async () => 'must not start'
+  );
+
+  assert.equal(await manager.cancelBySessionId(7002), true);
+  assert.equal(queuedSession.cancelCount, 1);
+  assert.equal(manager.cancelQueued(queuedSession), true);
+  await assert.rejects(queued, SessionCancelledException);
+  assert.equal(await manager.cancelBySessionId(7001), true);
+  assert.equal(activeSession.cancelCount, 1);
+  assert.equal(await manager.cancelBySessionId(7999), false);
+
+  activeGate.resolve();
+  await active;
 });
 
 test('cancelCurrent cancels every active session', async () => {
@@ -126,3 +438,281 @@ test('cancelCurrent cancels every active session', async () => {
   secondGate.resolve();
   await Promise.all([first, second]);
 });
+
+test('cancelCurrent attempts every active session before rethrowing the first error', async () => {
+  manager.maxConcurrentSessions = 2;
+  const firstError = new Error('first cancellation failed');
+  const firstSession = createSession();
+  firstSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    throw firstError;
+  };
+  const secondSession = createSession();
+  const firstGate = deferred();
+  const secondGate = deferred();
+
+  const first = manager.executeSession(
+    firstSession,
+    async () => firstGate.promise
+  );
+  const second = manager.executeSession(
+    secondSession,
+    async () => secondGate.promise
+  );
+
+  assert.throws(
+    () => manager.cancelCurrent(),
+    (reason) => reason === firstError
+  );
+  assert.equal(firstSession.cancelCount, 1);
+  assert.equal(secondSession.cancelCount, 1);
+
+  firstGate.resolve();
+  secondGate.resolve();
+  await Promise.all([first, second]);
+});
+
+test('cancelCurrent reports the first active failure despite later settlement', async () => {
+  manager.maxConcurrentSessions = 2;
+  const firstError = new Error('first active cancellation failed');
+  const secondError = new Error('second active cancellation failed');
+  const firstCancellation = deferred();
+  const secondCancellation = deferred();
+  const firstExecution = deferred();
+  const secondExecution = deferred();
+  const firstSession = createSession();
+  firstSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    return firstCancellation.promise;
+  };
+  const secondSession = createSession();
+  secondSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    return secondCancellation.promise;
+  };
+
+  const first = manager.executeSession(firstSession, () => firstExecution.promise);
+  const second = manager.executeSession(
+    secondSession,
+    () => secondExecution.promise
+  );
+  const cancellation = manager.cancelCurrent();
+
+  assert.equal(firstSession.cancelCount, 1);
+  assert.equal(secondSession.cancelCount, 1);
+  secondCancellation.reject(secondError);
+  firstCancellation.reject(firstError);
+
+  await assert.rejects(cancellation, (reason) => reason === firstError);
+  firstExecution.resolve();
+  secondExecution.resolve();
+  await Promise.all([first, second]);
+});
+
+test('cancelCurrent preserves target order when the earlier failure settles first', async () => {
+  manager.maxConcurrentSessions = 2;
+  const firstError = new Error('first ordered cancellation failed');
+  const secondError = new Error('second ordered cancellation failed');
+  const firstCancellation = deferred();
+  const secondCancellation = deferred();
+  const firstExecution = deferred();
+  const secondExecution = deferred();
+  const firstSession = createSession();
+  firstSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    return firstCancellation.promise;
+  };
+  const secondSession = createSession();
+  secondSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    return secondCancellation.promise;
+  };
+
+  const first = manager.executeSession(firstSession, () => firstExecution.promise);
+  const second = manager.executeSession(
+    secondSession,
+    () => secondExecution.promise
+  );
+  const cancellation = manager.cancelCurrent();
+
+  firstCancellation.reject(firstError);
+  secondCancellation.reject(secondError);
+
+  await assert.rejects(cancellation, (reason) => reason === firstError);
+  firstExecution.resolve();
+  secondExecution.resolve();
+  await Promise.all([first, second]);
+});
+
+test('cancelCurrent reports the later target only when the first succeeds', async () => {
+  manager.maxConcurrentSessions = 2;
+  const secondError = new Error('second target cancellation failed');
+  const firstCancellation = deferred();
+  const secondCancellation = deferred();
+  const firstExecution = deferred();
+  const secondExecution = deferred();
+  const firstSession = createSession();
+  firstSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    return firstCancellation.promise;
+  };
+  const secondSession = createSession();
+  secondSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    return secondCancellation.promise;
+  };
+
+  const first = manager.executeSession(firstSession, () => firstExecution.promise);
+  const second = manager.executeSession(
+    secondSession,
+    () => secondExecution.promise
+  );
+  const cancellation = manager.cancelCurrent();
+
+  firstCancellation.resolve();
+  secondCancellation.reject(secondError);
+
+  await assert.rejects(cancellation, (reason) => reason === secondError);
+  firstExecution.resolve();
+  secondExecution.resolve();
+  await Promise.all([first, second]);
+});
+
+test('cancelCurrent keeps the earlier target authoritative across sync and async failures', async () => {
+  manager.maxConcurrentSessions = 2;
+  const firstError = new Error('earlier async cancellation failed');
+  const secondError = new Error('later sync cancellation failed');
+  const firstCancellation = deferred();
+  const firstExecution = deferred();
+  const secondExecution = deferred();
+  const firstSession = createSession();
+  firstSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    return firstCancellation.promise;
+  };
+  const secondSession = createSession();
+  secondSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    throw secondError;
+  };
+
+  const first = manager.executeSession(firstSession, () => firstExecution.promise);
+  const second = manager.executeSession(
+    secondSession,
+    () => secondExecution.promise
+  );
+  const cancellation = manager.cancelCurrent();
+
+  firstCancellation.reject(firstError);
+  await assert.rejects(cancellation, (reason) => reason === firstError);
+  firstExecution.resolve();
+  secondExecution.resolve();
+  await Promise.all([first, second]);
+});
+
+test('cancelCurrent keeps a synchronous first failure authoritative over later async failure', async () => {
+  manager.maxConcurrentSessions = 2;
+  const firstError = new Error('earlier sync cancellation failed');
+  const secondError = new Error('later async cancellation failed');
+  const secondCancellation = deferred();
+  const firstExecution = deferred();
+  const secondExecution = deferred();
+  const firstSession = createSession();
+  firstSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    throw firstError;
+  };
+  const secondSession = createSession();
+  secondSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    return secondCancellation.promise;
+  };
+
+  const first = manager.executeSession(firstSession, () => firstExecution.promise);
+  const second = manager.executeSession(
+    secondSession,
+    () => secondExecution.promise
+  );
+  const cancellation = manager.cancelCurrent();
+
+  secondCancellation.reject(secondError);
+  await assert.rejects(cancellation, (reason) => reason === firstError);
+  firstExecution.resolve();
+  secondExecution.resolve();
+  await Promise.all([first, second]);
+});
+
+test('cancelAll initiates active cancellation before deferred queued cleanup resolves', async () => {
+  manager.maxConcurrentSessions = 1;
+  const activeGate = deferred();
+  const discardGate = deferred();
+  const activeSession = createSession();
+  const queuedSession = createSession();
+  const active = manager.executeSession(activeSession, () => activeGate.promise);
+  const queued = manager.executeSession(
+    queuedSession,
+    async () => 'must not start',
+    () => discardGate.promise,
+    markBeforeExecution(queuedSession)
+  );
+
+  let settled = false;
+  const cancellation = manager.cancelAll();
+  Promise.resolve(cancellation).then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    }
+  );
+  await Promise.resolve();
+
+  assert.equal(manager.queueLength, 0);
+  assert.equal(activeSession.cancelCount, 1);
+  assert.equal(queuedSession.preExecutionCancellationCount, 1);
+  assert.equal(settled, false);
+
+  discardGate.resolve();
+  await assert.rejects(queued, SessionCancelledException);
+  await cancellation;
+
+  activeGate.resolve();
+  await active;
+});
+
+test('cancelAll attempts every active target and preserves the first failure', async () => {
+  manager.maxConcurrentSessions = 2;
+  const activeGate = deferred();
+  const secondGate = deferred();
+  const cleanupGate = deferred();
+  const firstError = new Error('active cancellation failed');
+  const firstSession = createSession();
+  firstSession.cancel = function cancel() {
+    this.cancelCount += 1;
+    throw firstError;
+  };
+  const secondSession = createSession();
+  const first = manager.executeSession(firstSession, () => activeGate.promise);
+  const second = manager.executeSession(secondSession, () => secondGate.promise);
+  const queuedSession = createSession();
+  const queued = manager.executeSession(
+    queuedSession,
+    async () => 'must not start',
+    () => cleanupGate.promise
+  );
+
+  const cancellation = manager.cancelAll();
+  assert.equal(firstSession.cancelCount, 1);
+  assert.equal(secondSession.cancelCount, 1);
+  assert.equal(manager.queueLength, 0);
+
+  cleanupGate.resolve();
+  await assert.rejects(queued, SessionCancelledException);
+  await assert.rejects(cancellation, (reason) => reason === firstError);
+
+  activeGate.resolve();
+  secondGate.resolve();
+  await Promise.all([first, second]);
+});
+

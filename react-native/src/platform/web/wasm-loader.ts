@@ -1,0 +1,88 @@
+export interface WasmModule {
+  HEAPU8: Uint8Array;
+  HEAPU32: Uint32Array;
+  FS?: WasmFileSystem;
+  _malloc(size: number): number;
+  _free(pointer: number): void;
+  UTF8ToString(pointer: number): string;
+  stringToUTF8(value: string, pointer: number, maxBytes: number): void;
+  lengthBytesUTF8(value: string): number;
+  /** Emscripten function-table ownership used by the structured callback bridge. */
+  addFunction?(callback: (...args: unknown[]) => unknown, signature: string): number;
+  removeFunction?(pointer: number): void;
+  [name: string]: unknown;
+}
+
+/** The Emscripten filesystem operations used by the Web file facade. */
+export interface WasmFileSystem {
+  writeFile(path: string, data: Uint8Array): void;
+  readFile(path: string): Uint8Array;
+  unlink(path: string): void;
+  stat(path: string): {mode: number; size: number};
+}
+
+export interface WasmInitializeOptions {
+  assetBaseUrl?: string;
+}
+
+let moduleValue: WasmModule | undefined;
+let initialization: Promise<void> | undefined;
+
+function normalizedBaseUrl(value?: string): string {
+  const base = value ?? '/ffmpeg-kit-extended/wasm/';
+  return base.endsWith('/') ? base : `${base}/`;
+}
+
+function requireIsolation(): void {
+  const isolated = (globalThis as typeof globalThis & {crossOriginIsolated?: boolean})
+    .crossOriginIsolated;
+  if (!isolated || typeof SharedArrayBuffer === 'undefined') {
+    throw new Error(
+      'FFmpegKit Web requires cross-origin isolation (COOP same-origin and COEP require-corp) and SharedArrayBuffer.',
+    );
+  }
+}
+
+export function requireWasmModule(): WasmModule {
+  if (!moduleValue) {
+    throw new Error(
+      'FFmpegKitExtended.initialize() must be awaited before using the Web backend.',
+    );
+  }
+  return moduleValue;
+}
+
+export function isWasmModuleReady(): boolean {
+  return moduleValue !== undefined;
+}
+
+export function initializeWasm(options?: WasmInitializeOptions): Promise<void> {
+  if (moduleValue) return Promise.resolve();
+  initialization ??= loadWasm(normalizedBaseUrl(options?.assetBaseUrl))
+    .then(() => undefined)
+    .catch(error => {
+      initialization = undefined;
+      throw error;
+    });
+  return initialization;
+}
+
+async function loadWasm(baseUrl: string): Promise<WasmModule> {
+  requireIsolation();
+  const pageUrl = (globalThis as typeof globalThis & {location?: Location}).location?.href;
+  const bridgeUrl = new URL('ffmpegkit_bridge.mjs', new URL(baseUrl, pageUrl ?? 'http://localhost/'));
+  const bridge = await import(/* @vite-ignore */ bridgeUrl.href) as {
+    createFFmpegKitModule?: () => Promise<WasmModule>;
+  };
+  if (typeof bridge.createFFmpegKitModule !== 'function') {
+    throw new Error(`Wasm bridge does not export a module factory: ${bridgeUrl.href}`);
+  }
+  const loaded = await bridge.createFFmpegKitModule();
+  moduleValue = loaded;
+  return loaded;
+}
+
+export function resetWasmLoaderForTests(): void {
+  moduleValue = undefined;
+  initialization = undefined;
+}

@@ -1,0 +1,63 @@
+import 'dart:io';
+
+import 'package:ffmpeg_kit_extended_flutter/src/platform/web/web_asset_paths.dart';
+import 'package:test/test.dart';
+
+void main() {
+  test('uses the build-hook staged Web runtime URL root', () {
+    expect(
+      WebAssetPaths.defaultAssetKeyRoot,
+      'packages/ffmpeg_kit_extended_flutter/wasm',
+    );
+    expect(
+      WebAssetPaths.defaultAssetRoot,
+      'assets/packages/ffmpeg_kit_extended_flutter/wasm',
+    );
+  });
+
+  test('keeps current Web support modules as build-hook staging sources', () {
+    for (final name in <String>[
+      'ffmpegkit_bridge.mjs',
+      'ffmpegkit_callback_runtime.mjs',
+      'ffmpegkit_heap_runtime.mjs',
+      'ffmpegkit_loader.mjs',
+    ]) {
+      final file = File('web/$name');
+      expect(file.existsSync(), isTrue, reason: name);
+      expect(file.lengthSync(), greaterThan(0), reason: name);
+    }
+  });
+
+  test(
+    'keeps shipped bridge and heap helper copies identical to staging sources',
+    () {
+      for (final name in <String>[
+        'ffmpegkit_bridge.mjs',
+        'ffmpegkit_heap_runtime.mjs',
+      ]) {
+        expect(
+          File('assets/wasm/$name').readAsBytesSync(),
+          orderedEquals(File('web/$name').readAsBytesSync()),
+          reason: name,
+        );
+      }
+    },
+  );
+
+  test('does not declare DataAssets or pinned runtime Flutter assets', () {
+    final source = File('pubspec.yaml').readAsStringSync();
+    expect(source, isNot(contains('data_assets:')));
+    expect(source, isNot(contains('- assets/wasm/')));
+  });
+
+  test('does not retain a stale executable Web runtime', () {
+    expect(File('assets/wasm/ffmpegkit.mjs').existsSync(), isFalse);
+    expect(File('assets/wasm/ffmpegkit.wasm').existsSync(), isFalse);
+
+    final fixture = File(
+      'test/fixtures/custom_web_workspace/pubspec.yaml',
+    ).readAsStringSync();
+    expect(fixture, isNot(contains('../../../assets/wasm')));
+    expect(fixture, contains('bundle-base-wasm-wasm32-static-lgpl.zip'));
+  });
+}

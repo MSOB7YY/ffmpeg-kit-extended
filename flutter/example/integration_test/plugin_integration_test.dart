@@ -37,30 +37,144 @@ import 'package:ffmpeg_kit_extended_flutter/ffmpeg_kit_extended_flutter.dart';
 import 'package:path/path.dart' as path;
 
 void main() async {
-  await FFmpegKitExtended.initialize();
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+  await FFmpegKitExtended.initialize();
 
   // Set SDL drivers to dummy to avoid window creation issues and ensure reliability
   FFmpegKitConfig.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
   FFmpegKitConfig.setEnvironmentVariable("SDL_AUDIODRIVER", "dummy");
 
   String videoFile = "test_video.mp4";
-  String audioFile = "test_audio.mp3";
+  String audioFile = "test_audio.wav";
   String videoPath = "";
   String audioPath = "";
   String outputDir = "";
 
+  const String frameContractSource =
+      'color=c=red:size=512x512:rate=30:duration=2[red];'
+      'color=c=green:size=512x512:rate=30:duration=2[green];'
+      'color=c=blue:size=512x512:rate=30:duration=2[blue];'
+      'color=c=white:size=512x512:rate=30:duration=2[white];'
+      '[red][green][blue][white]concat=n=4:v=1:a=0';
   const String dummyVideoCommand =
-      "-hide_banner -loglevel info -f lavfi -i testsrc=duration=5:size=512x512:rate=30";
+      "-hide_banner -loglevel info -f lavfi -i \"$frameContractSource\"";
   const String dummyAudioCommand =
-      "-hide_banner -loglevel info -f lavfi -i sine=frequency=1000:duration=3";
+      "-hide_banner -loglevel info -f lavfi -i sine=frequency=1000:duration=3 -c:a pcm_s16le";
+  const frameContractPhases =
+      <({String name, double atSeconds, List<int> rgba})>[
+        (name: 'red', atSeconds: 0.5, rgba: [253, 0, 0, 255]),
+        (name: 'green', atSeconds: 2.5, rgba: [0, 127, 0, 255]),
+        (name: 'blue', atSeconds: 4.5, rgba: [0, 0, 254, 255]),
+        (name: 'white', atSeconds: 6.5, rgba: [255, 255, 255, 255]),
+      ];
+  const frameWidth = 512;
+  const frameHeight = 512;
+  const frameRgbaTolerance = 32;
+
+  Future<List<int>> decodeFrameRgba({
+    required String inputArguments,
+    required String outputPath,
+    required String label,
+  }) async {
+    final outputFile = File(outputPath);
+    if (outputFile.existsSync()) {
+      outputFile.deleteSync();
+    }
+    final session = FFmpegKit.execute(
+      '-hide_banner -loglevel info $inputArguments '
+      '-frames:v 1 -pix_fmt rgba -f rawvideo -y "$outputPath"',
+    );
+    expect(
+      ReturnCode.isSuccess(session.getReturnCode()),
+      isTrue,
+      reason: 'Could not decode a frame from $label',
+    );
+    expect(
+      outputFile.existsSync(),
+      isTrue,
+      reason: '$label frame decode did not produce $outputPath',
+    );
+    final bytes = outputFile.readAsBytesSync();
+    final expectedLength = frameWidth * frameHeight * 4;
+    expect(
+      bytes.length,
+      greaterThanOrEqualTo(expectedLength),
+      reason:
+          '$label frame decode produced ${bytes.length} bytes; '
+          'expected at least $expectedLength',
+    );
+    return bytes;
+  }
+
+  Future<void> verifyGeneratedVideoFramePixels() async {
+    expect(videoPath, isNotEmpty);
+    final originalFramePath = path.join(
+      outputDir,
+      '.ffplay-original-frame.rgba',
+    );
+    final outputFramePath = path.join(outputDir, '.ffplay-output-frame.rgba');
+    try {
+      final originalSignatures = <String>{};
+      final outputSignatures = <String>{};
+      for (final phase in frameContractPhases) {
+        final originalFrame = await decodeFrameRgba(
+          inputArguments:
+              '-f lavfi -i "$frameContractSource" -ss ${phase.atSeconds}',
+          outputPath: originalFramePath,
+          label: 'original input at ${phase.atSeconds}s',
+        );
+        final outputFrame = await decodeFrameRgba(
+          inputArguments: '-ss ${phase.atSeconds} -i "$videoPath"',
+          outputPath: outputFramePath,
+          label: 'final output at ${phase.atSeconds}s',
+        );
+        final offset = ((frameHeight ~/ 2) * frameWidth + frameWidth ~/ 2) * 4;
+        final originalPixel = originalFrame.sublist(offset, offset + 4);
+        final outputPixel = outputFrame.sublist(offset, offset + 4);
+        for (var index = 0; index < originalPixel.length; index++) {
+          expect(
+            (originalPixel[index] - phase.rgba[index]).abs(),
+            lessThanOrEqualTo(frameRgbaTolerance),
+            reason:
+                '${phase.name} original input channel $index expected '
+                '${phase.rgba[index]}, got ${originalPixel[index]}',
+          );
+          expect(
+            (outputPixel[index] - originalPixel[index]).abs(),
+            lessThanOrEqualTo(frameRgbaTolerance),
+            reason:
+                '${phase.name} final output channel $index differs from '
+                'original input: original ${originalPixel[index]}, '
+                'final ${outputPixel[index]}',
+          );
+        }
+        originalSignatures.add(originalPixel.join(','));
+        outputSignatures.add(outputPixel.join(','));
+      }
+      expect(originalSignatures, hasLength(frameContractPhases.length));
+      expect(outputSignatures, hasLength(frameContractPhases.length));
+    } finally {
+      for (final file in [File(originalFramePath), File(outputFramePath)]) {
+        if (file.existsSync()) {
+          file.deleteSync();
+        }
+      }
+    }
+  }
+
+  Future<void> ensureOutputDirectory() async {
+    if (outputDir.isEmpty) {
+      final tempDirectory = await Directory.systemTemp.createTemp(
+        'ffmpeg_kit_extended_integration_',
+      );
+      outputDir = tempDirectory.path;
+    }
+  }
 
   /// Helper to create a dummy video file
   Future<void> createDummyVideo() async {
     if (videoPath.isEmpty) {
-      final currentDir = Directory.current.absolute.path;
-      outputDir = path.join(currentDir, 'test_output');
-      await Directory(outputDir).create(recursive: true);
+      await ensureOutputDirectory();
       videoPath = path.join(outputDir, videoFile).replaceAll(r'\', '/');
       audioPath = path.join(outputDir, audioFile).replaceAll(r'\', '/');
     }
@@ -68,7 +182,6 @@ void main() async {
     if (!File(videoPath).existsSync()) {
       if (kDebugMode) print("Creating test video at: $videoPath");
       FFmpegKit.execute("$dummyVideoCommand -y $videoPath");
-      await SessionQueueManager().waitForAll();
       expect(File(videoPath).existsSync(), isTrue);
     }
   }
@@ -76,16 +189,13 @@ void main() async {
   /// Helper to create a dummy audio file
   Future<void> createDummyAudio() async {
     if (audioPath.isEmpty) {
-      final currentDir = Directory.current.absolute.path;
-      outputDir = path.join(currentDir, 'test_output');
-      await Directory(outputDir).create(recursive: true);
+      await ensureOutputDirectory();
       audioPath = path.join(outputDir, audioFile).replaceAll(r'\', '/');
     }
 
     if (!File(audioPath).existsSync()) {
       if (kDebugMode) print("Creating test audio at: $audioPath");
       FFmpegKit.execute("$dummyAudioCommand -y $audioPath");
-      await SessionQueueManager().waitForAll();
       expect(File(audioPath).existsSync(), isTrue);
     }
   }
@@ -229,7 +339,6 @@ void main() async {
       final session = FFmpegKit.createSession("-version");
       session.enableDebugLog();
       session.execute();
-      await SessionQueueManager().waitForAll();
       if (kDebugMode) print("Session ID: ${session.sessionId}");
       if (kDebugMode) print("Debug enabled: ${session.isDebugLogEnabled()}");
       if (kDebugMode) print("Return Code: ${session.getReturnCode()}");
@@ -277,7 +386,6 @@ void main() async {
         if (kDebugMode) print("History Session ID: ${s.sessionId}");
         if (kDebugMode) print(s.getOutput());
       }
-      await SessionQueueManager().waitForAll();
 
       final sessions = FFmpegKit.getFFmpegSessions();
       if (kDebugMode) print("Sessions count: ${sessions.length}");
@@ -312,7 +420,6 @@ void main() async {
 
     testWidgets('Session Output and Logs', (WidgetTester tester) async {
       final session = FFmpegKit.execute("-version");
-      await SessionQueueManager().waitForAll();
       if (kDebugMode) print("Test 6 Session ID: ${session.sessionId}");
 
       final output = session.getOutput();
@@ -341,7 +448,6 @@ void main() async {
 
     testWidgets('Session Timing Information', (WidgetTester tester) async {
       final session = FFmpegKit.execute("-version");
-      await SessionQueueManager().waitForAll();
 
       final createTime = session.getCreateTime();
       final startTime = session.getStartTime();
@@ -364,7 +470,6 @@ void main() async {
     testWidgets('Session Log Entries', (WidgetTester tester) async {
       FFmpegKitConfig.enableRedirection();
       final session = FFmpegKit.execute("-version");
-      await SessionQueueManager().waitForAll();
 
       final logsCount = session.getLogsCount();
       if (kDebugMode) print("Logs count: $logsCount");
@@ -396,7 +501,6 @@ void main() async {
       final session = FFmpegKit.execute(
         "-i $videoPath -c:v mpeg4 -q:v 5 -y $outputPath",
       );
-      await SessionQueueManager().waitForAll();
 
       if (kDebugMode) print("Transcoding result: ${session.getReturnCode()}");
       expect(ReturnCode.isSuccess(session.getReturnCode()), isTrue);
@@ -451,7 +555,6 @@ void main() async {
       WidgetTester tester,
     ) async {
       final session = FFmpegKit.execute("-version");
-      await SessionQueueManager().waitForAll();
 
       final output = session.getOutput();
       if (kDebugMode) print("Sync FFmpeg -version output: \n$output");
@@ -494,7 +597,6 @@ void main() async {
       WidgetTester tester,
     ) async {
       final session = FFmpegKit.execute("-h");
-      //await SessionQueueManager().waitForAll();
 
       final output = session.getOutput();
       if (kDebugMode) {
@@ -531,7 +633,6 @@ void main() async {
       WidgetTester tester,
     ) async {
       final session = FFprobeKit.execute("-version");
-      await SessionQueueManager().waitForAll();
 
       final output = session.getOutput();
       if (kDebugMode) print("Sync FFprobe -version output: \n$output");
@@ -559,7 +660,6 @@ void main() async {
     });
     testWidgets('Execute Sync - Version', (WidgetTester tester) async {
       final session = FFprobeKit.execute("-version");
-      await SessionQueueManager().waitForAll();
 
       expect(session.getState(), SessionState.completed);
       expect(ReturnCode.isSuccess(session.getReturnCode()), isTrue);
@@ -576,7 +676,6 @@ void main() async {
 
     testWidgets('Get Media Information - Video', (WidgetTester tester) async {
       final session = FFprobeKit.getMediaInformation(videoPath);
-      await SessionQueueManager().waitForAll();
 
       if (kDebugMode) print("FFprobe result: ${session.getReturnCode()}");
       if (kDebugMode) print("FFprobe output: ${session.getOutput()}");
@@ -621,7 +720,6 @@ void main() async {
 
     testWidgets('Stream Information Details', (WidgetTester tester) async {
       final session = FFprobeKit.getMediaInformation(videoPath);
-      await SessionQueueManager().waitForAll();
       final mediaInfo = session.getMediaInformation();
 
       expect(mediaInfo, isNotNull);
@@ -648,7 +746,6 @@ void main() async {
     testWidgets('Get FFprobe Sessions', (WidgetTester tester) async {
       FFprobeKit.execute("-version");
       FFprobeKit.execute("-version");
-      await SessionQueueManager().waitForAll();
 
       final sessions = FFprobeKit.getFFprobeSessions();
       for (var session in sessions) {
@@ -676,8 +773,6 @@ void main() async {
     });
     testWidgets('Media Information Type Check', (WidgetTester tester) async {
       final session = FFprobeKit.getMediaInformation(videoPath);
-      // Ensure completion before checking properties that might depend on state, though type check is static
-      await SessionQueueManager().waitForAll();
 
       expect(session.isFFmpegSession(), isFalse);
       expect(session.isFFplaySession(), isFalse);
@@ -688,7 +783,6 @@ void main() async {
 
     testWidgets('Media Information Properties', (WidgetTester tester) async {
       final session = FFprobeKit.getMediaInformation(videoPath);
-      await SessionQueueManager().waitForAll();
       final mediaInfo = session.getMediaInformation();
 
       expect(mediaInfo, isNotNull);
@@ -713,7 +807,6 @@ void main() async {
 
     testWidgets('Stream Information Properties', (WidgetTester tester) async {
       final session = FFprobeKit.getMediaInformation(videoPath);
-      await SessionQueueManager().waitForAll();
       final mediaInfo = session.getMediaInformation();
 
       expect(mediaInfo, isNotNull);
@@ -754,6 +847,12 @@ void main() async {
 
       expect(session.getState(), SessionState.completed);
       if (kDebugMode) print(session.getOutput());
+    });
+
+    testWidgets('Generated video changes frame colors over time', (
+      WidgetTester tester,
+    ) async {
+      await verifyGeneratedVideoFramePixels();
     });
 
     testWidgets('Pause and Resume', (WidgetTester tester) async {

@@ -17,9 +17,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+import 'dart:async';
 import 'dart:developer';
-import 'dart:ffi';
-import 'package:ffi/ffi.dart';
+
+import 'package:meta/meta.dart';
+
 import '../ffmpeg_kit_extended_flutter.dart'
     show
         FFmpegSession,
@@ -27,10 +29,17 @@ import '../ffmpeg_kit_extended_flutter.dart'
         FFprobeSession,
         MediaInformationSession,
         FFmpegKitExtended;
-import 'ffmpeg_kit_extended_flutter_loader.dart' show ffmpegKitHandleReleasePtr;
-import 'generated/ffmpeg_kit_bindings.dart' as ffmpeg;
+import 'callback_manager.dart';
 import 'log.dart';
+import 'log_format.dart';
+import 'platform/backend.dart';
+import 'platform/backend_selector.dart';
+import 'platform/session_finalizer.dart';
+import 'session_queue_manager.dart';
 import 'statistics.dart';
+
+typedef SessionExecutionErrorCallback =
+    void Function(Object error, StackTrace stackTrace);
 
 // ---------------------------------------------------------------------------
 // Return-code sentinel values
@@ -88,10 +97,8 @@ enum SessionState {
 ///
 /// ### Native handle lifetime
 /// Each session owns an opaque native C++ object exposed as a
-/// [Pointer<Void>] ([handle]).  A [NativeFinalizer] is attached at
-/// construction time to call `ffmpeg_kit_handle_release` when the Dart
-/// object is garbage-collected, preventing native memory leaks even when
-/// the caller drops a reference without an explicit release.
+/// [SessionHandle] ([handle]). A platform-specific finalizer is attached at
+/// construction time, when supported, to release abandoned session resources.
 ///
 /// ### Testing without a native library
 /// Use the protected [Session.noFinalizer] constructor in test subclasses
@@ -99,11 +106,25 @@ enum SessionState {
 /// finalizer registration for that specific instance.  Unlike the previous
 /// `static bool skipFinalizer` approach, this flag cannot leak between
 /// tests or affect unrelated sessions.
-abstract class Session implements Finalizable {
+abstract class Session {
   // ---- Core fields --------------------------------------------------------
 
-  /// The native opaque handle for this session.
-  late Pointer<Void> handle;
+  /// The platform-neutral opaque handle for this session.
+  late SessionHandle _handle;
+
+  /// The platform-neutral opaque handle for this session.
+  ///
+  /// Accessing the handle after [dispose] throws [StateError] instead of
+  /// allowing a backend call to use a released native object.
+  SessionHandle get handle {
+    _ensureNotDisposed();
+    return _handle;
+  }
+
+  set handle(SessionHandle value) {
+    _ensureNotDisposed();
+    _handle = value;
+  }
 
   /// The C-layer session identifier.  Stable for the session's entire lifetime.
   late int sessionId;
@@ -114,13 +135,33 @@ abstract class Session implements Finalizable {
   /// Index of the next log entry not yet dispatched to Dart callbacks.
   ///
   /// Shared between [Session], `FFmpegSession`, and `CallbackManager` so
-  /// that the log-polling loop and the completion flush both advance from the
-  /// same cursor and never deliver the same entry twice.
+  /// callback delivery and the completion flush advance from the same cursor
+  /// and never deliver the same entry twice.
   int logsProcessed = 0;
+
+  /// Sequence of the next native log event that has not been delivered.
+  ///
+  /// Native insertion order, rather than callback arrival order, is the
+  /// authority for structured log delivery. The history cursor above remains
+  /// for bounded reconciliation and advances with this sequence when a direct
+  /// event is accepted.
+  int nextExpectedLogSequence = 0;
 
   // ---- Cancellation -------------------------------------------------------
 
   bool _isCancelled = false;
+
+  /// Whether this session has already been handed to an execution path.
+  ///
+  /// A session object represents one native execution.  History wrappers may
+  /// expose sessions that are already running or terminal, but those objects
+  /// are read-only observations and cannot be submitted again.
+  bool _submitted = false;
+  bool _restoredFromHandle = false;
+  bool _executionStarted = false;
+  bool _nativeCancellationDispatched = false;
+  bool _cancellationMonitorActive = false;
+  bool _cancelledBeforeStartCleaned = false;
 
   /// Whether [cancel] has been called on this session.
   bool get isCancelled => _isCancelled;
@@ -128,10 +169,26 @@ abstract class Session implements Finalizable {
   /// When `true`, [registerFinalizer] is a no-op for this specific instance.
   /// Set exclusively by [Session.noFinalizer]; immutable after construction.
   final bool _skipFinalizer;
+  final SessionFinalizer _sessionFinalizer;
+
+  bool _disposed = false;
+  bool _disposing = false;
+  bool _executionSettled = false;
+  bool _completionDispatched = false;
+  bool _terminalCompletionObserved = false;
+  bool _restoredCompletionSettled = false;
+  int _completionDispatchDepth = 0;
+  bool _disposeRequested = false;
+  final Completer<void> _executionSettlement = Completer<void>();
+  final Set<Completer<void>> _executionCompleters = <Completer<void>>{};
+  SessionExecutionErrorCallback? _executionErrorCallback;
+  final Map<CallbackBridgeKind, CallbackBridgeLease> _bridgeLeases = {};
 
   /// Standard constructor — [registerFinalizer] will attach the native
   /// finalizer after [handle] is assigned.
-  Session() : _skipFinalizer = false;
+  Session({SessionFinalizer? finalizer})
+    : _skipFinalizer = false,
+      _sessionFinalizer = finalizer ?? sessionFinalizer;
 
   /// Constructor for use in test subclasses where no native library is loaded.
   ///
@@ -139,39 +196,488 @@ abstract class Session implements Finalizable {
   /// concurrently-live sessions are unaffected.
   ///
   /// **Production code must never call this constructor.**
-  Session.noFinalizer() : _skipFinalizer = true;
+  Session.noFinalizer({SessionFinalizer? finalizer})
+    : _skipFinalizer = true,
+      _sessionFinalizer = finalizer ?? sessionFinalizer;
 
-  // Lazily-initialised shared NativeFinalizer.  The function pointer for
-  // `ffmpeg_kit_handle_release` is resolved once from the loaded dynamic
-  // library and reused for every subsequent [registerFinalizer] call.
-  static NativeFinalizer? _sharedFinalizer;
-
-  static NativeFinalizer _getFinalizer() {
-    if (_sharedFinalizer != null) return _sharedFinalizer!;
-
-    final ptr = ffmpegKitHandleReleasePtr;
-    if (ptr == null) {
-      // Library not loaded or symbol not resolved (unit-test environment).
-      // A zero-address token is safe: NativeFinalizer will never invoke it
-      // because it only runs on GC, and tests should not create sessions that
-      // reach GC in this code path.
-      _sharedFinalizer = NativeFinalizer(Pointer.fromAddress(0));
-    } else {
-      _sharedFinalizer = NativeFinalizer(ptr);
-    }
-    return _sharedFinalizer!;
-  }
-
-  /// Attaches the native finalizer to this session.
+  /// Attaches the platform finalizer to this session when supported.
   ///
   /// Must be called exactly once from every concrete subclass constructor,
   /// *after* both [handle] and [sessionId] have been assigned.
   ///
   /// Calling this more than once on the same session is safe — [_skipFinalizer]
-  /// and the guard inside [NativeFinalizer.attach] prevent double-attachment.
+  /// and the platform finalizer own duplicate-attachment behavior.
   void registerFinalizer() {
     if (_skipFinalizer) return;
-    _getFinalizer().attach(this, handle, detach: this);
+    _sessionFinalizer.attach(this, handle.value, detachToken: this);
+  }
+
+  /// Whether this session has released its native handle.
+  bool get isDisposed => _disposed;
+
+  /// Releases this session's native handle and associated Dart resources.
+  ///
+  /// Disposal is deterministic, idempotent, and valid for sessions that have
+  /// completed, been cancelled, or were never executed. The cleanup order is
+  /// `releaseHandle` -> disposed-state commit -> finalizer detach -> execution
+  /// error-handler clear -> [onDispose]. Native and Web finalizers are
+  /// detached after the handle release commits; Web also has a GC safety net
+  /// while explicit disposal remains deterministic. A failed native release
+  /// leaves the session retryable.
+  ///
+  /// Dispose a running session only when cancellation/release semantics of the
+  /// selected backend are acceptable to the caller. The native wrapper cancels
+  /// a running session before releasing it.
+  void dispose() {
+    if (_disposed || _disposing) return;
+    if (_completionDispatchDepth > 0) {
+      // Completion observers share this session until queue-owned settlement
+      // finishes. Defer physical release so a local callback cannot make the
+      // global callback or settlement path use a released handle.
+      _disposeRequested = true;
+      return;
+    }
+    _disposeNow();
+  }
+
+  void _disposeNow() {
+    if (_disposed || _disposing) return;
+    _disposing = true;
+    try {
+      // Native release is the ownership commit point. If it throws, retain
+      // the finalizer and the live handle so a later dispose() can retry.
+      releaseHandle(_handle);
+      _disposed = true;
+      FFmpegKitExtended.removeNonTerminalSession(this);
+
+      // Everything below is post-commit cleanup. Failures remain visible to
+      // the caller, but the committed disposal state prevents a second native
+      // release attempt.
+      try {
+        if (!_skipFinalizer) _sessionFinalizer.detach(this);
+      } finally {
+        try {
+          clearExecutionErrorHandler();
+        } finally {
+          try {
+            onDispose();
+          } finally {
+            releaseAllBridgeLeases();
+            for (final completer in _executionCompleters) {
+              if (!completer.isCompleted) completer.complete();
+            }
+            _executionCompleters.clear();
+          }
+        }
+      }
+    } finally {
+      _disposing = false;
+    }
+  }
+
+  /// Gives concrete session types a hook to close Dart-side resources after
+  /// the backend release has committed and the finalizer/error handler have
+  /// been detached. This ordering prevents a post-release cleanup failure from
+  /// causing a second native release.
+  @protected
+  void onDispose() {}
+
+  /// Closes Dart-side callback and stream resources when execution is
+  /// cancelled before native work starts. Concrete session types override
+  /// this hook; it is deliberately separate from [onDispose] because a
+  /// cancelled queued session still owns its native handle.
+  @protected
+  void onCancelledBeforeStart() {}
+
+  /// Marks the queue handoff immediately before the executor is invoked.
+  ///
+  /// This distinguishes a queued item that can be removed safely from a
+  /// dequeued item whose native startup may still need cancellation delivery.
+  void markExecutionStarted() {
+    _executionStarted = true;
+  }
+
+  /// Whether the queue has handed this session to its executor.
+  ///
+  /// Concrete session types use this protected seam to avoid invoking
+  /// playback-specific native controls for work that was still queued.
+  @protected
+  bool get hasExecutionStarted => _executionStarted;
+
+  /// Whether the queue-owned execution has reached its terminal handoff.
+  @protected
+  bool get hasExecutionSettled => _executionSettled;
+
+  /// Whether a submitted execution still owns callback routing.
+  ///
+  /// Callback sinks may be removed while a queued or running execution is
+  /// still waiting for its completion event.  The session must remain in the
+  /// callback map until that execution settles.
+  @protected
+  bool get hasPendingExecutionRouting => _submitted && !_executionSettled;
+
+  /// Acquires a process-global callback bridge on behalf of this session.
+  ///
+  /// The lease is intentionally owned by the session rather than by a
+  /// concrete platform backend so native and Wasm implementations share the
+  /// same demand/refcount semantics.
+  @protected
+  void acquireBridgeLease(
+    CallbackBridgeKind kind, {
+    required void Function() install,
+    required void Function() uninstall,
+  }) {
+    if (_bridgeLeases.containsKey(kind)) return;
+    _bridgeLeases[kind] = CallbackManager().acquireBridge(
+      kind,
+      install: install,
+      uninstall: uninstall,
+    );
+  }
+
+  /// Releases one session-owned bridge lease without allowing cleanup failure
+  /// to replace the execution's primary error.
+  @protected
+  void releaseBridgeLease(CallbackBridgeKind kind) {
+    final lease = _bridgeLeases.remove(kind);
+    if (lease == null) return;
+    try {
+      lease.release();
+    } catch (error, stackTrace) {
+      log(
+        'Session: callback bridge cleanup failed for $kind',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  /// Releases all callback bridges owned by this session.
+  @protected
+  void releaseAllBridgeLeases() {
+    for (final kind in _bridgeLeases.keys.toList()) {
+      releaseBridgeLease(kind);
+    }
+  }
+
+  /// Whether this object was restored around an already-owned native handle.
+  ///
+  /// Restored wrappers are allowed to attach callback routing only after the
+  /// native state proves that the underlying session is still running.
+  @protected
+  bool get isRestoredSession => _restoredFromHandle;
+
+  /// Whether terminal observation has already ended restored observer demand.
+  @protected
+  bool get hasTerminalCompletionBeenObserved => _terminalCompletionObserved;
+
+  /// Returns whether this session currently owns a lease for [kind].
+  @protected
+  bool hasBridgeLease(CallbackBridgeKind kind) =>
+      _bridgeLeases.containsKey(kind);
+
+  /// Reads the restored session state for observer-only bridge demand.
+  ///
+  /// This never changes execution ownership. Restored observers use the same
+  /// state oracle as execution admission, but remain distinct from submission,
+  /// startup, and queue settlement.
+  @protected
+  bool get isRestoredObserverRunning =>
+      isRestoredSession &&
+      !hasTerminalCompletionBeenObserved &&
+      executionStateForSubmission() == SessionState.running;
+
+  /// Registers a callback sink only when it can own live delivery.
+  ///
+  /// Newly-created sessions remain inert until execution is submitted. A
+  /// restored session must first read native state and is routed only while
+  /// that state is running. The state read intentionally propagates failures so
+  /// callers can roll back the sink mutation without leaving a map root.
+  @protected
+  void ensureRoutingForSinkDemand(void Function() register) {
+    if (isDisposed) return;
+    if (hasPendingExecutionRouting) {
+      register();
+      return;
+    }
+    if (!isRestoredSession) return;
+    if (executionStateForSubmission() == SessionState.running) {
+      register();
+    }
+  }
+
+  /// Claims the single completion-callback dispatch for this session.
+  ///
+  /// Native callback bridges and synchronous wrappers can observe the same
+  /// terminal execution through different paths. The session owns this
+  /// one-shot guard so local and global completion callbacks are delivered at
+  /// most once per session.
+  bool claimCompletionDispatch() {
+    if (_completionDispatched) return false;
+    _completionDispatched = true;
+    return true;
+  }
+
+  /// Commits terminal history before completion observers are invoked.
+  ///
+  /// Restored wrappers do not pass through the queue-owned execution
+  /// settlement boundary, so completion observation is an independent
+  /// lifecycle owner for those wrappers. The one-shot guard also protects
+  /// synchronous paths that reconcile history before dispatching callbacks.
+  void observeTerminalCompletion() {
+    if (_terminalCompletionObserved) return;
+    _terminalCompletionObserved = true;
+    commitTerminalHistory();
+    FFmpegKitExtended.clearCancellationIntent(sessionId);
+  }
+
+  /// Requires the selected backend to be initialized before direct execution.
+  ///
+  /// Kept as a narrow protected seam so synchronous lifecycle tests can prove
+  /// ordering without loading a platform library.
+  @protected
+  void requireInitializedForExecution() {
+    FFmpegKitExtended.requireInitialized();
+  }
+
+  /// Performs the platform cancellation dispatch.
+  ///
+  /// Kept as a protected seam so lifecycle tests can observe retry and
+  /// exactly-once behavior without loading a native backend.
+  @protected
+  void dispatchNativeCancellation() {
+    ffmpegKitBackend.cancelSession(handle);
+  }
+
+  /// Called by [SessionQueueManager] when a queued item is discarded.
+  void discardBeforeExecution() {
+    _cleanupCancelledBeforeStart();
+    FFmpegKitExtended.abandonCreatedSession(sessionId);
+  }
+
+  /// Records cancellation for a queue-wide discard without querying native
+  /// state or dispatching a native cancellation call.
+  void markCancelledBeforeExecution() {
+    _isCancelled = true;
+  }
+
+  void _cleanupCancelledBeforeStart() {
+    if (_cancelledBeforeStartCleaned) return;
+    _cancelledBeforeStartCleaned = true;
+    try {
+      onCancelledBeforeStart();
+    } finally {
+      releaseAllBridgeLeases();
+    }
+  }
+
+  /// Releases the platform handle owned by this session.
+  ///
+  /// Kept as a protected seam so lifecycle tests can verify release ordering
+  /// without loading a native or Web FFmpegKit library.
+  @protected
+  void releaseHandle(SessionHandle handle) {
+    ffmpegKitBackend.releaseSession(handle);
+  }
+
+  /// Adopts an already-owned handle or releases it if wrapper initialization
+  /// cannot commit.
+  ///
+  /// Ownership transfers to this [Session] only after the handle, session ID,
+  /// and platform finalizer have all been initialized. A rollback release is
+  /// secondary to the original adoption error and is logged without replacing
+  /// it.
+  @protected
+  void adoptOwnedHandle(
+    SessionHandle ownedHandle, {
+    required int Function(SessionHandle) readSessionId,
+    void Function()? onBeforeCommit,
+    bool restoredSession = false,
+  }) {
+    try {
+      handle = ownedHandle;
+      sessionId = readSessionId(ownedHandle);
+      onBeforeCommit?.call();
+      registerFinalizer();
+      _restoredFromHandle = restoredSession;
+    } catch (error, stackTrace) {
+      try {
+        releaseHandle(ownedHandle);
+      } catch (cleanupError, cleanupStackTrace) {
+        log(
+          'Session: failed to roll back an uncommitted session handle',
+          error: cleanupError,
+          stackTrace: cleanupStackTrace,
+        );
+      }
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+  }
+
+  /// Tracks an asynchronous execution so [dispose] can settle its internal
+  /// wait even when disposal unregisters the completion callback first.
+  @protected
+  void trackExecution(Completer<void> completer) {
+    _executionCompleters.add(completer);
+  }
+
+  /// Marks the queue-owned execution as terminal.
+  ///
+  /// The queue calls this from its `finally` block for every item that was
+  /// handed to an executor. Cancellation monitoring uses the signal to stop
+  /// retrying after execution settles, even when the final native state read
+  /// failed or never reached `Running`.
+  void markExecutionSettled() {
+    if (!_executionSettled) {
+      _executionSettled = true;
+      commitTerminalHistory();
+    }
+    if (!_executionSettlement.isCompleted) {
+      _executionSettlement.complete();
+    }
+    _releaseDeferredDisposeIfReady();
+  }
+
+  /// Enters the lifetime scope shared by local and global completion
+  /// observers. Physical disposal is deferred while this scope is active.
+  void beginCompletionDispatch() {
+    _completionDispatchDepth++;
+  }
+
+  /// Leaves the completion-observer lifetime scope. Disposal remains deferred
+  /// until execution settlement has also completed.
+  void endCompletionDispatch() {
+    if (_completionDispatchDepth == 0) return;
+    _completionDispatchDepth--;
+    _releaseDeferredDisposeIfReady();
+  }
+
+  /// Settles the completion-observation owner for a restored wrapper.
+  ///
+  /// Queue-owned sessions remain governed by [markExecutionSettled]. Restored
+  /// sessions instead release their completion routing after observer fan-out,
+  /// allowing an explicit dispose requested from a callback to finish without
+  /// requiring a queue that never owned the restored execution.
+  void settleRestoredCompletionObservation() {
+    if (!isRestoredSession || _restoredCompletionSettled) return;
+    _restoredCompletionSettled = true;
+    try {
+      onRestoredCompletionSettled();
+    } finally {
+      _releaseDeferredDisposeIfReady();
+    }
+  }
+
+  /// Gives concrete session types a chance to release completion-only routing
+  /// while preserving any independent log/statistics sinks.
+  @protected
+  void onRestoredCompletionSettled() {}
+
+  void _releaseDeferredDisposeIfReady() {
+    final completionOwnerSettled =
+        _executionSettled || (isRestoredSession && _restoredCompletionSettled);
+    if (!_disposeRequested ||
+        _completionDispatchDepth != 0 ||
+        !completionOwnerSettled ||
+        _disposed) {
+      return;
+    }
+    _disposeRequested = false;
+    _disposeNow();
+  }
+
+  /// Commits wrapper history after authoritative native terminal observation.
+  ///
+  /// This is intentionally separate from queue settlement so completion
+  /// callbacks cannot dispose a native-terminal session while its identity is
+  /// still classified as nonterminal.
+  void commitTerminalHistory() {
+    FFmpegKitExtended.reconcileCompletedSession(this);
+  }
+
+  /// Registers the handler used when the platform cannot deliver a normal
+  /// completion event for an asynchronous execution.
+  ///
+  /// Platform backends route transport failures back to this shared execution
+  /// layer. The concrete session owns cleanup and completes its execution
+  /// Future with the original error.
+  @protected
+  void registerExecutionErrorHandler(SessionExecutionErrorCallback callback) {
+    _executionErrorCallback = callback;
+  }
+
+  /// Clears the error handler for a settled execution.
+  @protected
+  void clearExecutionErrorHandler() {
+    _executionErrorCallback = null;
+  }
+
+  /// Dispatches an asynchronous execution failure to the active execution.
+  ///
+  /// The fallback completes any tracked execution directly if a concrete
+  /// session failed to install its cleanup handler. This keeps the queue from
+  /// waiting forever even when the callback registration itself is missing.
+  void dispatchExecutionError(Object error, StackTrace stackTrace) {
+    final callback = _executionErrorCallback;
+    _executionErrorCallback = null;
+    if (callback == null) {
+      _completeTrackedExecutionsWithError(error, stackTrace);
+      return;
+    }
+
+    try {
+      callback(error, stackTrace);
+    } catch (handlerError, handlerStackTrace) {
+      log(
+        'Session: execution error handler failed for session $sessionId',
+        error: handlerError,
+        stackTrace: handlerStackTrace,
+      );
+      _completeTrackedExecutionsWithError(error, stackTrace);
+    }
+  }
+
+  /// Cleans up an asynchronous execution and preserves its original failure.
+  ///
+  /// Cleanup failures are logged but do not replace the platform error that
+  /// caused the execution to terminate. This keeps the Future useful to the
+  /// caller while still making cleanup failures visible for diagnosis.
+  @protected
+  void completeExecutionWithError({
+    required Completer<void> completer,
+    required Object error,
+    required StackTrace stackTrace,
+    required void Function() cleanup,
+  }) {
+    try {
+      cleanup();
+    } catch (cleanupError, cleanupStackTrace) {
+      log(
+        'Session: error cleaning up failed execution for session $sessionId',
+        error: cleanupError,
+        stackTrace: cleanupStackTrace,
+      );
+    }
+    if (!completer.isCompleted) {
+      completer.completeError(error, stackTrace);
+    }
+  }
+
+  void _completeTrackedExecutionsWithError(
+    Object error,
+    StackTrace stackTrace,
+  ) {
+    for (final completer in _executionCompleters) {
+      if (!completer.isCompleted) {
+        completer.completeError(error, stackTrace);
+      }
+    }
+  }
+
+  void _ensureNotDisposed() {
+    if (_disposed) {
+      throw StateError('Session $sessionId has already been disposed');
+    }
   }
 
   // ---- State & return code ------------------------------------------------
@@ -180,9 +686,7 @@ abstract class Session implements Finalizable {
   SessionState getState() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return SessionState.fromValue(
-        ffmpeg.ffmpeg_kit_session_get_state(handle).value,
-      );
+      return SessionState.fromValue(ffmpegKitBackend.getSessionState(handle));
     } catch (e, st) {
       log(
         'Session.getState: error getting state ffmpeg_kit_session_get_state',
@@ -193,6 +697,59 @@ abstract class Session implements Finalizable {
     }
   }
 
+  /// Returns the state used by the one-shot submission guard.
+  ///
+  /// The protected seam lets lifecycle tests provide a deterministic state
+  /// oracle without loading a native backend. Production sessions delegate to
+  /// the native state query.
+  @protected
+  SessionState executionStateForSubmission() => getState();
+
+  /// Claims this session for exactly one execution submission.
+  ///
+  /// The claim is made before callback registration, queue insertion, or
+  /// native execution. A second call, a pre-start cancellation, or a session
+  /// observed outside the Created state is rejected without mutating any of
+  /// those execution surfaces.
+  @protected
+  void claimExecutionSubmission() {
+    _ensureNotDisposed();
+    if (_submitted) {
+      throw StateError('Session $sessionId has already been submitted');
+    }
+    validateExecutionHandoff();
+    _submitted = true;
+  }
+
+  /// Revalidates the native lifecycle immediately before queue handoff.
+  ///
+  /// A history lookup can create a second wrapper around the same native
+  /// session after the original wrapper has been queued. The queue invokes
+  /// this check again at handoff so only a still-Created native session can
+  /// reach callback registration or native execution.
+  void validateExecutionHandoff() {
+    _ensureNotDisposed();
+    if (FFmpegKitExtended.isSessionAbandoned(sessionId)) {
+      throw SessionCancelledException(
+        'Session $sessionId was abandoned before execution',
+      );
+    }
+    if (FFmpegKitExtended.isCancellationRequested(sessionId)) {
+      throw SessionCancelledException(
+        'Session $sessionId has a durable cancellation request',
+      );
+    }
+    if (_isCancelled) {
+      throw SessionCancelledException(
+        'Session $sessionId was cancelled before execution',
+      );
+    }
+    final state = executionStateForSubmission();
+    if (state != SessionState.created) {
+      throw StateError('Session $sessionId cannot start from state $state');
+    }
+  }
+
   /// Returns the native exit code.
   ///
   /// Meaningful only after [getState] returns [SessionState.completed] or
@@ -200,7 +757,7 @@ abstract class Session implements Finalizable {
   int getReturnCode() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.ffmpeg_kit_session_get_return_code(handle);
+      return ffmpegKitBackend.getReturnCode(handle);
     } catch (e, st) {
       log(
         'Session.getReturnCode: error getting return code ffmpeg_kit_session_get_return_code',
@@ -218,7 +775,7 @@ abstract class Session implements Finalizable {
   int getSessionId() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.ffmpeg_kit_session_get_session_id(handle);
+      return ffmpegKitBackend.getSessionId(handle);
     } catch (e, st) {
       log(
         'Session.getSessionId: error getting session id ffmpeg_kit_session_get_session_id',
@@ -236,7 +793,7 @@ abstract class Session implements Finalizable {
     FFmpegKitExtended.requireInitialized();
     try {
       return DateTime.fromMillisecondsSinceEpoch(
-        ffmpeg.ffmpeg_kit_session_get_create_time(handle),
+        ffmpegKitBackend.getCreateTime(handle),
       );
     } catch (e, st) {
       log(
@@ -253,7 +810,7 @@ abstract class Session implements Finalizable {
   DateTime? getStartTime() {
     FFmpegKitExtended.requireInitialized();
     try {
-      final ms = ffmpeg.ffmpeg_kit_session_get_start_time(handle);
+      final ms = ffmpegKitBackend.getStartTime(handle);
       return ms == 0 ? null : DateTime.fromMillisecondsSinceEpoch(ms);
     } catch (e, st) {
       log(
@@ -270,7 +827,7 @@ abstract class Session implements Finalizable {
   DateTime? getEndTime() {
     FFmpegKitExtended.requireInitialized();
     try {
-      final ms = ffmpeg.ffmpeg_kit_session_get_end_time(handle);
+      final ms = ffmpegKitBackend.getEndTime(handle);
       return ms == 0 ? null : DateTime.fromMillisecondsSinceEpoch(ms);
     } catch (e, st) {
       log(
@@ -288,7 +845,7 @@ abstract class Session implements Finalizable {
   int getDuration() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.ffmpeg_kit_session_get_duration(handle);
+      return ffmpegKitBackend.getDuration(handle);
     } catch (e, st) {
       log(
         'Session.getDuration: error getting duration ffmpeg_kit_session_get_duration',
@@ -306,7 +863,7 @@ abstract class Session implements Finalizable {
   String? getOutput() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return _toDartStringAndFree(ffmpeg.ffmpeg_kit_session_get_output(handle));
+      return _formatNativeLogOutput(ffmpegKitBackend.getOutput(handle));
     } catch (e, st) {
       log(
         'Session.getOutput: error getting output ffmpeg_kit_session_get_output',
@@ -338,9 +895,7 @@ abstract class Session implements Finalizable {
   String? getLogsAsString() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return _toDartStringAndFree(
-        ffmpeg.ffmpeg_kit_session_get_logs_as_string(handle),
-      );
+      return _formatNativeLogOutput(ffmpegKitBackend.getLogsAsString(handle));
     } catch (e, st) {
       log(
         'Session.getLogsAsString: error getting logs as string ffmpeg_kit_session_get_logs_as_string',
@@ -351,14 +906,30 @@ abstract class Session implements Finalizable {
     }
   }
 
+  String? _formatNativeLogOutput(String? nativeOutput) {
+    if (nativeOutput == null) {
+      return null;
+    }
+
+    final count = getLogsCount();
+    if (count <= 0) {
+      return nativeOutput;
+    }
+
+    final nativeMessages = List<String>.generate(
+      count,
+      (index) => ffmpegKitBackend.getLogAt(handle, index) ?? '',
+      growable: false,
+    );
+    return formatLogOutputIfMissingLineFeeds(nativeOutput, nativeMessages);
+  }
+
   /// Returns the failure stack trace captured when the session failed, or
   /// `null` if the session did not fail or no trace is available.
   String? getFailStackTrace() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return _toDartStringAndFree(
-        ffmpeg.ffmpeg_kit_session_get_fail_stack_trace(handle),
-      );
+      return ffmpegKitBackend.getFailStackTrace(handle);
     } catch (e, st) {
       log(
         'Session.getFailStackTrace: error getting fail stack trace ffmpeg_kit_session_get_fail_stack_trace',
@@ -373,10 +944,7 @@ abstract class Session implements Finalizable {
   String getCommand() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return _toDartStringAndFree(
-            ffmpeg.ffmpeg_kit_session_get_command(handle),
-          ) ??
-          '';
+      return ffmpegKitBackend.getCommand(handle) ?? '';
     } catch (e, st) {
       log(
         'Session.getCommand: error getting command ffmpeg_kit_session_get_command',
@@ -391,7 +959,7 @@ abstract class Session implements Finalizable {
   int getLogsCount() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.ffmpeg_kit_session_get_logs_count(handle);
+      return ffmpegKitBackend.getLogsCount(handle);
     } catch (e, st) {
       log(
         'Session.getLogsCount: error getting logs count ffmpeg_kit_session_get_logs_count',
@@ -409,10 +977,9 @@ abstract class Session implements Finalizable {
   String getLogAt(int index) {
     FFmpegKitExtended.requireInitialized();
     try {
-      return _toDartStringAndFree(
-            ffmpeg.ffmpeg_kit_session_get_log_at(handle, index),
-          ) ??
-          '';
+      return ensureLogMessageLineFeed(
+        ffmpegKitBackend.getLogAt(handle, index) ?? '',
+      );
     } catch (e, st) {
       log(
         'Session.getLogAt: error getting log at index $index ffmpeg_kit_session_get_log_at',
@@ -427,7 +994,7 @@ abstract class Session implements Finalizable {
   int getLogLevelAt(int index) {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.ffmpeg_kit_session_get_log_level_at(handle, index);
+      return ffmpegKitBackend.getLogLevelAt(handle, index);
     } catch (e, st) {
       log(
         'Session.getLogLevelAt: error getting log level at index $index ffmpeg_kit_session_get_log_level_at',
@@ -453,7 +1020,48 @@ abstract class Session implements Finalizable {
       batch.add(Log(sessionId, getLogLevelAt(i), getLogAt(i)));
     }
     logsProcessed = count;
+    if (nextExpectedLogSequence < count) {
+      nextExpectedLogSequence = count;
+    }
     onLogsDispatched(List<Log>.unmodifiable(batch));
+  }
+
+  /// Dispatches one structured log event in native insertion order.
+  ///
+  /// Contiguous events never read session history. A gap first reconciles the
+  /// buffered history; the direct event is then delivered only if that
+  /// reconciliation did not already include it. Older or already reconciled
+  /// sequences are duplicates and are ignored.
+  void dispatchDirectLogEvent({
+    required int sequence,
+    required int level,
+    required String? message,
+  }) {
+    if (sequence < nextExpectedLogSequence) {
+      return;
+    }
+
+    if (sequence > nextExpectedLogSequence) {
+      dispatchPendingLogs();
+      if (sequence < nextExpectedLogSequence) {
+        return;
+      }
+      // A direct callback cannot make an unresolved gap safe to deliver. Keep
+      // the cursor unchanged so a later completion/history flush can reconcile
+      // the missing entries without exposing out-of-order logs.
+      if (sequence > nextExpectedLogSequence) {
+        return;
+      }
+    }
+
+    nextExpectedLogSequence = sequence + 1;
+    if (logsProcessed < nextExpectedLogSequence) {
+      logsProcessed = nextExpectedLogSequence;
+    }
+    if (message == null || message.isEmpty) {
+      return;
+    }
+    onLogsDispatched(<Log>[Log(sessionId, level, message)]);
   }
 
   /// Called after [dispatchPendingLogs] drains a batch from the native buffer.
@@ -467,7 +1075,7 @@ abstract class Session implements Finalizable {
   int getStatisticsCount() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.ffmpeg_kit_session_get_statistics_count(handle);
+      return ffmpegKitBackend.getStatisticsCount(handle);
     } catch (e, st) {
       log(
         'Session.getStatisticsCount: error getting statistics count ffmpeg_kit_session_get_statistics_count',
@@ -482,55 +1090,36 @@ abstract class Session implements Finalizable {
   /// out of range.
   Statistics? getStatisticsAt(int index) {
     FFmpegKitExtended.requireInitialized();
-    final statsHandle = ffmpeg.ffmpeg_kit_session_get_statistics_at(
-      handle,
-      index,
-    );
-    if (statsHandle == nullptr) return null;
+    final snapshot = ffmpegKitBackend.getStatisticsAt(handle, index);
+    if (snapshot == null) return null;
 
     try {
-      final videoFrameNumber = ffmpeg
-          .ffmpeg_kit_statistics_get_video_frame_number(statsHandle);
-      final videoFps = ffmpeg.ffmpeg_kit_statistics_get_video_fps(statsHandle);
-      final videoQuality = ffmpeg.ffmpeg_kit_statistics_get_video_quality(
-        statsHandle,
-      );
-      final size = ffmpeg.ffmpeg_kit_statistics_get_size(statsHandle);
-      // The C API returns time in milliseconds; Statistics.time is int (milliseconds).
-      final timeElapsed = ffmpeg
-          .ffmpeg_kit_statistics_get_time_elapsed(statsHandle)
-          .round();
-      final timeMs = ffmpeg.ffmpeg_kit_statistics_get_time(statsHandle).round();
-      final bitrate = ffmpeg.ffmpeg_kit_statistics_get_bitrate(statsHandle);
-      final speed = ffmpeg.ffmpeg_kit_statistics_get_speed(statsHandle);
-      final dupFrames = ffmpeg.ffmpeg_kit_statistics_get_dup_frames(
-        statsHandle,
-      );
-      final dropFrames = ffmpeg.ffmpeg_kit_statistics_get_drop_frames(
-        statsHandle,
-      );
-      final transcodingProgress =
-          this is FFmpegSession
-              ? (this as FFmpegSession).calculateTranscodingProgress(timeMs)
-              : null;
+      final timeMs = snapshot.time;
+      final transcodingProgress = this is FFmpegSession
+          ? (this as FFmpegSession).calculateTranscodingProgress(timeMs)
+          : null;
 
       return Statistics(
         sessionId,
-        timeElapsed,
+        snapshot.timeElapsed,
         timeMs,
-        size,
-        bitrate,
-        speed,
-        videoFrameNumber,
-        videoFps,
-        videoQuality,
-        dupFrames,
-        dropFrames,
+        snapshot.size,
+        snapshot.bitrate,
+        snapshot.speed,
+        snapshot.videoFrameNumber,
+        snapshot.videoFps,
+        snapshot.videoQuality,
+        snapshot.dupFrames,
+        snapshot.dropFrames,
         transcodingProgress,
       );
-    } finally {
-      // Release after extraction, even if a getter call threw.
-      ffmpeg.ffmpeg_kit_handle_release(statsHandle);
+    } catch (e, st) {
+      log(
+        'Session.getStatisticsAt: error converting statistics snapshot',
+        error: e,
+        stackTrace: st,
+      );
+      rethrow;
     }
   }
 
@@ -538,31 +1127,135 @@ abstract class Session implements Finalizable {
 
   /// Requests cancellation of this session.
   ///
-  /// Has no effect if the session has already completed, failed, or been
-  /// previously cancelled.
+  /// Records the request before queue, state, or native operations. Cancellation
+  /// before submission removes the session from consideration, queued
+  /// cancellation removes its queue item, and startup cancellation remains
+  /// pending until the live execution can accept native delivery. A repeated
+  /// call does not duplicate successful native delivery, but it may retry a
+  /// delivery that previously failed. Natural completion can still win a
+  /// cancellation race.
   void cancel() {
-    FFmpegKitExtended.requireInitialized();
-    // Take a consistent snapshot before evaluating the guard.
-    final currentState = getState();
-    final currentReturnCode = getReturnCode();
+    _ensureNotDisposed();
+    // Latch intent before any queue, state, or native operation can fail.
+    _isCancelled = true;
+    FFmpegKitExtended.recordCancellationIntent(sessionId);
 
-    if (currentState == SessionState.completed ||
-        currentState == SessionState.failed ||
-        ReturnCode.isCancel(currentReturnCode) ||
-        _isCancelled) {
+    if (SessionQueueManager().cancelQueued(this)) {
       return;
     }
+
+    if (!_submitted && !_restoredFromHandle) {
+      FFmpegKitExtended.abandonCreatedSession(sessionId);
+      _cleanupCancelledBeforeStart();
+      return;
+    }
+
+    SessionState currentState;
     try {
-      ffmpeg.ffmpeg_kit_cancel_session(sessionId);
+      currentState = executionStateForSubmission();
     } catch (e, st) {
       log(
-        'Session.cancel: error cancelling session ffmpeg_kit_cancel_session',
+        'Session.cancel: error reading state before cancellation for session $sessionId',
         error: e,
         stackTrace: st,
       );
+      if (_executionStarted) {
+        unawaited(_monitorCancellationDispatch());
+      }
       rethrow;
     }
-    _isCancelled = true;
+
+    if (currentState == SessionState.completed ||
+        currentState == SessionState.failed) {
+      FFmpegKitExtended.clearCancellationIntent(sessionId);
+      return;
+    }
+    if (currentState == SessionState.created && !_submitted) {
+      FFmpegKitExtended.abandonCreatedSession(sessionId);
+      _cleanupCancelledBeforeStart();
+      return;
+    }
+    if (currentState == SessionState.running) {
+      try {
+        _dispatchNativeCancellationIfNeeded();
+      } catch (e, st) {
+        log(
+          'Session.cancel: error cancelling session ffmpeg_kit_cancel_session',
+          error: e,
+          stackTrace: st,
+        );
+        unawaited(_monitorCancellationDispatch());
+        rethrow;
+      }
+      return;
+    }
+
+    // A submitted session can remain Created while the native worker is
+    // handing off to its worker thread. Keep the intent and wait for Running.
+    if (_executionStarted) {
+      unawaited(_monitorCancellationDispatch());
+    } else {
+      _cleanupCancelledBeforeStart();
+    }
+  }
+
+  void _dispatchNativeCancellationIfNeeded() {
+    if (_nativeCancellationDispatched) return;
+    dispatchNativeCancellation();
+    _nativeCancellationDispatched = true;
+  }
+
+  Future<void> _monitorCancellationDispatch() async {
+    if (_cancellationMonitorActive || !_isCancelled) return;
+    _cancellationMonitorActive = true;
+    try {
+      while (_isCancelled &&
+          !_nativeCancellationDispatched &&
+          !_disposed &&
+          !_executionSettled) {
+        SessionState state;
+        try {
+          state = executionStateForSubmission();
+        } catch (e, st) {
+          log(
+            'Session.cancel: retrying state read for session $sessionId',
+            error: e,
+            stackTrace: st,
+          );
+          await _waitForCancellationRetry();
+          continue;
+        }
+
+        if (_executionSettled) break;
+        if (state == SessionState.completed || state == SessionState.failed) {
+          FFmpegKitExtended.clearCancellationIntent(sessionId);
+          break;
+        }
+        if (state == SessionState.running) {
+          try {
+            _dispatchNativeCancellationIfNeeded();
+          } catch (e, st) {
+            log(
+              'Session.cancel: retrying native cancellation for session $sessionId',
+              error: e,
+              stackTrace: st,
+            );
+          }
+        }
+        if (!_nativeCancellationDispatched) {
+          await _waitForCancellationRetry();
+        }
+      }
+    } finally {
+      _cancellationMonitorActive = false;
+    }
+  }
+
+  Future<void> _waitForCancellationRetry() async {
+    await Future.any<void>(<Future<void>>[
+      _executionSettlement.future,
+      Future<void>.delayed(const Duration(milliseconds: 10)),
+    ]);
   }
 
   // ---- Session-type identity ----------------------------------------------
@@ -575,7 +1268,7 @@ abstract class Session implements Finalizable {
   bool isFFmpegSession() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.session_is_ffmpeg_session(handle);
+      return ffmpegKitBackend.isFFmpegSession(handle);
     } catch (e, st) {
       log(
         'Session.isFFmpegSession: error checking if session is ffmpeg session session_is_ffmpeg_session',
@@ -590,7 +1283,7 @@ abstract class Session implements Finalizable {
   bool isFFplaySession() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.session_is_ffplay_session(handle);
+      return ffmpegKitBackend.isFFplaySession(handle);
     } catch (e, st) {
       log(
         'Session.isFFplaySession: error checking if session is ffplay session session_is_ffplay_session',
@@ -605,7 +1298,7 @@ abstract class Session implements Finalizable {
   bool isFFprobeSession() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.session_is_ffprobe_session(handle);
+      return ffmpegKitBackend.isFFprobeSession(handle);
     } catch (e, st) {
       log(
         'Session.isFFprobeSession: error checking if session is ffprobe session session_is_ffprobe_session',
@@ -620,7 +1313,7 @@ abstract class Session implements Finalizable {
   bool isMediaInformationSession() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.session_is_media_information_session(handle);
+      return ffmpegKitBackend.isMediaInformationSession(handle);
     } catch (e, st) {
       log(
         'Session.isMediaInformationSession: error checking if session is media information session session_is_media_information_session',
@@ -637,7 +1330,7 @@ abstract class Session implements Finalizable {
   void enableDebugLog() {
     FFmpegKitExtended.requireInitialized();
     try {
-      ffmpeg.session_enable_debug_log(handle);
+      ffmpegKitBackend.enableDebugLog(handle);
     } catch (e, st) {
       log(
         'Session.enableDebugLog: error enabling debug log session_enable_debug_log',
@@ -652,7 +1345,7 @@ abstract class Session implements Finalizable {
   void disableDebugLog() {
     FFmpegKitExtended.requireInitialized();
     try {
-      ffmpeg.session_disable_debug_log(handle);
+      ffmpegKitBackend.disableDebugLog(handle);
     } catch (e, st) {
       log(
         'Session.disableDebugLog: error disabling debug log session_disable_debug_log',
@@ -667,7 +1360,7 @@ abstract class Session implements Finalizable {
   bool isDebugLogEnabled() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return ffmpeg.session_is_debug_log_enabled(handle);
+      return ffmpegKitBackend.isDebugLogEnabled(handle);
     } catch (e, st) {
       log(
         'Session.isDebugLogEnabled: error checking if debug log is enabled session_is_debug_log_enabled',
@@ -683,7 +1376,7 @@ abstract class Session implements Finalizable {
   String getDebugLog() {
     FFmpegKitExtended.requireInitialized();
     try {
-      return _toDartStringAndFree(ffmpeg.session_get_debug_log(handle)) ?? '';
+      return ffmpegKitBackend.getDebugLog(handle) ?? '';
     } catch (e, st) {
       log(
         'Session.getDebugLog: error getting debug log session_get_debug_log',
@@ -698,7 +1391,7 @@ abstract class Session implements Finalizable {
   void clearDebugLog() {
     FFmpegKitExtended.requireInitialized();
     try {
-      ffmpeg.session_clear_debug_log(handle);
+      ffmpegKitBackend.clearDebugLog(handle);
     } catch (e, st) {
       log(
         'Session.clearDebugLog: error clearing debug log session_clear_debug_log',
@@ -708,28 +1401,15 @@ abstract class Session implements Finalizable {
       rethrow;
     }
   }
+}
 
-  // ---- Private helpers ----------------------------------------------------
+/// Exception thrown when a session cannot be submitted because it was
+/// cancelled before execution began.
+class SessionCancelledException implements Exception {
+  final String message;
 
-  /// Copies a heap-allocated `char*` from the C layer into a Dart [String]
-  /// and immediately frees the native memory via `ffmpeg_kit_free`.
-  ///
-  /// Returns `null` when [ptr] is the null pointer, allowing callers to
-  /// distinguish "no value" from an empty string.
-  String? _toDartStringAndFree(Pointer<Char> ptr) {
-    FFmpegKitExtended.requireInitialized();
-    try {
-      if (ptr == nullptr) return null;
-      final result = ptr.cast<Utf8>().toDartString();
-      ffmpeg.ffmpeg_kit_free(ptr.cast());
-      return result;
-    } catch (e, st) {
-      log(
-        'Session._toDartStringAndFree: error converting string and freeing memory',
-        error: e,
-        stackTrace: st,
-      );
-      rethrow;
-    }
-  }
+  SessionCancelledException(this.message);
+
+  @override
+  String toString() => 'SessionCancelledException: $message';
 }

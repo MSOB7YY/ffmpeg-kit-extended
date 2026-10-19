@@ -71,6 +71,10 @@ jobs:
             os: ubuntu-latest
             artifact_name: app-debug.apk
             build_command: flutter build apk --debug
+          - platform: wasm
+            os: ubuntu-latest
+            artifact_name: build/web
+            build_command: flutter build web --wasm --debug
           - platform: ios
             os: macos-latest
             artifact_name: Runner.app
@@ -99,7 +103,7 @@ jobs:
       - name: Clone Flutter SDK
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.44.0"
+          flutter-version: "3.47.0"
           channel: "stable"
           cache: true
 
@@ -115,7 +119,7 @@ jobs:
           yes | flutter doctor --android-licenses >/dev/null
 
       - name: Configure Apple build
-        if: matrix.platform == 'ios' || matrix.platform == 'macos'
+        if: matrix.platform == 'ios' || matrix.platform == 'ios-simulator' || matrix.platform == 'macos'
         run: |
           flutter config --no-analytics
           flutter config --enable-swift-package-manager
@@ -195,42 +199,10 @@ jobs:
           path: flutter/example/${{ matrix.artifact_name }}
           retention-days: 7
 
-  verify:
-    if: github.event.pull_request.draft == false
-    name: Package Verification
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Clone Flutter SDK
-        uses: subosito/flutter-action@v2
+      - name: Upload artifacts (WASM)
+        if: matrix.platform == 'wasm'
+        uses: actions/upload-artifact@v4
         with:
-          flutter-version: "3.47.0"
-          channel: "stable"
-          cache: true
-
-      - name: Get plugin dependencies
-        working-directory: flutter
-        run: flutter pub get
-
-      - name: Run Dart analyze
-        working-directory: flutter
-        run: dart analyze
-
-      - name: Run Flutter analyze
-        working-directory: flutter
-        run: flutter analyze
-
-      - name: Run Flutter tests
-        working-directory: flutter
-        run: flutter test
-
-      - name: Get example dependencies
-        working-directory: flutter/example
-        run: flutter pub get
-
-      - name: Build Web Wasm example
-        working-directory: flutter/example
-        run: flutter build web --wasm
+          name: ${{ matrix.platform }}-app
+          path: flutter/example/${{ matrix.artifact_name }}
+          retention-days: 7

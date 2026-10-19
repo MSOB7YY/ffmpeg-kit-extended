@@ -18,21 +18,24 @@
  */
 
 import 'dart:async';
+import 'dart:developer';
+
+import 'package:meta/meta.dart';
 
 import '../ffmpeg_kit_extended_flutter.dart';
 import 'callback_manager.dart' as callback_manager;
 
-// Only one FFplay session can be active at a time.
+// FFplayKit keeps one current global control owner while multiple submitted
+// executions may remain tracked until their terminal Futures settle.
 FFplaySession? _activeFFplaySession;
-
-// Completer to track when the active session completes
-Completer<void>? _sessionCompleter;
+final Set<FFplaySession> _trackedExecutions = <FFplaySession>{};
 
 /// A utility class for managing global FFplay playback.
 ///
-/// Since FFplay typically involves a single active playback window/session,
-/// [FFplayKit] provides a convenient way to execute commands and control
-/// the current active session.
+/// [FFplayKit] exposes a current global control owner for convenience while
+/// submitted executions remain tracked until their terminal Futures settle.
+/// Creating a newer global session changes the current owner; it does not
+/// implicitly cancel older tracked executions.
 class FFplayKit {
   /// Executes an FFplay [command] and starts playback.
   static Future<FFplaySession> execute(String command) => executeAsync(command);
@@ -45,26 +48,15 @@ class FFplayKit {
     FFplaySessionCompleteCallback? onComplete,
     callback_manager.FFmpegLogCallback? onLog,
   }) async {
-    _sessionCompleter = Completer<void>();
-
-    void wrappedCallback(FFplaySession session) {
-      if (onComplete != null) onComplete(session);
-      if (_activeFFplaySession == session) {
-        _activeFFplaySession = null;
-        _sessionCompleter?.complete();
-        _sessionCompleter = null;
-      }
-    }
-
     _activeFFplaySession = FFplaySession.createGlobal(
       command,
-      completeCallback: wrappedCallback,
+      completeCallback: onComplete,
     );
     if (onLog != null) {
       _activeFFplaySession!.setLogCallback(onLog);
     }
     final session = _activeFFplaySession!;
-    unawaited(session.executeAsync());
+    await _startTrackedExecution(session, propagateStartupError: true);
     return session;
   }
 
@@ -75,26 +67,9 @@ class FFplayKit {
     FFplaySessionCompleteCallback? onComplete,
     callback_manager.FFmpegLogCallback? onLog,
   }) async {
-    // Create a new completer for this session
-    _sessionCompleter = Completer<void>();
-
-    // Wrap the user's callback to complete our internal completer
-    void wrappedCallback(FFplaySession session) {
-      if (onComplete != null) {
-        onComplete(session);
-      }
-
-      // Only clear if this session is still the active one
-      if (_activeFFplaySession == session) {
-        _activeFFplaySession = null;
-        _sessionCompleter?.complete();
-        _sessionCompleter = null;
-      }
-    }
-
     _activeFFplaySession = FFplaySession.createGlobal(
       command,
-      completeCallback: wrappedCallback,
+      completeCallback: onComplete,
     );
     if (onLog != null) {
       _activeFFplaySession!.setLogCallback(onLog);
@@ -108,20 +83,9 @@ class FFplayKit {
     FFplaySessionCompleteCallback? onComplete,
     callback_manager.FFmpegLogCallback? onLog,
   }) async {
-    _sessionCompleter = Completer<void>();
-
-    void wrappedCallback(FFplaySession session) {
-      onComplete?.call(session);
-      if (_activeFFplaySession == session) {
-        _activeFFplaySession = null;
-        _sessionCompleter?.complete();
-        _sessionCompleter = null;
-      }
-    }
-
     _activeFFplaySession = FFplaySession.createGlobalFromArguments(
       arguments,
-      completeCallback: wrappedCallback,
+      completeCallback: onComplete,
     );
     if (onLog != null) {
       _activeFFplaySession!.setLogCallback(onLog);
@@ -129,17 +93,31 @@ class FFplayKit {
     return _activeFFplaySession!;
   }
 
-  /// Cancels a [session] if it is currently running.
-  static void cancel(FFplaySession session) => session.cancel();
+  /// Requests cancellation of a [session].
+  ///
+  /// The request is recorded before playback stop is attempted. Queued or
+  /// pre-start sessions do not invoke the playback stop control, and a failed
+  /// stop can be retried without losing the cancellation request.
+  ///
+  /// An untracked session that was never handed to an executor is no longer
+  /// current after cancellation succeeds. Tracked executions retain global
+  /// ownership until their execution Future settles.
+  static void cancel(FFplaySession session) {
+    session.cancel();
+    _clearCurrentIfUntracked(session);
+  }
 
-  /// Returns the current active [FFplaySession], if any.
+  /// Returns the current global control owner, if any.
+  ///
+  /// The owner is a control handle, not an assertion that no other execution
+  /// remains tracked or that the returned session is the only retained one.
   static FFplaySession? getCurrentSession() => _activeFFplaySession;
 
-  /// Returns all active FFplay sessions.
+  /// Returns all retained FFplay sessions in native session history.
   static List<FFplaySession> getFFplaySessions() =>
       FFmpegKitExtended.getFFplaySessions();
 
-  /// Returns the current active [FFplaySession], if any.
+  /// Returns the current global control owner, if any.
   static FFplaySession? get currentSession => _activeFFplaySession;
 
   /// Returns true if the current session is playing.
@@ -164,38 +142,164 @@ class FFplayKit {
     }
   }
 
-  /// Starts or resumes playback for the active global session.
+  /// Starts or resumes playback for the current global session.
   ///
-  /// This method only has an effect if there is an active session
-  /// that was created but not yet executed, or was paused.
+  /// This method only has an effect if a current session was created but not
+  /// yet executed, or was paused. A created session is started in a tracked
+  /// fire-and-forget path; startup failures are logged there. Use
+  /// [executeAsync] when the caller must await startup errors.
   static void start() {
-    if (_activeFFplaySession != null) {
-      _activeFFplaySession!.executeAsync();
+    final session = _activeFFplaySession;
+    if (session == null) return;
+
+    try {
+      switch (session.getState()) {
+        case SessionState.created:
+          unawaited(_startTrackedExecution(session));
+        case SessionState.running:
+          if (session.isPaused()) session.resume();
+        case SessionState.completed:
+        case SessionState.failed:
+          break;
+      }
+    } catch (error, stackTrace) {
+      log(
+        'FFplayKit.start: unable to inspect current session',
+        error: error,
+        stackTrace: stackTrace,
+      );
     }
   }
 
-  /// Pauses playback if there is an active global session.
+  static Future<void> _startTrackedExecution(
+    FFplaySession session, {
+    bool propagateStartupError = false,
+  }) async {
+    if (!_trackedExecutions.add(session)) return;
+
+    late final Future<FFplaySession> execution;
+    Future<void>? terminalObserver;
+    try {
+      execution = session.executeAsync();
+      // Attach the terminal owner before awaiting startup. A startup failure
+      // is also an execution failure, so one observer must own cleanup and
+      // logging for both paths.
+      terminalObserver = _finishTrackedExecution(session, execution);
+      final startup = session.startupFutureForTracking;
+      await (startup ?? execution);
+    } catch (error, stackTrace) {
+      final observer = terminalObserver;
+      if (observer != null) {
+        await observer;
+      } else {
+        // A non-async test double or an unexpected synchronous throw can fail
+        // before executeAsync returns a Future for the terminal observer.
+        log(
+          'FFplayKit: tracked startup failed before terminal observation for '
+          'session ${session.sessionId}',
+          error: error,
+          stackTrace: stackTrace,
+        );
+        _releaseTrackedExecution(session);
+      }
+      if (propagateStartupError) {
+        Error.throwWithStackTrace(error, stackTrace);
+      }
+      return;
+    }
+
+    unawaited(terminalObserver);
+  }
+
+  static Future<void> _finishTrackedExecution(
+    FFplaySession session,
+    Future<FFplaySession> completion,
+  ) async {
+    try {
+      await completion;
+    } catch (error, stackTrace) {
+      log(
+        'FFplayKit: tracked execution failed for session ${session.sessionId}',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    } finally {
+      _releaseTrackedExecution(session);
+    }
+  }
+
+  static void _releaseTrackedExecution(FFplaySession session) {
+    _trackedExecutions.remove(session);
+    _removeCurrentOwner(session);
+  }
+
+  static void _clearCurrentIfUntracked(FFplaySession session) {
+    if (identical(_activeFFplaySession, session) &&
+        !_trackedExecutions.contains(session)) {
+      _removeCurrentOwner(session);
+    }
+  }
+
+  static void _removeCurrentOwner(FFplaySession session) {
+    if (!identical(_activeFFplaySession, session)) return;
+    _activeFFplaySession = _trackedExecutions.isEmpty
+        ? null
+        : _trackedExecutions.last;
+  }
+
+  /// Installs a test session and tracks a supplied execution Future.
+  @visibleForTesting
+  static void trackExecutionForTest(
+    FFplaySession session,
+    Future<void> Function() execution,
+  ) {
+    _activeFFplaySession = session;
+    if (!_trackedExecutions.add(session)) return;
+    unawaited(() async {
+      try {
+        await execution();
+      } catch (error, stackTrace) {
+        log(
+          'FFplayKit test tracked execution failed for session ${session.sessionId}',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      } finally {
+        _releaseTrackedExecution(session);
+      }
+    }());
+  }
+
+  /// Sets the current session for [start] lifecycle tests.
+  @visibleForTesting
+  static void setCurrentSessionForTest(FFplaySession? session) {
+    _activeFFplaySession = session;
+  }
+
+  /// Pauses playback for the current global session.
   static void pause() {
     if (_activeFFplaySession != null) {
       _activeFFplaySession!.pause();
     }
   }
 
-  /// Resumes playback if there is an active session.
+  /// Resumes playback for the current global session.
   static void resume() {
     if (_activeFFplaySession != null) {
       _activeFFplaySession!.resume();
     }
   }
 
-  /// Stops playback for the active global session.
+  /// Requests playback stop for the current global control owner.
+  ///
+  /// Stop is distinct from [close] and from [FFplaySession.dispose].
   static void stop() {
     if (_activeFFplaySession != null) {
       _activeFFplaySession!.stop();
     }
   }
 
-  /// Returns true if the active session is currently playing.
+  /// Returns true if the current session is currently playing.
   static bool isPlaying() {
     if (_activeFFplaySession != null) {
       return _activeFFplaySession!.isPlaying();
@@ -203,7 +307,7 @@ class FFplayKit {
     return false;
   }
 
-  /// Returns true if the active session is currently paused.
+  /// Returns true if the current session is currently paused.
   static bool isPaused() {
     if (_activeFFplaySession != null) {
       return _activeFFplaySession!.isPaused();
@@ -211,14 +315,20 @@ class FFplayKit {
     return false;
   }
 
-  /// Closes the active session and releases resources.
+  /// Delegates FFplay close control for the current global owner.
+  ///
+  /// Close is distinct from [stop]. Deterministic native handle release is
+  /// owned by [FFplaySession.dispose]; a tracked execution remains globally
+  /// owned until its execution Future settles.
   static void close() {
-    if (_activeFFplaySession != null) {
-      _activeFFplaySession!.close();
+    final session = _activeFFplaySession;
+    if (session != null) {
+      session.close();
+      _clearCurrentIfUntracked(session);
     }
   }
 
-  /// Returns true if there is no active playback session.
+  /// Returns true if there is no current global control owner.
   static bool isClosed() => _activeFFplaySession == null;
 
   /// Sets the current playback position to [seconds].

@@ -1,0 +1,1275 @@
+'use strict';
+
+/* global BigUint64Array */
+
+const assert = require('node:assert/strict');
+const test = require('node:test');
+const {
+  WebFFmpegKitBackend,
+} = require('../.test-dist/platform/backend.web.js');
+const { getBackend } = require('../.test-dist/platform/backend-registry.js');
+const { webBackend } = require('../.test-dist/platform/backend.web.js');
+const {
+  currentFFplayPlaybackEpoch,
+  currentFFplayPlaybackSessionId,
+  resetFFplayPlaybackEpochForTests,
+} = require('../.test-dist/platform/web/ffplay-frame-state.js');
+
+require('../.test-dist/platform/backend.web.register.js');
+
+function createSnapshotModule({
+  pointers,
+  snapshotErrors = new Map(),
+  releaseErrors = new Map(),
+}) {
+  const memory = new ArrayBuffer(4096);
+  const heap = new Uint32Array(memory);
+  const arrayPointer = 64;
+  pointers.forEach((pointer, index) => {
+    heap[arrayPointer / 4 + index] = pointer;
+  });
+  heap[arrayPointer / 4 + pointers.length] = 0;
+  const releaseCalls = [];
+  const freeCalls = [];
+  let creationIndex = 0;
+  let snapshotting = false;
+  const module = {
+    HEAPU32: heap,
+    _malloc: () => 64,
+    _free: (pointer) => freeCalls.push(pointer),
+    lengthBytesUTF8: () => 0,
+    stringToUTF8: () => {},
+    ffmpeg_kit_create_session: () => pointers[creationIndex++],
+    ffmpeg_kit_get_session: (sessionId) =>
+      pointers.find((pointer) => pointer / 256 === Number(sessionId)) ?? 0,
+    ffmpeg_kit_get_sessions: () => arrayPointer,
+    ffmpeg_kit_session_get_session_id: (pointer) => {
+      const error = snapshotting ? snapshotErrors.get(pointer) : undefined;
+      if (error) throw error;
+      return pointer / 256;
+    },
+    session_is_ffmpeg_session: () => true,
+    session_is_media_information_session: () => false,
+    session_is_ffprobe_session: () => false,
+    session_is_ffplay_session: () => false,
+    ffmpeg_kit_session_get_state: () => 2,
+    ffmpeg_kit_session_get_return_code: () => 0,
+    ffmpeg_kit_session_get_create_time: () => 0,
+    ffmpeg_kit_session_get_start_time: () => 0,
+    ffmpeg_kit_session_get_end_time: () => 0,
+    ffmpeg_kit_session_get_duration: () => 0,
+    ffmpeg_kit_session_get_command: () => 0,
+    ffmpeg_kit_session_get_output: () => 0,
+    ffmpeg_kit_session_get_logs_as_string: () => 0,
+    ffmpeg_kit_session_get_fail_stack_trace: () => 0,
+    ffmpeg_kit_session_get_logs_count: () => 0,
+    ffmpeg_kit_session_get_statistics_count: () => 0,
+    session_is_debug_log_enabled: () => false,
+    ffmpeg_kit_handle_release: (pointer) => {
+      releaseCalls.push(pointer);
+      const error = snapshotting ? releaseErrors.get(pointer) : undefined;
+      if (error) throw error;
+    },
+    ffmpeg_kit_free: (pointer) => freeCalls.push(pointer),
+  };
+  return {
+    module,
+    releaseCalls,
+    freeCalls,
+    beginSnapshot: () => {
+      snapshotting = true;
+    },
+  };
+}
+
+test('Web backend registration selects the browser backend without native imports', () => {
+  assert.strictEqual(getBackend(), webBackend);
+});
+
+test('Web cancellation uses the native entry point for each session type', () => {
+  for (const type of ['ffmpeg', 'ffprobe', 'media-information', 'ffplay']) {
+    const calls = [];
+    const { module } = createSnapshotModule({ pointers: [256] });
+    module.session_is_ffmpeg_session = () => type === 'ffmpeg';
+    module.session_is_ffprobe_session = () => type === 'ffprobe';
+    module.session_is_media_information_session = () => type === 'media-information';
+    module.session_is_ffplay_session = () => type === 'ffplay';
+    module.ffprobe_kit_create_session = module.ffmpeg_kit_create_session;
+    module.media_information_create_session = module.ffmpeg_kit_create_session;
+    module.ffplay_kit_create_session = module.ffmpeg_kit_create_session;
+    module.ffmpeg_kit_session_cancel = pointer => calls.push(['ffmpeg', pointer]);
+    module.ffprobe_kit_cancel_session = id => calls.push(['ffprobe', id]);
+    module.ffplay_kit_session_stop = pointer => calls.push(['ffplay', pointer]);
+    const backend = new WebFFmpegKitBackend(undefined, module);
+    const factory = {
+      ffmpeg: 'createFFmpegSession',
+      ffprobe: 'createFFprobeSession',
+      'media-information': 'createMediaInformationSession',
+      ffplay: 'createFFplaySession',
+    }[type];
+    const id = backend[factory]('-version');
+    backend.cancelSession(id);
+    assert.deepEqual(calls, [type === 'ffmpeg' || type === 'ffplay'
+      ? [type, 256] : ['ffprobe', 1n]], type);
+  }
+});
+test('Web backend emits the frozen structured log shape and frees owned memory once', () => {
+  const events = [];
+  const freeCalls = [];
+  const removedPointers = [];
+  const registrations = [];
+  let callback;
+  let callbackSignature;
+  const module = {
+    addFunction: (value, signature) => {
+      callback = value;
+      callbackSignature = signature;
+      return 55;
+    },
+    removeFunction: (pointer) => removedPointers.push(pointer),
+    ffmpeg_kit_config_enable_log_callback: (pointer, userData) => {
+      registrations.push([pointer, userData]);
+    },
+    UTF8ToString: (pointer) => {
+      assert.equal(pointer, 128);
+      return 'direct wasm log';
+    },
+    ffmpeg_kit_free: (pointer) => freeCalls.push(pointer),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  const subscription = backend.onLogEvent((event) => events.push(event));
+
+  backend.installLogBridge();
+  assert.equal(backend.isDirectLogBridgeActive(), true);
+  assert.equal(callbackSignature, 'vjjipp');
+  assert.equal(typeof callback, 'function');
+  callback(42n, 7n, 32, 128, 0);
+
+  assert.deepEqual(events, [
+    {
+      sessionId: 42,
+      sequence: 7,
+      level: 32,
+      message: 'direct wasm log',
+    },
+  ]);
+  assert.deepEqual(freeCalls, [128]);
+  assert.deepEqual(registrations, [[55, 0]]);
+
+  subscription.remove();
+  subscription.remove();
+  backend.uninstallLogBridge();
+  assert.equal(backend.isDirectLogBridgeActive(), false);
+  assert.deepEqual(registrations, [
+    [55, 0],
+    [0, 0],
+  ]);
+  assert.deepEqual(removedPointers, []);
+});
+
+test('Web backend retains one callback pointer across delayed work and stress cycles', () => {
+  const events = [];
+  const registrations = [];
+  const callbacks = [];
+  const removedPointers = [];
+  let addCalls = 0;
+  const module = {
+    addFunction: (callback) => {
+      addCalls += 1;
+      callbacks.push(callback);
+      return 55;
+    },
+    removeFunction: (pointer) => removedPointers.push(pointer),
+    ffmpeg_kit_config_enable_log_callback: (pointer, userData) => {
+      registrations.push([pointer, userData]);
+    },
+    UTF8ToString: (pointer) => `delayed log ${pointer}`,
+    ffmpeg_kit_free: () => {},
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  backend.onLogEvent((event) => events.push(event));
+
+  backend.installLogBridge();
+  const acceptedCallback = callbacks[0];
+  for (let cycle = 0; cycle < 10000; cycle += 1) {
+    backend.uninstallLogBridge();
+    backend.installLogBridge();
+  }
+
+  assert.equal(addCalls, 1);
+  assert.equal(callbacks.length, 1);
+  assert.deepEqual(removedPointers, []);
+  assert.equal(registrations.length, 20001);
+
+  // Invoke the pointer captured before the first uninstall after all
+  // reinstallations. It must still route through the current bridge owner.
+  acceptedCallback(42n, 7n, 32, 128, 0);
+  assert.deepEqual(events, [
+    {
+      sessionId: 42,
+      sequence: 7,
+      level: 32,
+      message: 'delayed log 128',
+    },
+  ]);
+});
+
+test('Web backend rejects a missing structured log export without fallback', () => {
+  const backend = new WebFFmpegKitBackend(undefined, {
+    addFunction: () => 55,
+  });
+  assert.throws(
+    () => backend.installLogBridge(),
+    /ffmpeg_kit_config_enable_log_callback/
+  );
+  backend.uninstallLogBridge();
+});
+
+test('Web backend reads session state without full snapshot getters', () => {
+  const calls = [];
+  const module = {
+    ffmpeg_kit_get_session: (sessionId) => {
+      calls.push(['get_session', sessionId]);
+      return 1024;
+    },
+    ffmpeg_kit_session_get_state: (handle) => {
+      calls.push(['get_state', handle]);
+      return 1;
+    },
+    ffmpeg_kit_handle_release: (handle) => calls.push(['release', handle]),
+    ffmpeg_kit_session_get_session_id: () => {
+      throw new Error('full snapshot getter must not be called');
+    },
+  };
+
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.equal(backend.getSessionState(77), 1);
+  assert.deepEqual(calls, [
+    ['get_session', 77n],
+    ['get_state', 1024],
+    ['release', 1024],
+  ]);
+});
+
+test('Web backend normalizes only a proven missing session lookup', () => {
+  const backend = new WebFFmpegKitBackend(undefined, {
+    ffmpeg_kit_get_session: () => 0,
+  });
+
+  assert.equal(backend.getSessionJson(77), '');
+});
+
+test('Web backend preserves real session lookup failures', () => {
+  const lookupError = new Error('session lookup failed');
+  const backend = new WebFFmpegKitBackend(undefined, {
+    ffmpeg_kit_get_session: () => {
+      throw lookupError;
+    },
+  });
+
+  assert.throws(() => backend.getSessionJson(77), (error) => error === lookupError);
+});
+
+test('Web backend copies FFplay frame metadata through mocked Wasm memory', () => {
+  const memory = new ArrayBuffer(4096);
+  let allocations = 0;
+  let releases = 0;
+  let nextPointer = 64;
+  const module = {
+    HEAPU8: new Uint8Array(memory),
+    HEAPU32: new Uint32Array(memory),
+    _malloc: (size) => {
+      allocations += 1;
+      assert.equal(size, 24);
+      const pointer = nextPointer;
+      nextPointer += size;
+      return pointer;
+    },
+    _free: () => {
+      releases += 1;
+    },
+    ffplay_kit_get_frame_buffer_size: () => 32,
+    ffplay_kit_copy_frame: (
+      destination,
+      size,
+      width,
+      height,
+      linesize,
+      generation
+    ) => {
+      module.HEAPU32[width / 4] = 2;
+      module.HEAPU32[height / 4] = 1;
+      module.HEAPU32[linesize / 4] = 8;
+      new BigUint64Array(memory, generation, 1)[0] = 4n;
+      if (destination === 0) return -1;
+      assert.equal(size, 32);
+      module.HEAPU8.set([1, 2, 3, 4, 5, 6, 7, 8], destination);
+      return 1;
+    },
+  };
+
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  assert.equal(backend.getFrameBufferSize(), 32);
+  assert.deepEqual(backend.copyFrame(128, 32), {
+    width: 2,
+    height: 1,
+    linesize: 8,
+    generation: 4,
+    copied: true,
+  });
+  assert.deepEqual(backend.copyFrame(0, 0), {
+    width: 2,
+    height: 1,
+    linesize: 8,
+    generation: 4,
+    copied: false,
+  });
+  assert.deepEqual(backend.copyFrame(0, 0), {
+    width: 2,
+    height: 1,
+    linesize: 8,
+    generation: 4,
+    copied: false,
+  });
+  assert.deepEqual(backend.copyFrame(128, 32), {
+    width: 2,
+    height: 1,
+    linesize: 8,
+    generation: 4,
+    copied: true,
+  });
+  assert.equal(allocations, 1);
+  assert.equal(releases, 0);
+});
+
+test('Web backend creates media-information sessions from pre-tokenized arguments', () => {
+  const memory = new ArrayBuffer(4096);
+  const allocations = [];
+  const freed = [];
+  const observed = [];
+  let pointer = 64;
+  const module = {
+    HEAPU8: new Uint8Array(memory),
+    HEAPU32: new Uint32Array(memory),
+    _malloc: (size) => {
+      const result = Math.ceil(pointer / 8) * 8;
+      pointer = result + size;
+      allocations.push(result);
+      return result;
+    },
+    _free: (value) => freed.push(value),
+    lengthBytesUTF8: (value) => Buffer.byteLength(value, 'utf8'),
+    stringToUTF8: (value, destination, size) => {
+      const bytes = Buffer.from(value, 'utf8');
+      module.HEAPU8.set(bytes.subarray(0, size - 1), destination);
+      module.HEAPU8[destination + Math.min(bytes.length, size - 1)] = 0;
+    },
+    UTF8ToString: (source) => {
+      const end = module.HEAPU8.indexOf(0, source);
+      return Buffer.from(module.HEAPU8.subarray(source, end)).toString('utf8');
+    },
+    media_information_create_session_from_argv: (argc, argv) => {
+      for (let index = 0; index < argc; index += 1) {
+        observed.push(module.UTF8ToString(module.HEAPU32[argv / 4 + index]));
+      }
+      return 1024;
+    },
+    ffmpeg_kit_session_get_session_id: (handle) => {
+      assert.equal(handle, 1024);
+      return 77;
+    },
+    ffmpeg_kit_handle_release: (handle) => assert.equal(handle, 1024),
+  };
+
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  const path = '/tmp/my video "quoted" C:\\media\\clip.mkv';
+
+  assert.equal(backend.createMediaInformationSessionFromPath(path), 77);
+  assert.deepEqual(observed, [
+    '-v',
+    'error',
+    '-hide_banner',
+    '-print_format',
+    'json',
+    '-show_format',
+    '-show_streams',
+    '-show_chapters',
+    '-i',
+    path,
+  ]);
+  assert.deepEqual(
+    [...freed].sort((left, right) => left - right),
+    [...allocations].sort((left, right) => left - right)
+  );
+
+  backend.releaseSessionHandle(77);
+});
+
+test('Web backend preserves created-handle cleanup when native release fails', () => {
+  const releaseCalls = [];
+  const releaseError = new Error('release failed');
+  let shouldFail = true;
+  const module = {
+    _malloc: () => 64,
+    _free: () => {},
+    lengthBytesUTF8: () => 0,
+    stringToUTF8: () => {},
+    ffmpeg_kit_create_session: () => 1024,
+    ffmpeg_kit_session_get_session_id: (handle) => {
+      assert.equal(handle, 1024);
+      return 77;
+    },
+    ffmpeg_kit_handle_release: (handle) => {
+      releaseCalls.push(handle);
+      if (shouldFail) throw releaseError;
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.throws(
+    () => backend.createFFmpegSession('-version'),
+    (error) => error === releaseError
+  );
+  assert.deepEqual(releaseCalls, [1024]);
+
+  shouldFail = false;
+  backend.releaseSessionHandle(77);
+  backend.releaseSessionHandle(77);
+  assert.deepEqual(releaseCalls, [1024, 1024]);
+});
+
+test('Web backend clears tracked sessions transactionally', () => {
+  const releaseCalls = [];
+  const pointers = new Map([
+    [1, 1024],
+    [2, 2048],
+    [3, 3072],
+  ]);
+  let shouldFail = true;
+  let clearCalls = 0;
+  const module = {
+    _malloc: () => 64,
+    _free: () => {},
+    lengthBytesUTF8: () => 0,
+    stringToUTF8: () => {},
+    ffmpeg_kit_get_session: (sessionId) => pointers.get(Number(sessionId)),
+    ffmpeg_kit_session_get_state: () => 0,
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    ffmpeg_kit_session_execute_async: () => {},
+    ffmpeg_kit_handle_release: (handle) => {
+      releaseCalls.push(handle);
+      if (shouldFail && handle === 2048)
+        throw new Error('second release failed');
+    },
+    ffmpeg_kit_clear_sessions: () => {
+      clearCalls += 1;
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  backend.abandonCreatedSession(99);
+
+  backend.executeSessionAsync(1, 0);
+  backend.executeSessionAsync(2, 0);
+  backend.executeSessionAsync(3, 0);
+
+  assert.throws(() => backend.clearSessions(), /second release failed/);
+  assert.deepEqual(releaseCalls, [1024, 2048]);
+  assert.equal(clearCalls, 0);
+  // The event-driven reconciler probes the new candidate immediately; this
+  // fixture has no native identity for 99, so the dead tombstone is removed.
+  assert.equal(backend.isSessionAbandoned(99), false);
+
+  shouldFail = false;
+  backend.clearSessions();
+  assert.deepEqual(releaseCalls, [1024, 2048, 2048, 3072]);
+  assert.equal(clearCalls, 1);
+  assert.equal(backend.isSessionAbandoned(99), false);
+});
+
+test('Web backend retains Created tombstones when the direct oracle still finds them', () => {
+  const releaseCalls = [];
+  const module = {
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_handle_release: (pointer) => releaseCalls.push(pointer),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  for (let index = 0; index < 32; index += 1) {
+    backend.abandonCreatedSession(900 + index);
+  }
+
+  assert.equal(backend.isSessionAbandoned(900), true);
+  assert.equal(releaseCalls.length, 32);
+});
+
+test('Web backend reclaims a tombstone only when the direct oracle is empty', () => {
+  const module = {
+    ffmpeg_kit_get_session: () => 0,
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  for (let index = 0; index < 32; index += 1) {
+    backend.abandonCreatedSession(901);
+  }
+
+  assert.equal(backend.isSessionAbandoned(901), false);
+});
+
+test('Web tombstone reconciliation probes each new candidate once', () => {
+  let probes = 0;
+  const module = {
+    ffmpeg_kit_get_session: () => {
+      probes += 1;
+      return 1024;
+    },
+    ffmpeg_kit_handle_release: () => {},
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  for (let index = 0; index < 10000; index += 1) {
+    backend.abandonCreatedSession(10000 + index);
+  }
+  backend.abandonCreatedSession(10000);
+
+  assert.equal(probes, 10000);
+});
+
+test('Web tombstone reconciliation fails closed when the candidate probe errors', () => {
+  const module = {
+    ffmpeg_kit_get_session: () => {
+      throw new Error('probe unavailable');
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  backend.abandonCreatedSession(10001);
+
+  assert.equal(backend.isSessionAbandoned(10001), true);
+});
+
+test('Web backend frees every argument allocation when encoding fails', () => {
+  const allocations = [];
+  const freed = [];
+  const encodingError = new Error('argument encoding failed');
+  const memory = new ArrayBuffer(4096);
+  let nextPointer = 64;
+  const module = {
+    HEAPU8: new Uint8Array(memory),
+    HEAPU32: new Uint32Array(memory),
+    _malloc: (size) => {
+      const result = nextPointer;
+      nextPointer += Math.max(8, size);
+      allocations.push(result);
+      return result;
+    },
+    _free: (pointer) => freed.push(pointer),
+    lengthBytesUTF8: (value) => Buffer.byteLength(value, 'utf8'),
+    stringToUTF8: (value) => {
+      if (value === 'bad') throw encodingError;
+    },
+    ffmpeg_kit_create_session_from_argv: () => {
+      throw new Error('session creation must not run');
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.throws(
+    () => backend.createFFmpegSessionFromArguments(['good', 'bad']),
+    (error) => error === encodingError
+  );
+  assert.deepEqual(
+    [...freed].sort((left, right) => left - right),
+    [...allocations].sort((left, right) => left - right)
+  );
+});
+
+test('Web backend classifies MediaInformation before the broader FFprobe predicate', () => {
+  const memory = new ArrayBuffer(1024);
+  let state = 0;
+  const calls = [];
+  const module = {
+    _malloc: () => 64,
+    _free: () => {},
+    lengthBytesUTF8: (value) => Buffer.byteLength(value, 'utf8'),
+    stringToUTF8: () => {},
+    media_information_create_session: () => 1024,
+    ffmpeg_kit_session_get_session_id: () => 77,
+    ffmpeg_kit_handle_release: (pointer) => calls.push(['release', pointer]),
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_state: () => state,
+    session_is_media_information_session: () => true,
+    session_is_ffmpeg_session: () => false,
+    session_is_ffprobe_session: () => true,
+    session_is_ffplay_session: () => false,
+    media_information_session_execute_async: (pointer, timeout) => {
+      calls.push(['media-information', pointer, timeout]);
+      state = 2;
+    },
+    ffmpeg_kit_get_session_history_size: () => 1,
+  };
+
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  assert.equal(backend.createMediaInformationSession('-i input'), 77);
+  backend.executeSessionAsync(77, 500);
+  backend.releaseSessionHandle(77);
+
+  assert.deepEqual(calls, [
+    ['release', 1024],
+    ['media-information', 1024, 500n],
+    ['release', 1024],
+  ]);
+});
+
+test('Web backend rolls back a handle when session ID extraction fails', () => {
+  const releaseCalls = [];
+  const sessionIdError = new Error('session ID extraction failed');
+  const module = {
+    _malloc: () => 64,
+    _free: () => {},
+    lengthBytesUTF8: () => 0,
+    stringToUTF8: () => {},
+    ffmpeg_kit_create_session: () => 1024,
+    ffmpeg_kit_session_get_session_id: () => {
+      throw sessionIdError;
+    },
+    ffmpeg_kit_handle_release: (pointer) => releaseCalls.push(pointer),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.throws(
+    () => backend.createFFmpegSession('-version'),
+    (error) => error === sessionIdError
+  );
+  assert.deepEqual(releaseCalls, [1024]);
+});
+
+test('Web backend rolls back a handle when registry validation fails', () => {
+  const releaseCalls = [];
+  const module = {
+    _malloc: () => 64,
+    _free: () => {},
+    lengthBytesUTF8: () => 0,
+    stringToUTF8: () => {},
+    ffmpeg_kit_create_session: () => 1024,
+    ffmpeg_kit_session_get_session_id: () => 0,
+    ffmpeg_kit_handle_release: (pointer) => releaseCalls.push(pointer),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.throws(
+    () => backend.createFFmpegSession('-version'),
+    /invalid session handle/
+  );
+  assert.deepEqual(releaseCalls, [1024]);
+});
+
+test('Web backend releases a created handle before execution', () => {
+  const releaseCalls = [];
+  const module = {
+    _malloc: () => 64,
+    _free: () => {},
+    lengthBytesUTF8: () => 0,
+    stringToUTF8: () => {},
+    ffmpeg_kit_create_session: () => 1024,
+    ffmpeg_kit_session_get_session_id: () => 77,
+    ffmpeg_kit_get_session: (sessionId) => {
+      assert.equal(sessionId, 77n);
+      return 2048;
+    },
+    ffmpeg_kit_session_get_state: (handle) => {
+      assert.equal(handle, 2048);
+      return 1;
+    },
+    ffmpeg_kit_handle_release: (pointer) => releaseCalls.push(pointer),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.equal(backend.createFFmpegSession('-version'), 77);
+  assert.deepEqual(releaseCalls, [1024]);
+  assert.equal(backend.getSessionState(77), 1);
+  assert.deepEqual(releaseCalls, [1024, 2048]);
+  backend.releaseSessionHandle(77);
+  assert.deepEqual(releaseCalls, [1024, 2048]);
+});
+
+test('Web backend releases a temporary session handle when snapshot construction fails', () => {
+  const releaseCalls = [];
+  const snapshotError = new Error('snapshot getter failed');
+  let snapshotting = false;
+  const module = {
+    _malloc: () => 64,
+    _free: () => {},
+    lengthBytesUTF8: () => 0,
+    stringToUTF8: () => {},
+    ffmpeg_kit_create_session: () => 1024,
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_session_id: () => {
+      if (snapshotting) throw snapshotError;
+      return 77;
+    },
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    session_is_ffprobe_session: () => false,
+    session_is_ffplay_session: () => false,
+    ffmpeg_kit_session_get_state: () => 0,
+    ffmpeg_kit_session_get_return_code: () => 0,
+    ffmpeg_kit_session_get_create_time: () => 0,
+    ffmpeg_kit_session_get_start_time: () => 0,
+    ffmpeg_kit_session_get_end_time: () => 0,
+    ffmpeg_kit_session_get_duration: () => 0,
+    ffmpeg_kit_session_get_command: () => 0,
+    ffmpeg_kit_session_get_output: () => 0,
+    ffmpeg_kit_session_get_logs_as_string: () => 0,
+    ffmpeg_kit_session_get_fail_stack_trace: () => 0,
+    ffmpeg_kit_session_get_logs_count: () => 0,
+    ffmpeg_kit_session_get_statistics_count: () => 0,
+    session_is_debug_log_enabled: () => false,
+    ffmpeg_kit_handle_release: (pointer) => releaseCalls.push(pointer),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  backend.createFFmpegSession('-version');
+  releaseCalls.length = 0;
+  snapshotting = true;
+
+  assert.throws(
+    () => backend.getSessionsJson('all'),
+    (error) => error === snapshotError
+  );
+  assert.deepEqual(releaseCalls, [1024]);
+});
+
+test('Web backend releases every history handle after a snapshot failure', () => {
+  const snapshotError = new Error('middle snapshot failed');
+  const { module, releaseCalls, beginSnapshot } = createSnapshotModule({
+    pointers: [1024, 2048, 3072],
+    snapshotErrors: new Map([[2048, snapshotError]]),
+  });
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  backend.createFFmpegSession('-version');
+  backend.createFFmpegSession('-version');
+  backend.createFFmpegSession('-version');
+  releaseCalls.length = 0;
+  beginSnapshot();
+
+  assert.throws(
+    () => backend.getSessionsJson('all'),
+    (error) => error === snapshotError
+  );
+  assert.deepEqual(releaseCalls, [1024, 2048, 3072]);
+});
+
+test('Web history state probing releases its temporary pointer on failure', () => {
+  const stateError = new Error('history state probe failed');
+  const releaseCalls = [];
+  const module = {
+    _malloc: () => 64,
+    _free: () => {},
+    lengthBytesUTF8: () => 0,
+    stringToUTF8: () => {},
+    ffmpeg_kit_create_session: () => 2048,
+    ffmpeg_kit_session_get_session_id: () => 77,
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_state: (pointer) => {
+      if (pointer === 1024) throw stateError;
+      return 0;
+    },
+    ffmpeg_kit_handle_release: (pointer) => releaseCalls.push(pointer),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.equal(backend.createFFmpegSession('-version'), 77);
+  releaseCalls.length = 0;
+  assert.throws(
+    () => backend.getSessionsJson('all'),
+    (error) => error === stateError
+  );
+  assert.deepEqual(releaseCalls, [1024]);
+});
+
+test('Web backend preserves a snapshot error over a later collection release error', () => {
+  const snapshotError = new Error('snapshot failed first');
+  const releaseError = new Error('release failed later');
+  const { module, releaseCalls, beginSnapshot } = createSnapshotModule({
+    pointers: [1024, 2048, 3072],
+    snapshotErrors: new Map([[2048, snapshotError]]),
+    releaseErrors: new Map([[3072, releaseError]]),
+  });
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  backend.createFFmpegSession('-version');
+  backend.createFFmpegSession('-version');
+  backend.createFFmpegSession('-version');
+  releaseCalls.length = 0;
+  beginSnapshot();
+
+  assert.throws(
+    () => backend.getSessionsJson('all'),
+    (error) => error === snapshotError
+  );
+  assert.deepEqual(releaseCalls, [1024, 2048, 3072]);
+});
+
+test('Web backend reports a collection release error after successful snapshots', () => {
+  const releaseError = new Error('collection release failed');
+  const { module, releaseCalls, beginSnapshot } = createSnapshotModule({
+    pointers: [1024, 2048, 3072],
+    releaseErrors: new Map([[2048, releaseError]]),
+  });
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  backend.createFFmpegSession('-version');
+  backend.createFFmpegSession('-version');
+  backend.createFFmpegSession('-version');
+  releaseCalls.length = 0;
+  beginSnapshot();
+
+  assert.throws(
+    () => backend.getSessionsJson('all'),
+    (error) => error === releaseError
+  );
+  assert.deepEqual(releaseCalls, [1024, 2048, 3072]);
+});
+
+test('Web backend preserves an action error over temporary session release failure', () => {
+  const actionError = new Error('session action failed first');
+  const releaseError = new Error('temporary release failed later');
+  const releaseCalls = [];
+  const module = {
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_state: () => {
+      throw actionError;
+    },
+    ffmpeg_kit_handle_release: (pointer) => {
+      releaseCalls.push(pointer);
+      throw releaseError;
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.throws(
+    () => backend.getSessionState(77),
+    (error) => error === actionError
+  );
+  assert.deepEqual(releaseCalls, [1024]);
+});
+
+test('Web backend preserves a last-session snapshot error over release failure', () => {
+  const snapshotError = new Error('last snapshot failed first');
+  const releaseError = new Error('last session release failed later');
+  const releaseCalls = [];
+  let snapshotting = false;
+  const module = {
+    _malloc: () => 64,
+    _free: () => {},
+    lengthBytesUTF8: () => 0,
+    stringToUTF8: () => {},
+    ffmpeg_kit_create_session: () => 1024,
+    ffmpeg_kit_get_last_session: () => 1024,
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_session_id: () => {
+      if (snapshotting) throw snapshotError;
+      return 77;
+    },
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    session_is_ffprobe_session: () => false,
+    session_is_ffplay_session: () => false,
+    ffmpeg_kit_session_get_state: () => 0,
+    ffmpeg_kit_session_get_return_code: () => 0,
+    ffmpeg_kit_session_get_create_time: () => 0,
+    ffmpeg_kit_session_get_start_time: () => 0,
+    ffmpeg_kit_session_get_end_time: () => 0,
+    ffmpeg_kit_session_get_duration: () => 0,
+    ffmpeg_kit_session_get_command: () => 0,
+    ffmpeg_kit_session_get_output: () => 0,
+    ffmpeg_kit_session_get_logs_as_string: () => 0,
+    ffmpeg_kit_session_get_fail_stack_trace: () => 0,
+    ffmpeg_kit_session_get_logs_count: () => 0,
+    ffmpeg_kit_session_get_statistics_count: () => 0,
+    session_is_debug_log_enabled: () => false,
+    ffmpeg_kit_handle_release: (pointer) => {
+      releaseCalls.push(pointer);
+      if (snapshotting) throw releaseError;
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+  backend.createFFmpegSession('-version');
+  releaseCalls.length = 0;
+  snapshotting = true;
+
+  assert.throws(
+    () => backend.getLastSessionJson('all'),
+    (error) => error === snapshotError
+  );
+  assert.deepEqual(releaseCalls, [1024]);
+});
+
+test('Web backend preserves statistics errors over child-handle release errors', () => {
+  const statisticsError = new Error('statistics getter failed');
+  const releaseError = new Error('statistics release failed');
+  const releaseCalls = [];
+  const module = {
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_statistics_count: () => 1,
+    ffmpeg_kit_session_get_statistics_at: () => 2048,
+    ffmpeg_kit_statistics_get_time_elapsed: () => {
+      throw statisticsError;
+    },
+    ffmpeg_kit_handle_release: (pointer) => {
+      releaseCalls.push(pointer);
+      if (pointer === 2048) throw releaseError;
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.throws(
+    () => backend.getStatisticsJson(77, 0),
+    (error) => error === statisticsError
+  );
+  assert.deepEqual(releaseCalls, [2048, 1024]);
+});
+
+test('Web backend reports a statistics release error after successful serialization', () => {
+  const releaseError = new Error('statistics release failed');
+  const releaseCalls = [];
+  const module = {
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_statistics_count: () => 1,
+    ffmpeg_kit_session_get_statistics_at: () => 2048,
+    ffmpeg_kit_statistics_get_time_elapsed: () => 1,
+    ffmpeg_kit_statistics_get_time: () => 2,
+    ffmpeg_kit_statistics_get_size: () => 3,
+    ffmpeg_kit_statistics_get_bitrate: () => 4,
+    ffmpeg_kit_statistics_get_speed: () => 5,
+    ffmpeg_kit_statistics_get_video_frame_number: () => 6,
+    ffmpeg_kit_statistics_get_video_fps: () => 7,
+    ffmpeg_kit_statistics_get_video_quality: () => 8,
+    ffmpeg_kit_statistics_get_dup_frames: () => 9,
+    ffmpeg_kit_statistics_get_drop_frames: () => 10,
+    ffmpeg_kit_handle_release: (pointer) => {
+      releaseCalls.push(pointer);
+      if (pointer === 2048) throw releaseError;
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.throws(
+    () => backend.getStatisticsJson(77, 0),
+    (error) => error === releaseError
+  );
+  assert.deepEqual(releaseCalls, [2048, 1024]);
+});
+
+test('Web backend preserves media stream errors over child and info release errors', () => {
+  const streamError = new Error('stream serialization failed');
+  const streamReleaseError = new Error('stream release failed');
+  const infoReleaseError = new Error('media info release failed');
+  const releaseCalls = [];
+  const module = {
+    ffmpeg_kit_get_session: () => 1024,
+    media_information_session_get_media_information: () => 2048,
+    media_information_get_streams_count: () => 1,
+    media_information_get_stream_at: () => 3072,
+    stream_information_get_index: () => {
+      throw streamError;
+    },
+    media_information_get_chapters_count: () => 0,
+    ffmpeg_kit_handle_release: (pointer) => {
+      releaseCalls.push(pointer);
+      if (pointer === 3072) throw streamReleaseError;
+      if (pointer === 2048) throw infoReleaseError;
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.throws(
+    () => backend.getMediaInformationData(77),
+    (error) => error === streamError
+  );
+  assert.deepEqual(releaseCalls, [3072, 2048, 1024]);
+});
+
+test('Web backend reacquires and retains ownership for async execution', () => {
+  const calls = [];
+  const module = {
+    ffmpeg_kit_get_session: (sessionId) => {
+      calls.push(['get_session', sessionId]);
+      return 1024;
+    },
+    ffmpeg_kit_session_get_state: (pointer) => {
+      calls.push(['get_state', pointer]);
+      return 0;
+    },
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    ffmpeg_kit_session_execute_async: (pointer) =>
+      calls.push(['execute', pointer]),
+    ffmpeg_kit_handle_release: (pointer) => calls.push(['release', pointer]),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  backend.executeSessionAsync(77, 0);
+  assert.deepEqual(calls, [
+    ['get_session', 77n],
+    ['get_state', 1024],
+    ['execute', 1024],
+  ]);
+});
+
+test('Web backend keeps the promoted execution handle through polling', () => {
+  const calls = [];
+  const module = {
+    ffmpeg_kit_get_session: (sessionId) => {
+      calls.push(['get_session', sessionId]);
+      return 1024;
+    },
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    ffmpeg_kit_session_execute_async: (pointer) =>
+      calls.push(['execute', pointer]),
+    ffmpeg_kit_session_get_state: (pointer) => {
+      calls.push(['get_state', pointer]);
+      return calls.filter(([name]) => name === 'get_state').length === 1
+        ? 0
+        : 1;
+    },
+    ffmpeg_kit_handle_release: (pointer) => calls.push(['release', pointer]),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  backend.executeSessionAsync(77, 0);
+  assert.equal(backend.getSessionState(77), 1);
+  assert.deepEqual(calls, [
+    ['get_session', 77n],
+    ['get_state', 1024],
+    ['execute', 1024],
+    ['get_state', 1024],
+  ]);
+});
+
+test('Web backend releases a promoted execution handle exactly once at terminal cleanup', () => {
+  const releaseCalls = [];
+  const module = {
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_state: () => 0,
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    ffmpeg_kit_session_execute_async: () => {},
+    ffmpeg_kit_handle_release: (pointer) => releaseCalls.push(pointer),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  backend.executeSessionAsync(77, 0);
+  backend.releaseSessionHandle(77);
+  backend.releaseSessionHandle(77);
+  assert.deepEqual(releaseCalls, [1024]);
+});
+
+test('Web backend promotes a history handle when executing an unretained session', () => {
+  const calls = [];
+  const module = {
+    ffmpeg_kit_get_session: (sessionId) => {
+      calls.push(['get_session', sessionId]);
+      return 1024;
+    },
+    ffmpeg_kit_session_get_state: (pointer) => {
+      calls.push(['get_state', pointer]);
+      return 0;
+    },
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    ffmpeg_kit_session_execute_async: (pointer) =>
+      calls.push(['execute', pointer]),
+    ffmpeg_kit_handle_release: (pointer) => calls.push(['release', pointer]),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.equal(backend.getSessionState(77), 0);
+  backend.executeSessionAsync(77, 0);
+  assert.deepEqual(calls, [
+    ['get_session', 77n],
+    ['get_state', 1024],
+    ['release', 1024],
+    ['get_session', 77n],
+    ['get_state', 1024],
+    ['execute', 1024],
+  ]);
+});
+
+test('Web backend preserves async-start failure and rolls back execution ownership', () => {
+  const startError = new Error('async start failed');
+  const calls = [];
+  const module = {
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_state: () => 0,
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    ffmpeg_kit_session_execute_async: () => {
+      calls.push('execute');
+      throw startError;
+    },
+    ffmpeg_kit_handle_release: (pointer) => calls.push(['release', pointer]),
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.throws(
+    () => backend.executeSessionAsync(77, 0),
+    (error) => error === startError
+  );
+  assert.deepEqual(calls, ['execute', ['release', 1024]]);
+});
+
+test('Web backend keeps failed async-start cleanup retryable', () => {
+  const startError = new Error('async start failed');
+  const releaseError = new Error('execution release failed');
+  const releaseCalls = [];
+  let shouldFailRelease = true;
+  const module = {
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_state: () => 0,
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    ffmpeg_kit_session_execute_async: () => {
+      throw startError;
+    },
+    ffmpeg_kit_handle_release: (pointer) => {
+      releaseCalls.push(pointer);
+      if (shouldFailRelease) throw releaseError;
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  assert.throws(
+    () => backend.executeSessionAsync(77, 0),
+    (error) => error === startError
+  );
+  shouldFailRelease = false;
+  backend.releaseSessionHandle(77);
+  assert.deepEqual(releaseCalls, [1024, 1024]);
+});
+
+test('Web backend rejects a second wrapper for the same native session', () => {
+  let executions = 0;
+  const module = {
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_state: () => 0,
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    ffmpeg_kit_session_execute_async: () => {
+      executions += 1;
+    },
+    ffmpeg_kit_handle_release: () => {},
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  backend.executeSessionAsync(77, 0);
+  assert.throws(
+    () => backend.executeSessionAsync(77, 0),
+    /already submitted for execution/
+  );
+  assert.equal(executions, 1);
+  backend.releaseSessionHandle(77);
+});
+
+test('Web backend advances the FFplay playback epoch only after successful start', () => {
+  const createModule = ({ type, startError } = {}) => ({
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_state: () => 0,
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => type === 'ffmpeg',
+    session_is_ffprobe_session: () => false,
+    session_is_ffplay_session: () => type === 'ffplay',
+    ffplay_kit_session_execute_async: () => {
+      if (startError) throw startError;
+    },
+    ffmpeg_kit_session_execute_async: () => {},
+    ffmpeg_kit_handle_release: () => {},
+  });
+
+  resetFFplayPlaybackEpochForTests();
+  const ffplayBackend = new WebFFmpegKitBackend(
+    undefined,
+    createModule({ type: 'ffplay' })
+  );
+  ffplayBackend.executeSessionAsync(77, 0);
+  assert.equal(currentFFplayPlaybackSessionId(), 77);
+  assert.equal(currentFFplayPlaybackEpoch(), 1);
+  ffplayBackend.releaseSessionHandle(77);
+
+  resetFFplayPlaybackEpochForTests();
+  const startError = new Error('ffplay start failed');
+  const failedBackend = new WebFFmpegKitBackend(
+    undefined,
+    createModule({ type: 'ffplay', startError })
+  );
+  assert.equal(currentFFplayPlaybackSessionId(), undefined);
+  assert.throws(
+    () => failedBackend.executeSessionAsync(77, 0),
+    (error) => error === startError
+  );
+  assert.equal(currentFFplayPlaybackEpoch(), 0);
+
+  resetFFplayPlaybackEpochForTests();
+  assert.equal(currentFFplayPlaybackSessionId(), undefined);
+  const ffmpegBackend = new WebFFmpegKitBackend(
+    undefined,
+    createModule({ type: 'ffmpeg' })
+  );
+  ffmpegBackend.executeSessionAsync(77, 0);
+  assert.equal(currentFFplayPlaybackEpoch(), 0);
+  ffmpegBackend.releaseSessionHandle(77);
+  resetFFplayPlaybackEpochForTests();
+});
+
+test('Web backend rejects history sessions that are not Created', () => {
+  for (const state of [1, 2, 3]) {
+    let executions = 0;
+    const releases = [];
+    const module = {
+      ffmpeg_kit_get_session: () => 1024,
+      ffmpeg_kit_session_get_state: () => state,
+      session_is_media_information_session: () => false,
+      session_is_ffmpeg_session: () => true,
+      ffmpeg_kit_session_execute_async: () => {
+        executions += 1;
+      },
+      ffmpeg_kit_handle_release: (pointer) => releases.push(pointer),
+    };
+    const backend = new WebFFmpegKitBackend(undefined, module);
+
+    assert.throws(
+      () => backend.executeSessionAsync(77, 0),
+      new RegExp(`cannot be executed from state ${state}`)
+    );
+    assert.equal(executions, 0);
+    assert.deepEqual(releases, [1024]);
+  }
+});
+
+test('Web backend retains an execution claim until release succeeds', () => {
+  let failRelease = true;
+  const releases = [];
+  const module = {
+    ffmpeg_kit_get_session: () => 1024,
+    ffmpeg_kit_session_get_state: () => 0,
+    session_is_media_information_session: () => false,
+    session_is_ffmpeg_session: () => true,
+    ffmpeg_kit_session_execute_async: () => {},
+    ffmpeg_kit_handle_release: (pointer) => {
+      releases.push(pointer);
+      if (failRelease) throw new Error('release failed');
+    },
+  };
+  const backend = new WebFFmpegKitBackend(undefined, module);
+
+  backend.executeSessionAsync(77, 0);
+  assert.throws(() => backend.releaseSessionHandle(77), /release failed/);
+  assert.throws(
+    () => backend.executeSessionAsync(77, 0),
+    /already submitted for execution/
+  );
+  failRelease = false;
+  backend.releaseSessionHandle(77);
+  backend.executeSessionAsync(77, 0);
+  assert.deepEqual(releases, [1024, 1024]);
+});

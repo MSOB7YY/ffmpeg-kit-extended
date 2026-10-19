@@ -1,4 +1,7 @@
-import NativeFFmpegKitExtended from './NativeFFmpegKitExtended';
+import {
+  getBackend,
+  type FFmpegKitInitializeOptions,
+} from './platform/backend-registry';
 import {
   FFmpegSession,
   FFplaySession,
@@ -8,29 +11,45 @@ import {
   parseSessionsJson,
   type Session,
 } from './session';
-import {SessionQueueManager} from './session-queue-manager';
-import {LogLevel, Signal} from './types';
+import { SessionQueueManager } from './session-queue-manager';
+import { restoredSessionObserver } from './session-observation';
+import { clearAllCancellationDispatches } from './session-cancellation';
+import { LogLevel, Signal } from './types';
+
+const NativeFFmpegKitExtended = getBackend();
 
 /**
  * Central lifecycle, session-history, build-introspection, and native utility
  * facade.
  *
- * Call `initialize()` exactly once near application startup before invoking
- * FFmpegKit APIs. Initialization is idempotent in JavaScript. Most command
- * execution should go through `FFmpegKit`, `FFprobeKit`, or `FFplayKit`; the
- * session factory methods here are useful for framework-style integrations.
+ * Call `initialize()` near application startup before invoking FFmpegKit APIs.
+ * Successful initialization is idempotent, and failed attempts can be retried.
+ * Most command execution should go through `FFmpegKit`, `FFprobeKit`, or
+ * `FFplayKit`; the session factory methods here are useful for framework-style
+ * integrations.
+ *
+ * @hideconstructor
+ * @category Execution
  */
 export class FFmpegKitExtended {
   private static initializedValue = false;
+  private static initialization?: Promise<void>;
 
   /**
    * Loads and initializes the configured native FFmpegKit bundle.
    * Repeated calls are ignored after successful JavaScript initialization.
    */
-  static initialize(): void {
-    if (this.initializedValue) return;
-    NativeFFmpegKitExtended.initialize();
-    this.initializedValue = true;
+  static initialize(options?: FFmpegKitInitializeOptions): Promise<void> {
+    if (this.initializedValue) return Promise.resolve();
+    this.initialization ??= NativeFFmpegKitExtended.initialize(options)
+      .then(() => {
+        this.initializedValue = true;
+      })
+      .catch((error) => {
+        this.initialization = undefined;
+        throw error;
+      });
+    return this.initialization;
   }
 
   /** Whether `initialize()` has completed in this JavaScript runtime. */
@@ -42,7 +61,7 @@ export class FFmpegKitExtended {
   static requireInitialized(): void {
     if (!this.initializedValue) {
       throw new Error(
-        'FFmpegKitExtended has not been initialized. Call FFmpegKitExtended.initialize() before using the package.',
+        'FFmpegKitExtended has not been initialized. Call FFmpegKitExtended.initialize() before using the package.'
       );
     }
   }
@@ -58,7 +77,7 @@ export class FFmpegKitExtended {
     this.requireInitialized();
     return new FFmpegSession(
       NativeFFmpegKitExtended.createFFmpegSession(command),
-      command,
+      command
     );
   }
 
@@ -67,7 +86,7 @@ export class FFmpegKitExtended {
     this.requireInitialized();
     return new FFprobeSession(
       NativeFFmpegKitExtended.createFFprobeSession(command),
-      command,
+      command
     );
   }
 
@@ -77,7 +96,7 @@ export class FFmpegKitExtended {
     return new FFplaySession(
       NativeFFmpegKitExtended.createFFplaySession(command),
       command,
-      timeoutMs,
+      timeoutMs
     );
   }
 
@@ -87,26 +106,50 @@ export class FFmpegKitExtended {
    */
   static createMediaInformationSession(
     command: string,
-    timeoutMs = 500,
+    timeoutMs = 500
   ): MediaInformationSession {
     this.requireInitialized();
     return new MediaInformationSession(
       NativeFFmpegKitExtended.createMediaInformationSession(command),
       command,
-      timeoutMs,
+      timeoutMs
     );
   }
 
-  /** Requests cancellation by native session ID. */
-  static cancelSession(sessionId: number): void {
+  /**
+   * Requests queue-aware cancellation by session ID.
+   *
+   * ID `0` cancels all queued and active managed sessions. A matching managed
+   * session uses the same durable-intent transaction as object cancellation;
+   * an unsubmitted history wrapper is used only when no managed object exists.
+   * Missing IDs are compatibility no-ops, while lookup/state/native failures for
+   * an existing identity are propagated to the caller.
+   */
+  static async cancelSession(sessionId: number): Promise<void> {
     this.requireInitialized();
-    NativeFFmpegKitExtended.cancelSession(sessionId);
+    if (sessionId === 0) {
+      await this.cancelAllSessions();
+      return;
+    }
+    const managed = SessionQueueManager.shared.cancelBySessionId(sessionId);
+    if (managed instanceof Promise) {
+      if (await managed) return;
+    } else if (managed) {
+      return;
+    }
+
+    const restored = this.getSession(sessionId);
+    if (restored) await restored.cancel();
   }
 
-  /** Clears queued work and requests cancellation of all active sessions. */
-  static cancelAllSessions(): void {
+  /**
+   * Clears queued work and requests cancellation of all active sessions.
+   * Queue cleanup and active delivery start together; the returned promise
+   * settles only after every initiated branch has settled.
+   */
+  static async cancelAllSessions(): Promise<void> {
     this.requireInitialized();
-    SessionQueueManager.shared.cancelAll();
+    await SessionQueueManager.shared.cancelAll();
   }
 
   /** Returns all sessions retained in native history. */
@@ -123,31 +166,32 @@ export class FFmpegKitExtended {
   /** Returns retained FFmpeg processing sessions. */
   static getFFmpegSessions(): FFmpegSession[] {
     return parseSessionsJson(
-      NativeFFmpegKitExtended.getSessionsJson('ffmpeg'),
+      NativeFFmpegKitExtended.getSessionsJson('ffmpeg')
     ).filter((session): session is FFmpegSession => session.isFFmpegSession());
   }
 
   /** Returns retained FFprobe command sessions. */
   static getFFprobeSessions(): FFprobeSession[] {
     return parseSessionsJson(
-      NativeFFmpegKitExtended.getSessionsJson('ffprobe'),
-    ).filter((session): session is FFprobeSession => session.isFFprobeSession());
+      NativeFFmpegKitExtended.getSessionsJson('ffprobe')
+    ).filter((session): session is FFprobeSession =>
+      session.isFFprobeSession()
+    );
   }
 
   /** Returns retained FFplay sessions. */
   static getFFplaySessions(): FFplaySession[] {
     return parseSessionsJson(
-      NativeFFmpegKitExtended.getSessionsJson('ffplay'),
+      NativeFFmpegKitExtended.getSessionsJson('ffplay')
     ).filter((session): session is FFplaySession => session.isFFplaySession());
   }
 
   /** Returns retained structured media-information sessions. */
   static getMediaInformationSessions(): MediaInformationSession[] {
     return parseSessionsJson(
-      NativeFFmpegKitExtended.getSessionsJson('media-information'),
-    ).filter(
-      (session): session is MediaInformationSession =>
-        session.isMediaInformationSession(),
+      NativeFFmpegKitExtended.getSessionsJson('media-information')
+    ).filter((session): session is MediaInformationSession =>
+      session.isMediaInformationSession()
     );
   }
 
@@ -166,7 +210,7 @@ export class FFmpegKitExtended {
   /** Returns the newest retained FFmpeg session. */
   static getLastFFmpegSession(): FFmpegSession | undefined {
     const session = parseSessionJson(
-      NativeFFmpegKitExtended.getLastSessionJson('ffmpeg'),
+      NativeFFmpegKitExtended.getLastSessionJson('ffmpeg')
     );
     return session?.isFFmpegSession() ? session : undefined;
   }
@@ -174,7 +218,7 @@ export class FFmpegKitExtended {
   /** Returns the newest retained FFprobe session. */
   static getLastFFprobeSession(): FFprobeSession | undefined {
     const session = parseSessionJson(
-      NativeFFmpegKitExtended.getLastSessionJson('ffprobe'),
+      NativeFFmpegKitExtended.getLastSessionJson('ffprobe')
     );
     return session?.isFFprobeSession() ? session : undefined;
   }
@@ -182,7 +226,7 @@ export class FFmpegKitExtended {
   /** Returns the newest retained FFplay session. */
   static getLastFFplaySession(): FFplaySession | undefined {
     const session = parseSessionJson(
-      NativeFFmpegKitExtended.getLastSessionJson('ffplay'),
+      NativeFFmpegKitExtended.getLastSessionJson('ffplay')
     );
     return session?.isFFplaySession() ? session : undefined;
   }
@@ -190,24 +234,24 @@ export class FFmpegKitExtended {
   /** Returns the newest retained media-information session. */
   static getLastMediaInformationSession(): MediaInformationSession | undefined {
     const session = parseSessionJson(
-      NativeFFmpegKitExtended.getLastSessionJson('media-information'),
+      NativeFFmpegKitExtended.getLastSessionJson('media-information')
     );
     return session?.isMediaInformationSession() ? session : undefined;
   }
 
   /** Enables native log redirection used by per-session callbacks. */
-  static enableRedirection(): void {
-    NativeFFmpegKitExtended.enableRedirection();
+  static async enableRedirection(): Promise<void> {
+    await NativeFFmpegKitExtended.enableRedirection();
   }
 
   /** Disables native log redirection. */
-  static disableRedirection(): void {
-    NativeFFmpegKitExtended.disableRedirection();
+  static async disableRedirection(): Promise<void> {
+    await NativeFFmpegKitExtended.disableRedirection();
   }
 
   /** Sets the process-wide FFmpeg log level. */
-  static setLogLevel(level: LogLevel): void {
-    NativeFFmpegKitExtended.setLogLevel(level);
+  static async setLogLevel(level: LogLevel): Promise<void> {
+    await NativeFFmpegKitExtended.setLogLevel(level);
   }
 
   /** Returns the process-wide FFmpeg log level. */
@@ -216,16 +260,19 @@ export class FFmpegKitExtended {
   }
 
   /** Registers fonts for FFmpeg filters, with an optional family-to-file map. */
-  static setFontDirectory(path: string, mapping?: Record<string, string>): void {
-    NativeFFmpegKitExtended.setFontDirectory(
+  static async setFontDirectory(
+    path: string,
+    mapping?: Record<string, string>
+  ): Promise<void> {
+    await NativeFFmpegKitExtended.setFontDirectory(
       path,
-      mapping ? JSON.stringify(mapping) : '',
+      mapping ? JSON.stringify(mapping) : ''
     );
   }
 
   /** Selects a native audio output device by backend-provided name. */
-  static setAudioOutputDevice(deviceName: string): void {
-    NativeFFmpegKitExtended.setAudioOutputDevice(deviceName);
+  static async setAudioOutputDevice(deviceName: string): Promise<void> {
+    await NativeFFmpegKitExtended.setAudioOutputDevice(deviceName);
   }
 
   /** Lists native audio output devices in backend-defined text form. */
@@ -234,13 +281,16 @@ export class FFmpegKitExtended {
   }
 
   /** Sets a native environment variable for FFmpeg and linked libraries. */
-  static setEnvironmentVariable(name: string, value: string): void {
-    NativeFFmpegKitExtended.setEnvironmentVariable(name, value);
+  static async setEnvironmentVariable(
+    name: string,
+    value: string
+  ): Promise<void> {
+    await NativeFFmpegKitExtended.setEnvironmentVariable(name, value);
   }
 
   /** Configures the native runtime to ignore a supported signal. */
-  static ignoreSignal(signal: Signal): void {
-    NativeFFmpegKitExtended.ignoreSignal(signal);
+  static async ignoreSignal(signal: Signal): Promise<void> {
+    await NativeFFmpegKitExtended.ignoreSignal(signal);
   }
 
   /** Returns the bundled upstream FFmpeg version. */
@@ -334,8 +384,8 @@ export class FFmpegKitExtended {
   }
 
   /** Sets the number of sessions retained in native history. */
-  static setSessionHistorySize(size: number): void {
-    NativeFFmpegKitExtended.setSessionHistorySize(size);
+  static async setSessionHistorySize(size: number): Promise<void> {
+    await NativeFFmpegKitExtended.setSessionHistorySize(size);
   }
 
   /** Returns the native session-history capacity. */
@@ -343,9 +393,20 @@ export class FFmpegKitExtended {
     return NativeFFmpegKitExtended.getSessionHistorySize();
   }
 
-  /** Clears retained native session history. */
-  static clearSessions(): void {
-    NativeFFmpegKitExtended.clearSessions();
+  /**
+   * Clears the native session registry and retained session history.
+   *
+   * Do not call this while sessions are running. Clearing sessions can
+   * cancel/invalidate active session handles, and Session getters for cleared
+   * IDs may subsequently fail.
+   */
+  static async clearSessions(): Promise<void> {
+    await NativeFFmpegKitExtended.clearSessions();
+    try {
+      await restoredSessionObserver.invalidateAll();
+    } finally {
+      clearAllCancellationDispatches();
+    }
   }
 
   /** Creates a native FFmpeg FIFO/pipe and returns its path when supported. */
@@ -354,8 +415,8 @@ export class FFmpegKitExtended {
   }
 
   /** Closes/removes a pipe created by `registerNewFFmpegPipe()`. */
-  static closeFFmpegPipe(path: string): void {
-    NativeFFmpegKitExtended.closeFFmpegPipe(path);
+  static async closeFFmpegPipe(path: string): Promise<void> {
+    await NativeFFmpegKitExtended.closeFFmpegPipe(path);
   }
 
   /** Returns native callback messages still in transit for a session. */

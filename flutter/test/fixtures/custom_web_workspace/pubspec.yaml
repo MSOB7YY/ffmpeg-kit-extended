@@ -1,0 +1,14 @@
+name: custom_web_runtime_workspace
+publish_to: none
+
+environment:
+  sdk: ">=3.12.0 <4.0.0"
+
+workspace:
+  - apps/app
+
+hooks:
+  user_defines:
+    ffmpeg_kit_extended_flutter:
+      type: base
+      web: '\\wsl.localhost\ManyLinux\home\vscode\ffmpeg-kit-builders\prebuilt\wasm-wasm32\releases\bundle-base-wasm-wasm32-static-lgpl.zip'

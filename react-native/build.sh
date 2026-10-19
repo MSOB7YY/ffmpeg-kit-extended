@@ -8,7 +8,11 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-example_dir="$script_dir/example"
+example_dir="${FFMPEG_KIT_EXAMPLE_DIR:-$script_dir/example}"
+if command -v cygpath >/dev/null 2>&1; then
+  script_dir="$(cygpath -u "$script_dir")"
+  example_dir="$(cygpath -u "$example_dir")"
+fi
 macos_runtime_dir="$example_dir/.macos-runtime"
 appletvos_runtime_dir="$example_dir/.appletvos-runtime"
 windows_runtime_dir="$example_dir/.windows-runtime"
@@ -117,10 +121,17 @@ pack_runtime_local_package() {
   mkdir -p "$package_dir"
 
   echo "Packing local FFmpegKit Extended dependency for ${platform_name}..."
-  packed_name="$(
+  if ! packed_name="$(
     cd "$script_dir"
     npm pack --ignore-scripts --pack-destination "$package_dir" | tail -n 1
-  )"
+  )"; then
+    echo "npm pack failed; using the local tarball packer for ${platform_name}." >&2
+    packed_name="$(
+      node "$script_dir/scripts/pack-local-package.js" \
+        "$script_dir" \
+        "$package_dir"
+    )"
+  fi
   packed_path="$package_dir/$packed_name"
 
   if [[ -z "$packed_name" || ! -f "$packed_path" ]]; then
@@ -406,6 +417,11 @@ prepare_appletvos_runtime_files() {
   rm -rf "$appletvos_runtime_dir/ios"
   ln -s ../appletvos "$appletvos_runtime_dir/ios"
 
+  for source in index.js App.tsx App.tv.tsx app.json src; do
+    rm -rf "$appletvos_runtime_dir/$source"
+    ln -s "../$source" "$appletvos_runtime_dir/$source"
+  done
+
   cat > "$appletvos_runtime_dir/package.json" <<'JSON'
 {
   "name": "ffmpeg-kit-extended-react-native-appletvos-runtime",
@@ -417,7 +433,7 @@ prepare_appletvos_runtime_files() {
   "dependencies": {
     "ffmpeg-kit-extended": "file:.local-packages/ffmpeg-kit-extended-local.tgz",
     "react": "19.2.3",
-    "react-native": "npm:react-native-tvos@0.86.0-2"
+    "react-native": "npm:react-native-tvos@0.86.3-0"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
@@ -425,9 +441,9 @@ prepare_appletvos_runtime_files() {
     "@babel/runtime": "^7.25.0",
     "@react-native-community/cli": "20.1.0",
     "@react-native-community/cli-platform-ios": "20.1.0",
-    "@react-native/babel-preset": "0.86.0",
-    "@react-native/metro-config": "0.86.0",
-    "@react-native/typescript-config": "0.86.0",
+    "@react-native/babel-preset": "0.86.3",
+    "@react-native/metro-config": "0.86.3",
+    "@react-native/typescript-config": "0.86.3",
     "@types/react": "^19.2.0",
     "typescript": "^5.8.3"
   },
@@ -457,11 +473,11 @@ const runtimeRoot = __dirname;
 const exampleRoot = path.resolve(runtimeRoot, '..');
 const libraryRoot = path.resolve(exampleRoot, '..');
 const runtimeNodeModules = path.resolve(runtimeRoot, 'node_modules');
-const defaultConfig = getDefaultConfig(exampleRoot);
+const defaultConfig = getDefaultConfig(runtimeRoot);
 
 const config = {
-  projectRoot: exampleRoot,
-  watchFolders: [libraryRoot],
+  projectRoot: runtimeRoot,
+  watchFolders: [exampleRoot, libraryRoot],
   resolver: {
     disableHierarchicalLookup: true,
     nodeModulesPaths: [runtimeNodeModules],
@@ -479,6 +495,12 @@ const config = {
 
 module.exports = mergeConfig(defaultConfig, config);
 JS
+
+  cat > "$appletvos_runtime_dir/babel.config.js" <<'JS'
+module.exports = {
+  presets: [require.resolve('@react-native/babel-preset')],
+};
+JS
 }
 
 prepare_appletvos_package_archive() {
@@ -493,6 +515,10 @@ install_appletvos_dependencies() {
     cd "$appletvos_runtime_dir"
     npm install --ignore-scripts --legacy-peer-deps --no-audit --no-fund
   )
+}
+
+apply_appletvos_runtime_compatibility_patch() {
+  node "$script_dir/scripts/patch-appletvos-runtime.js" "$appletvos_runtime_dir"
 }
 
 sync_appletvos_binary_to_runtime() {
@@ -514,6 +540,7 @@ sync_appletvos_binary_to_runtime() {
 
 prepare_appletvos_example() {
   install_appletvos_dependencies
+  apply_appletvos_runtime_compatibility_patch
   sync_appletvos_binary_to_runtime
 }
 
@@ -649,8 +676,8 @@ prepare_windows_runtime_files() {
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "start": "react-native start --config metro.config.js",
-    "windows": "react-native run-windows --sln ../windows/FFmpegKitExtendedExample.sln"
+    "start": "node node_modules/react-native/cli.js start --config metro.config.js",
+    "windows": "node node_modules/react-native/cli.js run-windows --sln ../windows/FFmpegKitExtendedExample.sln"
   },
   "dependencies": {
     "ffmpeg-kit-extended": "file:.local-packages/ffmpeg-kit-extended-local.tgz",
@@ -735,7 +762,7 @@ prepare_windows_example() {
 
   (
     cd "$windows_runtime_dir"
-    npx react-native autolink-windows --no-telemetry
+    node node_modules/react-native/cli.js autolink-windows --no-telemetry
   )
 }
 
@@ -787,17 +814,117 @@ build_windows() {
   fi
 
   local msbuild
-  local project_windows
+  local node_windows
+  local node_dir_windows
+  local codegen_cli_windows
+  local codegen_wrapper_windows
+  local codegen_working_dir_windows
+  local mdmerge_path_windows
+  local dotnet_root_windows
+  local dotnet_sdk_dir_windows
+  local msbuild_sdks_path_windows
+  local windows_path
+  local npm_prefix_windows=""
+  local npm_prefix
   local solution_path_windows
   local solution_dir_windows
   msbuild="$(cygpath -u "$msbuild_windows")"
-  project_windows="$(cygpath -w "$example_dir/windows/FFmpegKitExtendedExample/FFmpegKitExtendedExample.vcxproj")"
+  node_windows="$(cygpath -w "$(command -v node)")"
+  node_dir_windows="$(cygpath -w "$(dirname "$(command -v node)")")"
+  codegen_cli_windows="$(cygpath -w "$windows_runtime_dir/node_modules/ffmpeg-kit-extended/scripts/windows-codegen-entry.js")"
+  codegen_wrapper_windows="$(cygpath -w "$windows_runtime_dir/.ffmpeg-kit-windows-codegen.cmd")"
+  codegen_working_dir_windows="$(cygpath -w "$windows_runtime_dir/node_modules/ffmpeg-kit-extended")"
+  local mdmerge_binary
+  mdmerge_binary="$(find '/c/Program Files (x86)/Windows Kits/10/bin' -type f -path '*/x64/mdmerge.exe' -print 2>/dev/null | sort -V | tail -n 1)"
+  if [[ -z "$mdmerge_binary" ]]; then
+    echo "Windows SDK mdmerge.exe was not found." >&2
+    exit 1
+  fi
+  local mdmerge_dir_windows
+  local mdmerge_short_path_script_windows
+  local mdmerge_short_dir_windows
+  mdmerge_dir_windows="$(cygpath -w "$(dirname "$mdmerge_binary")")"
+  mdmerge_short_path_script_windows="$windows_runtime_dir/.resolve-mdmerge-short-path.cmd"
+  cat > "$mdmerge_short_path_script_windows" <<EOF
+@echo off
+for %%I in ("$mdmerge_dir_windows") do @echo %%~sI
+EOF
+  mdmerge_short_dir_windows="$(
+    MSYS2_ARG_CONV_EXCL='*' cmd.exe /d /c \
+      "$(cygpath -w "$mdmerge_short_path_script_windows")" |
+      tr -d '\r'
+  )"
+  rm -f "$mdmerge_short_path_script_windows"
+  if [[ -z "$mdmerge_short_dir_windows" || "$mdmerge_short_dir_windows" == *' '* ]]; then
+    echo "Could not resolve a space-free Windows SDK path for mdmerge.exe: $mdmerge_dir_windows" >&2
+    exit 1
+  fi
+  mdmerge_path_windows="${mdmerge_short_dir_windows}\\"
+  echo "Using Windows SDK mdmerge.exe: $mdmerge_binary"
+  dotnet_root_windows="$(cygpath -w '/c/Program Files/dotnet')"
+  if [[ ! -d '/c/Program Files/dotnet' ]]; then
+    echo "The installed .NET SDK root was not found: /c/Program Files/dotnet" >&2
+    exit 1
+  fi
+  local dotnet_sdk_dir
+  dotnet_sdk_dir="$(find '/c/Program Files/dotnet/sdk' -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort -V | tail -n 1)"
+  if [[ -z "$dotnet_sdk_dir" ]]; then
+    echo "No installed .NET SDK directory was found under /c/Program Files/dotnet/sdk." >&2
+    exit 1
+  fi
+  dotnet_sdk_dir_windows="$(cygpath -w "$dotnet_sdk_dir")"
+  msbuild_sdks_path_windows="${dotnet_sdk_dir_windows}\\Sdks"
+  npm_prefix="$(npm config get prefix 2>/dev/null | tr -d '\r' | tail -n 1 || true)"
+  if [[ -n "$npm_prefix" ]]; then
+    npm_prefix_windows="$(cygpath -w "$(cygpath -u "$npm_prefix")")"
+  fi
+  local npm_global_dir_windows=""
+  if [[ -n "${APPDATA:-}" ]]; then
+    npm_global_dir_windows="$(cygpath -w "$(cygpath -u "$APPDATA")")\\npm"
+  fi
+  # MSBuild invokes Metro through cmd.exe, so expose Node and npm's Windows shims.
+  windows_path="$node_dir_windows"
+  if [[ -n "$npm_prefix_windows" ]]; then
+    windows_path+=";$npm_prefix_windows"
+  fi
+  if [[ -n "$npm_global_dir_windows" ]]; then
+    windows_path+=";$npm_global_dir_windows"
+  fi
+  windows_path+=";$(cygpath -pw "$PATH");$dotnet_root_windows;$mdmerge_dir_windows"
+  export MSYS2_ARG_CONV_EXCL='*'
+  case ";${MSYS2_ENV_CONV_EXCL:-};" in
+    *";PATH;"*) ;;
+    *) export MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+$MSYS2_ENV_CONV_EXCL;}PATH" ;;
+  esac
+  # Avoid Git Bash native-process PATH conversion when checking the Node shim.
+  if [[ ! -f "$(cygpath -u "$node_dir_windows")/npx.cmd" ]]; then
+    echo "npx.cmd was not found alongside node.exe." >&2
+    echo "Node directory: $node_dir_windows" >&2
+    echo "npm prefix: ${npm_prefix_windows:-unavailable}" >&2
+    echo "npm user bin: ${npm_global_dir_windows:-unavailable}" >&2
+    exit 1
+  fi
   solution_path_windows="$(cygpath -w "$example_dir/windows/FFmpegKitExtendedExample.sln")"
   solution_dir_windows="$(cygpath -w "$example_dir/windows")\\"
 
+  cat > "$windows_runtime_dir/.ffmpeg-kit-windows-codegen.cmd" <<EOF
+@echo off
+set "PATH=$node_dir_windows;%ProgramFiles%\\dotnet;%SystemRoot%\\System32;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0;%ProgramFiles%\\PowerShell\\7;%APPDATA%\\npm;%PATH%"
+set "DOTNET_ROOT=%ProgramFiles%\\dotnet"
+set "DOTNET_ROOT(x64)=%ProgramFiles%\\dotnet"
+set "DOTNET_ROOT(x86)=%ProgramFiles(x86)%\\dotnet"
+set "DOTNET_MULTILEVEL_LOOKUP=1"
+cd /d "$codegen_working_dir_windows"
+"$node_windows" "$codegen_cli_windows" %*
+EOF
+
   echo "Building Windows application project with MSBuild..."
-  MSYS2_ARG_CONV_EXCL='*' "$msbuild" \
-    "$project_windows" \
+  DOTNET_ROOT="$dotnet_root_windows" \
+  DOTNET_ROOT_X64="$dotnet_root_windows" \
+  DOTNET_MULTILEVEL_LOOKUP=1 \
+  MSBuildSDKsPath="$msbuild_sdks_path_windows" \
+  PATH="$windows_path" "$msbuild" \
+    "$solution_path_windows" \
     /restore \
     /m \
     "/p:Configuration=$configuration" \
@@ -805,6 +932,12 @@ build_windows() {
     "/p:SolutionPath=$solution_path_windows" \
     "/p:SolutionDir=$solution_dir_windows" \
     /p:SolutionFileName=FFmpegKitExtendedExample.sln \
+    "/p:CodegenCommand=\"$codegen_wrapper_windows\"" \
+    "/p:CodegenCommandArgs=codegen-windows --logging" \
+    "/p:CodegenCommandWorkingDir=$codegen_working_dir_windows" \
+    "/p:MdMergePath=$mdmerge_path_windows" \
+    /p:AppxBundle=false \
+    /p:AppxPackageSigningEnabled=false \
     /p:RunAutolinkCheck=false \
     /verbosity:minimal \
     /nologo
@@ -816,7 +949,11 @@ build_library() {
   echo "Building React Native library"
   echo "========================================"
   ensure_dependencies "$script_dir"
-  npm run prepare
+  # Calling Bob through npm's .bin shim is unreliable under the Windows
+  # MSYS2 host shell: npm can run but cannot resolve the POSIX shim as a
+  # Windows command. Invoke the cached package entry point with Node so the
+  # same library build works from PowerShell, Git Bash, and MSYS2.
+  node "$script_dir/node_modules/react-native-builder-bob/bin/bob" build
 }
 
 build_android() {
@@ -826,15 +963,23 @@ build_android() {
   echo "========================================"
   ensure_dependencies "$example_dir"
   local android_arch="${REACT_NATIVE_ARCH:-x86_64}"
+  local gradle_command=(bash ./gradlew)
+  if [[ ! -f "$example_dir/android/gradlew" ]]; then
+    if ! command -v gradle >/dev/null 2>&1; then
+      echo "Gradle wrapper is missing from $example_dir/android and Gradle was not found on PATH." >&2
+      return 127
+    fi
+    gradle_command=(gradle)
+  fi
 
   (
     cd "$example_dir/android"
     echo "Generating React Native Codegen artifacts..."
-    bash ./gradlew generateCodegenArtifactsFromSchema
+    "${gradle_command[@]}" generateCodegenArtifactsFromSchema
     if [[ "$build_type" == "release" ]]; then
-      bash ./gradlew app:assembleRelease "-PreactNativeArchitectures=$android_arch"
+      "${gradle_command[@]}" app:assembleRelease "-PreactNativeArchitectures=$android_arch"
     else
-      bash ./gradlew app:assembleDebug "-PreactNativeArchitectures=$android_arch"
+      "${gradle_command[@]}" app:assembleDebug "-PreactNativeArchitectures=$android_arch"
     fi
   )
 }
@@ -857,9 +1002,12 @@ build_ios() {
     echo "Installing CocoaPods dependencies..."
     bundle exec pod install 2>/dev/null || pod install
     local configuration="Debug"
+    local -a xcodebuild_args=(-workspace FFmpegKitExtendedExample.xcworkspace)
     [[ "$build_type" == "release" ]] && configuration="Release"
-    xcodebuild \
-      -workspace FFmpegKitExtendedExample.xcworkspace \
+    if [[ -n "${FFMPEG_KIT_IOS_DERIVED_DATA_PATH:-}" ]]; then
+      xcodebuild_args+=(-derivedDataPath "$FFMPEG_KIT_IOS_DERIVED_DATA_PATH")
+    fi
+    xcodebuild "${xcodebuild_args[@]}" \
       -scheme FFmpegKitExtendedExample \
       -configuration "$configuration" \
       -sdk iphonesimulator \
@@ -884,6 +1032,11 @@ build_appletvos() {
   prepare_appletvos_example
 
   (
+    if [[ ! -e "$example_dir/node_modules" && ! -L "$example_dir/node_modules" ]]; then
+      ln -s "$appletvos_runtime_dir/node_modules" "$example_dir/node_modules"
+      trap 'rm -f "$example_dir/node_modules"' EXIT
+    fi
+
     cd "$example_dir/appletvos"
     echo "Installing CocoaPods dependencies..."
     NODE_PATH="$appletvos_runtime_dir/node_modules" \
@@ -895,6 +1048,7 @@ build_appletvos() {
     [[ "$build_type" == "release" ]] && configuration="Release"
 
     echo "Building Apple tvOS app..."
+    REACT_NATIVE_PLATFORM=appletvos \
     NODE_PATH="$appletvos_runtime_dir/node_modules" \
     RCT_NEW_ARCH_ENABLED=1 xcodebuild \
       -workspace FFmpegKitExtendedExample.xcworkspace \
@@ -926,6 +1080,11 @@ build_macos() {
   prepare_macos_example
 
   (
+    if [[ ! -e "$example_dir/node_modules" && ! -L "$example_dir/node_modules" ]]; then
+      ln -s "$macos_runtime_dir/node_modules" "$example_dir/node_modules"
+      trap 'rm -f "$example_dir/node_modules"' EXIT
+    fi
+
     cd "$example_dir/macos"
     echo "Installing CocoaPods dependencies..."
     NODE_PATH="$macos_runtime_dir/node_modules" \
@@ -938,6 +1097,7 @@ build_macos() {
 
     echo "Building macOS app..."
     NODE_PATH="$macos_runtime_dir/node_modules" \
+    REACT_NATIVE_PLATFORM=macos \
     RCT_NEW_ARCH_ENABLED=1 xcodebuild \
       -workspace FFmpegKitExtendedExample.xcworkspace \
       -scheme FFmpegKitExtendedExample-macOS \

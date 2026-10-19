@@ -1,0 +1,1300 @@
+import type { MediaInformationData } from '../media-information';
+import type {
+  FFmpegKitBackend,
+  FFmpegKitInitializeOptions,
+  FFplayFrameCopyResult,
+  LogEvent,
+  LogEventHandler,
+  LogEventSubscription,
+  StatisticsSnapshot,
+} from './backend-registry';
+import { WasmSessionRegistry } from './web/session-registry';
+import {
+  SessionHistoryRegistry,
+  type SessionHistoryRecord,
+  type SessionHistoryType,
+} from './web/session-history-registry';
+import {
+  initializeWasm,
+  requireWasmModule,
+  type WasmModule,
+} from './web/wasm-loader';
+import { beginFFplayPlayback } from './web/ffplay-frame-state';
+import { SessionState } from '../types';
+
+type WasmFunction = (...args: unknown[]) => unknown;
+
+class MissingSessionLookupError extends Error {
+  constructor(sessionId: number) {
+    super(`Session ${sessionId} no longer exists`);
+    this.name = 'MissingSessionLookupError';
+  }
+}
+
+function fn<T extends WasmFunction>(module: WasmModule, name: string): T {
+  const value = module[name] ?? module[`_${name}`];
+  if (typeof value !== 'function')
+    throw new Error(`Wasm export is unavailable: ${name}`);
+  return value as T;
+}
+function numberResult(value: unknown): number {
+  return typeof value === 'bigint' ? Number(value) : Number(value ?? 0);
+}
+
+function int64(value: number): bigint {
+  return BigInt(Math.trunc(value));
+}
+
+function boolResult(value: unknown): boolean {
+  return Boolean(value);
+}
+
+/** Matches direct HTTP(S) inputs, including chained `scheme+` prefixes. */
+const WEB_NETWORK_INPUT_PATTERN = /^([a-z][a-z0-9.-]*\+)*https?:\/\//i;
+
+function jsonArray(value: unknown): string {
+  return JSON.stringify(Array.isArray(value) ? value : []);
+}
+
+export class WebFFmpegKitBackend implements FFmpegKitBackend {
+  private readonly sessions = new WasmSessionRegistry();
+  private readonly history = new SessionHistoryRegistry();
+  private readonly executingSessions = new Set<number>();
+  private readonly moduleOverride?: WasmModule;
+  private initializeOptions?: FFmpegKitInitializeOptions;
+  private frameMetadataScratch?: { module: WasmModule; pointer: number };
+  private readonly logEventHandlers = new Set<LogEventHandler>();
+  private logCallbackPointer?: number;
+  private directLogBridgeInstalled = false;
+
+  private readonly handleWasmLogEvent = (...args: unknown[]): void => {
+    const [sessionId, sequence, level, ownedMessage] = args;
+    const pointer = numberResult(ownedMessage);
+    let message = '';
+    try {
+      if (pointer) message = this.module().UTF8ToString(pointer);
+    } finally {
+      if (pointer) this.call('ffmpeg_kit_free')(pointer);
+    }
+
+    const event: LogEvent = {
+      sessionId: numberResult(sessionId),
+      sequence: numberResult(sequence),
+      level: numberResult(level),
+      message,
+    };
+    for (const handler of [...this.logEventHandlers]) {
+      try {
+        handler(event);
+      } catch {
+        // The Session monitor owns callback-error authority. Never allow a
+        // user handler exception to cross back through an Emscripten callback.
+      }
+    }
+  };
+
+  constructor(
+    options?: FFmpegKitInitializeOptions,
+    moduleOverride?: WasmModule
+  ) {
+    this.initializeOptions = options;
+    this.moduleOverride = moduleOverride;
+  }
+
+  private module(): WasmModule {
+    return this.moduleOverride ?? requireWasmModule();
+  }
+
+  private call<T extends WasmFunction>(name: string): T {
+    return fn<T>(this.module(), name);
+  }
+
+  private withString<T>(value: string, action: (pointer: number) => T): T {
+    const module = this.module();
+    const bytes = module.lengthBytesUTF8(value);
+    const pointer = module._malloc(bytes + 1);
+    try {
+      module.stringToUTF8(value, pointer, bytes + 1);
+      return action(pointer);
+    } finally {
+      module._free(pointer);
+    }
+  }
+
+  private readString(pointer: unknown): string {
+    const address = numberResult(pointer);
+    if (!address) return '';
+    try {
+      return this.module().UTF8ToString(address);
+    } finally {
+      this.call('ffmpeg_kit_free')(address);
+    }
+  }
+
+  private withArguments<T>(
+    arguments_: readonly string[],
+    action: (argv: number) => T
+  ): T {
+    const module = this.module();
+    const argv = module._malloc(Math.max(1, arguments_.length) * 4);
+    const values: number[] = [];
+    try {
+      for (let index = 0; index < arguments_.length; index += 1) {
+        const value = arguments_[index];
+        const pointer = module._malloc(module.lengthBytesUTF8(value) + 1);
+        values.push(pointer);
+        module.stringToUTF8(value, pointer, module.lengthBytesUTF8(value) + 1);
+        module.HEAPU32[argv / 4 + index] = pointer;
+      }
+      return action(argv);
+    } finally {
+      values.forEach((pointer) => module._free(pointer));
+      module._free(argv);
+    }
+  }
+
+  private consumeCreatedSessionHandle(
+    pointer: unknown,
+    type: SessionHistoryType
+  ): number {
+    const address = numberResult(pointer);
+    if (!address) throw new Error('Wasm returned an invalid session handle');
+
+    let sessionId: number;
+    try {
+      sessionId = numberResult(
+        this.call('ffmpeg_kit_session_get_session_id')(address)
+      );
+      if (!sessionId)
+        throw new Error('Wasm returned an invalid session handle');
+    } catch (error) {
+      try {
+        this.call('ffmpeg_kit_handle_release')(address);
+      } catch {
+        // Preserve the creation failure as the primary error.
+      }
+      throw error;
+    }
+
+    // Keep ownership retryable until the native release commits.
+    this.sessions.retain(address, sessionId);
+    try {
+      this.call('ffmpeg_kit_handle_release')(address);
+      this.sessions.take(sessionId);
+      this.history.record(sessionId, type);
+      return sessionId;
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  private pointerFor(sessionId: number): number {
+    if (this.history.isAbandoned(sessionId)) {
+      throw new Error(`Session ${sessionId} was abandoned before execution`);
+    }
+    const retained = this.sessions.get(sessionId);
+    if (retained) return retained;
+    const pointer = numberResult(
+      this.call('ffmpeg_kit_get_session')(int64(sessionId))
+    );
+    if (!pointer) throw new MissingSessionLookupError(sessionId);
+    return pointer;
+  }
+
+  private withSession<T>(sessionId: number, action: (pointer: number) => T): T {
+    const retained = this.sessions.get(sessionId);
+    if (retained) return action(retained);
+    return this.withTemporaryHandle(this.pointerFor(sessionId), action);
+  }
+
+  private withTemporaryHandle<T>(
+    pointer: number,
+    action: (pointer: number) => T
+  ): T {
+    let result!: T;
+    let primaryErrorSet = false;
+    let primaryError: unknown;
+
+    try {
+      result = action(pointer);
+    } catch (error) {
+      primaryErrorSet = true;
+      primaryError = error;
+    }
+
+    try {
+      this.call('ffmpeg_kit_handle_release')(pointer);
+    } catch (error) {
+      if (!primaryErrorSet) {
+        primaryErrorSet = true;
+        primaryError = error;
+      }
+    }
+
+    if (primaryErrorSet) throw primaryError;
+    return result;
+  }
+
+  /** Retains a Created-state history handle for one async execution. */
+  private retainForExecution(sessionId: number): number {
+    if (this.executingSessions.has(sessionId)) {
+      throw new Error(
+        `Session ${sessionId} was already submitted for execution`
+      );
+    }
+
+    const retained = this.sessions.get(sessionId);
+    const pointer =
+      retained ??
+      numberResult(this.call('ffmpeg_kit_get_session')(int64(sessionId)));
+    if (!pointer) throw new Error(`Session ${sessionId} no longer exists`);
+
+    let state: number;
+    try {
+      state = numberResult(this.call('ffmpeg_kit_session_get_state')(pointer));
+    } catch (error) {
+      if (!retained)
+        this.withTemporaryHandle(pointer, () => {
+          throw error;
+        });
+      throw error;
+    }
+
+    if (state !== SessionState.Created) {
+      const error = new Error(
+        `Session ${sessionId} cannot be executed from state ${state}`
+      );
+      if (!retained)
+        this.withTemporaryHandle(pointer, () => {
+          throw error;
+        });
+      throw error;
+    }
+
+    if (!retained) {
+      try {
+        this.sessions.retain(pointer, sessionId);
+      } catch (error) {
+        try {
+          this.call('ffmpeg_kit_handle_release')(pointer);
+        } catch {
+          // Preserve the lookup or registration failure as the primary error.
+        }
+        throw error;
+      }
+    }
+    this.executingSessions.add(sessionId);
+    return pointer;
+  }
+
+  private sessionType(pointer: number): string {
+    // MediaInformation is represented by an FFprobe-compatible native
+    // session. Preserve its specialised wrapper before the broader FFprobe
+    // predicate, matching the native and Flutter classification order.
+    if (
+      boolResult(this.call('session_is_media_information_session')(pointer))
+    ) {
+      return 'media-information';
+    }
+    if (boolResult(this.call('session_is_ffmpeg_session')(pointer)))
+      return 'ffmpeg';
+    if (boolResult(this.call('session_is_ffprobe_session')(pointer)))
+      return 'ffprobe';
+    if (boolResult(this.call('session_is_ffplay_session')(pointer)))
+      return 'ffplay';
+    throw new Error('Wasm returned an unknown session type');
+  }
+
+  private snapshot(pointer: number): Record<string, unknown> {
+    return {
+      sessionId: numberResult(
+        this.call('ffmpeg_kit_session_get_session_id')(pointer)
+      ),
+      type: this.sessionType(pointer),
+      state: numberResult(this.call('ffmpeg_kit_session_get_state')(pointer)),
+      returnCode: numberResult(
+        this.call('ffmpeg_kit_session_get_return_code')(pointer)
+      ),
+      createTime: numberResult(
+        this.call('ffmpeg_kit_session_get_create_time')(pointer)
+      ),
+      startTime: numberResult(
+        this.call('ffmpeg_kit_session_get_start_time')(pointer)
+      ),
+      endTime: numberResult(
+        this.call('ffmpeg_kit_session_get_end_time')(pointer)
+      ),
+      duration: numberResult(
+        this.call('ffmpeg_kit_session_get_duration')(pointer)
+      ),
+      command: this.readString(
+        this.call('ffmpeg_kit_session_get_command')(pointer)
+      ),
+      output: this.readString(
+        this.call('ffmpeg_kit_session_get_output')(pointer)
+      ),
+      logs: this.readString(
+        this.call('ffmpeg_kit_session_get_logs_as_string')(pointer)
+      ),
+      failStackTrace: this.readString(
+        this.call('ffmpeg_kit_session_get_fail_stack_trace')(pointer)
+      ),
+      logsCount: numberResult(
+        this.call('ffmpeg_kit_session_get_logs_count')(pointer)
+      ),
+      statisticsCount: numberResult(
+        this.call('ffmpeg_kit_session_get_statistics_count')(pointer)
+      ),
+      debugLogEnabled: boolResult(
+        this.call('session_is_debug_log_enabled')(pointer)
+      ),
+    };
+  }
+
+  private historyPointer(record: SessionHistoryRecord):
+    | {
+        pointer: number;
+        temporary: boolean;
+      }
+    | undefined {
+    const retained = this.sessions.get(record.sessionId);
+    if (retained) return { pointer: retained, temporary: false };
+
+    const pointer = numberResult(
+      this.call('ffmpeg_kit_get_session')(int64(record.sessionId))
+    );
+    if (!pointer) return undefined;
+
+    // Own the lookup pointer locally until cleanup authority transfers to the
+    // retained registry or the caller's temporary-handle finally block.
+    let transferred = false;
+    try {
+      const state = numberResult(
+        this.call('ffmpeg_kit_session_get_state')(pointer)
+      );
+      if (state === SessionState.Running) {
+        this.sessions.retain(pointer, record.sessionId);
+        transferred = true;
+        return { pointer, temporary: false };
+      }
+      transferred = true;
+      return { pointer, temporary: true };
+    } catch (error) {
+      if (!transferred) {
+        try {
+          this.call('ffmpeg_kit_handle_release')(pointer);
+        } catch {
+          // Preserve the state-probe/transfer failure as primary.
+        }
+      }
+      throw error;
+    }
+  }
+
+  private historySnapshots(
+    kind?: SessionHistoryType
+  ): Record<string, unknown>[] {
+    const result: Record<string, unknown>[] = [];
+    let primaryError: unknown;
+    for (const record of this.history.entries(kind)) {
+      try {
+        const handle = this.historyPointer(record);
+        if (!handle) {
+          this.history.remove(record.sessionId);
+          continue;
+        }
+        try {
+          result.push(this.snapshot(handle.pointer));
+        } catch (error) {
+          primaryError ??= error;
+        } finally {
+          if (handle.temporary) {
+            try {
+              this.call('ffmpeg_kit_handle_release')(handle.pointer);
+            } catch (error) {
+              primaryError ??= error;
+            }
+          }
+        }
+      } catch (error) {
+        primaryError ??= error;
+      }
+    }
+    if (primaryError !== undefined) throw primaryError;
+    return result;
+  }
+
+  /**
+   * Reconciles only tombstones whose direct Wasm lookup proves absence.
+   * Created identities retained by the frozen ABI remain fail-closed.
+   */
+  private reconcileAbandonedSession(sessionId: number): void {
+    let pointer = 0;
+    try {
+      pointer = numberResult(
+        this.call('ffmpeg_kit_get_session')(int64(sessionId))
+      );
+      if (!pointer) {
+        this.history.removeAbandoned(sessionId);
+        return;
+      }
+      this.call('ffmpeg_kit_handle_release')(pointer);
+    } catch {
+      // Preserve the tombstone if the absence oracle or temporary release fails.
+    }
+  }
+
+  async initialize(options?: FFmpegKitInitializeOptions): Promise<void> {
+    this.initializeOptions = options ?? this.initializeOptions;
+    await initializeWasm(this.initializeOptions);
+    this.call('ffmpeg_kit_initialize')();
+  }
+
+  getBuildStamp(): string {
+    return this.readString(this.call('ffmpeg_kit_get_build_stamp')());
+  }
+
+  createFFmpegSession(command: string): number {
+    return this.withString(command, (pointer) =>
+      this.consumeCreatedSessionHandle(
+        this.call('ffmpeg_kit_create_session')(pointer),
+        'ffmpeg'
+      )
+    );
+  }
+
+  createFFmpegSessionFromArguments(arguments_: readonly string[]): number {
+    return this.withArguments(arguments_, (argv) =>
+      this.consumeCreatedSessionHandle(
+        this.call('ffmpeg_kit_create_session_from_argv')(
+          arguments_.length,
+          argv
+        ),
+        'ffmpeg'
+      )
+    );
+  }
+
+  createFFprobeSession(command: string): number {
+    return this.withString(command, (pointer) =>
+      this.consumeCreatedSessionHandle(
+        this.call('ffprobe_kit_create_session')(pointer),
+        'ffprobe'
+      )
+    );
+  }
+
+  createFFprobeSessionFromArguments(arguments_: readonly string[]): number {
+    return this.withArguments(arguments_, (argv) =>
+      this.consumeCreatedSessionHandle(
+        this.call('ffprobe_kit_create_session_from_argv')(
+          arguments_.length,
+          argv
+        ),
+        'ffprobe'
+      )
+    );
+  }
+
+  createFFplaySession(command: string): number {
+    return this.withString(command, (pointer) =>
+      this.consumeCreatedSessionHandle(
+        this.call('ffplay_kit_create_session')(pointer),
+        'ffplay'
+      )
+    );
+  }
+
+  createFFplaySessionFromArguments(arguments_: readonly string[]): number {
+    return this.withArguments(arguments_, (argv) =>
+      this.consumeCreatedSessionHandle(
+        this.call('ffplay_kit_create_session_from_argv')(
+          arguments_.length,
+          argv
+        ),
+        'ffplay'
+      )
+    );
+  }
+
+  createMediaInformationSession(command: string): number {
+    return this.withString(command, (pointer) =>
+      this.consumeCreatedSessionHandle(
+        this.call('media_information_create_session')(pointer),
+        'media-information'
+      )
+    );
+  }
+
+  createMediaInformationSessionFromPath(path: string): number {
+    const arguments_ = [
+      '-v',
+      'error',
+      '-hide_banner',
+      '-print_format',
+      'json',
+      '-show_format',
+      '-show_streams',
+      '-show_chapters',
+      '-i',
+      path,
+    ];
+    return this.withArguments(arguments_, (argv) =>
+      this.consumeCreatedSessionHandle(
+        this.call('media_information_create_session_from_argv')(
+          arguments_.length,
+          argv
+        ),
+        'media-information'
+      )
+    );
+  }
+
+  executeSessionAsync(sessionId: number, timeoutMs: number): void {
+    const pointer = this.retainForExecution(sessionId);
+    try {
+      const type = this.sessionType(pointer);
+      if (type === 'ffplay') {
+        this.call('ffplay_kit_session_execute_async')(
+          pointer,
+          int64(timeoutMs)
+        );
+        beginFFplayPlayback(sessionId);
+      } else if (type === 'ffprobe')
+        this.call('ffprobe_kit_session_execute_async')(pointer);
+      else if (type === 'media-information')
+        this.call('media_information_session_execute_async')(
+          pointer,
+          int64(timeoutMs)
+        );
+      else this.call('ffmpeg_kit_session_execute_async')(pointer);
+    } catch (error) {
+      try {
+        this.releaseSessionHandle(sessionId);
+      } catch {
+        // Preserve the native start failure; the registry keeps retryable ownership.
+      }
+      throw error;
+    }
+  }
+
+  cancelSession(sessionId: number): void {
+    this.withSession(sessionId, (pointer) => {
+      const type = this.sessionType(pointer);
+      if (type === 'ffprobe' || type === 'media-information') {
+        this.call('ffprobe_kit_cancel_session')(int64(sessionId));
+      } else if (type === 'ffplay') {
+        this.call('ffplay_kit_session_stop')(pointer);
+      } else {
+        this.call('ffmpeg_kit_session_cancel')(pointer);
+      }
+    });
+  }
+
+  recordCancellationIntent(sessionId: number): void {
+    this.history.recordCancellationIntent(sessionId);
+  }
+
+  isCancellationRequested(sessionId: number): boolean {
+    return this.history.isCancellationRequested(sessionId);
+  }
+
+  clearCancellationIntent(sessionId: number): void {
+    this.history.clearCancellationIntent(sessionId);
+  }
+
+  getSessionState(sessionId: number): number {
+    return this.withSession(sessionId, (pointer) =>
+      numberResult(this.call('ffmpeg_kit_session_get_state')(pointer))
+    );
+  }
+
+  getSessionJson(sessionId: number): string {
+    if (this.history.isAbandoned(sessionId)) return '';
+    try {
+      return this.withSession(sessionId, (pointer) =>
+        JSON.stringify(this.snapshot(pointer))
+      );
+    } catch (error) {
+      // Normalize only a proven zero-pointer history lookup. State, snapshot,
+      // and release/runtime failures remain visible to cancellation callers.
+      if (error instanceof MissingSessionLookupError) return '';
+      throw error;
+    }
+  }
+
+  getLogsCount(sessionId: number): number {
+    return this.withSession(sessionId, (pointer) =>
+      numberResult(this.call('ffmpeg_kit_session_get_logs_count')(pointer))
+    );
+  }
+
+  releaseSessionHandle(sessionId: number): void {
+    const pointer = this.sessions.get(sessionId);
+    if (!pointer) return;
+    let state: number | undefined;
+    try {
+      state = numberResult(this.call('ffmpeg_kit_session_get_state')(pointer));
+    } catch {
+      // Preserve the release result when state reconciliation is unavailable.
+    }
+    this.call('ffmpeg_kit_handle_release')(pointer);
+    this.sessions.take(sessionId);
+    this.executingSessions.delete(sessionId);
+    if (state === SessionState.Completed || state === SessionState.Failed) {
+      this.history.markTerminal(sessionId);
+      try {
+        this.history.setCapacity(this.getSessionHistorySize());
+      } catch {
+        // Capacity reconciliation must not replace a successful release.
+      }
+    } else if (state === SessionState.Created) {
+      this.history.removeNonTerminal(sessionId);
+    }
+  }
+
+  /** Removes a queued Created identity without touching a Wasm execution pointer. */
+  abandonCreatedSession(sessionId: number): void {
+    if (this.history.abandonCreated(sessionId)) {
+      this.reconcileAbandonedSession(sessionId);
+    }
+  }
+
+  isSessionAbandoned(sessionId: number): boolean {
+    return this.history.isAbandoned(sessionId);
+  }
+
+  getSessionsJson(kind: string): string {
+    const historyKind =
+      kind === 'ffmpeg' ||
+      kind === 'ffprobe' ||
+      kind === 'ffplay' ||
+      kind === 'media-information'
+        ? kind
+        : undefined;
+    return jsonArray(this.historySnapshots(historyKind));
+  }
+
+  getLastSessionJson(kind: string): string {
+    const historyKind =
+      kind === 'ffmpeg' ||
+      kind === 'ffprobe' ||
+      kind === 'ffplay' ||
+      kind === 'media-information'
+        ? kind
+        : undefined;
+    const snapshots = this.historySnapshots(historyKind);
+    return snapshots.length === 0
+      ? ''
+      : JSON.stringify(snapshots[snapshots.length - 1]);
+  }
+
+  getLogsJson(sessionId: number, fromIndex: number): string {
+    return this.withSession(sessionId, (pointer) => {
+      const count = numberResult(
+        this.call('ffmpeg_kit_session_get_logs_count')(pointer)
+      );
+      const values: Record<string, unknown>[] = [];
+      for (let index = fromIndex; index < count; index += 1) {
+        values.push({
+          sessionId,
+          level: numberResult(
+            this.call('ffmpeg_kit_session_get_log_level_at')(
+              pointer,
+              int64(index)
+            )
+          ),
+          message: this.readString(
+            this.call('ffmpeg_kit_session_get_log_at')(pointer, int64(index))
+          ),
+        });
+      }
+      return JSON.stringify(values);
+    });
+  }
+
+  getStatisticsJson(sessionId: number, fromIndex: number): string {
+    return this.withSession(sessionId, (pointer) => {
+      const count = numberResult(
+        this.call('ffmpeg_kit_session_get_statistics_count')(pointer)
+      );
+      const values: StatisticsSnapshot[] = [];
+      for (let index = fromIndex; index < count; index += 1) {
+        const statistics = numberResult(
+          this.call('ffmpeg_kit_session_get_statistics_at')(
+            pointer,
+            int64(index)
+          )
+        );
+        if (!statistics) continue;
+        values.push(
+          this.withTemporaryHandle(statistics, (handle) => ({
+            sessionId,
+            timeElapsed: numberResult(
+              this.call('ffmpeg_kit_statistics_get_time_elapsed')(handle)
+            ),
+            time: numberResult(
+              this.call('ffmpeg_kit_statistics_get_time')(handle)
+            ),
+            size: numberResult(
+              this.call('ffmpeg_kit_statistics_get_size')(handle)
+            ),
+            bitrate: numberResult(
+              this.call('ffmpeg_kit_statistics_get_bitrate')(handle)
+            ),
+            speed: numberResult(
+              this.call('ffmpeg_kit_statistics_get_speed')(handle)
+            ),
+            videoFrameNumber: numberResult(
+              this.call('ffmpeg_kit_statistics_get_video_frame_number')(handle)
+            ),
+            videoFps: numberResult(
+              this.call('ffmpeg_kit_statistics_get_video_fps')(handle)
+            ),
+            videoQuality: numberResult(
+              this.call('ffmpeg_kit_statistics_get_video_quality')(handle)
+            ),
+            dupFrames: numberResult(
+              this.call('ffmpeg_kit_statistics_get_dup_frames')(handle)
+            ),
+            dropFrames: numberResult(
+              this.call('ffmpeg_kit_statistics_get_drop_frames')(handle)
+            ),
+          }))
+        );
+      }
+      return JSON.stringify(values);
+    });
+  }
+
+  getMediaInformationJson(sessionId: number): string {
+    const data = this.getMediaInformationData(sessionId);
+    return data ? JSON.stringify(data) : '';
+  }
+
+  private streamInformationData(pointer: number): Record<string, unknown> {
+    return {
+      index: numberResult(this.call('stream_information_get_index')(pointer)),
+      type: this.readString(this.call('stream_information_get_type')(pointer)),
+      codec: this.readString(
+        this.call('stream_information_get_codec')(pointer)
+      ),
+      codecLong: this.readString(
+        this.call('stream_information_get_codec_long')(pointer)
+      ),
+      format: this.readString(
+        this.call('stream_information_get_format')(pointer)
+      ),
+      width: numberResult(this.call('stream_information_get_width')(pointer)),
+      height: numberResult(this.call('stream_information_get_height')(pointer)),
+      bitrate: this.readString(
+        this.call('stream_information_get_bitrate')(pointer)
+      ),
+      sampleRate: this.readString(
+        this.call('stream_information_get_sample_rate')(pointer)
+      ),
+      sampleFormat: this.readString(
+        this.call('stream_information_get_sample_format')(pointer)
+      ),
+      channelLayout: this.readString(
+        this.call('stream_information_get_channel_layout')(pointer)
+      ),
+      sampleAspectRatio: this.readString(
+        this.call('stream_information_get_sample_aspect_ratio')(pointer)
+      ),
+      displayAspectRatio: this.readString(
+        this.call('stream_information_get_display_aspect_ratio')(pointer)
+      ),
+      averageFrameRate: this.readString(
+        this.call('stream_information_get_average_frame_rate')(pointer)
+      ),
+      realFrameRate: this.readString(
+        this.call('stream_information_get_real_frame_rate')(pointer)
+      ),
+      timeBase: this.readString(
+        this.call('stream_information_get_time_base')(pointer)
+      ),
+      codecTimeBase: this.readString(
+        this.call('stream_information_get_codec_time_base')(pointer)
+      ),
+      tagsJson: this.readString(
+        this.call('stream_information_get_tags_json')(pointer)
+      ),
+      allPropertiesJson: this.readString(
+        this.call('stream_information_get_all_properties_json')(pointer)
+      ),
+    };
+  }
+
+  private chapterInformationData(pointer: number): Record<string, unknown> {
+    return {
+      id: numberResult(this.call('chapter_get_id')(pointer)),
+      timeBase: this.readString(this.call('chapter_get_time_base')(pointer)),
+      start: numberResult(this.call('chapter_get_start')(pointer)),
+      startTime: this.readString(this.call('chapter_get_start_time')(pointer)),
+      end: numberResult(this.call('chapter_get_end')(pointer)),
+      endTime: this.readString(this.call('chapter_get_end_time')(pointer)),
+      tagsJson: this.readString(this.call('chapter_get_tags_json')(pointer)),
+      allPropertiesJson: this.readString(
+        this.call('chapter_get_all_properties_json')(pointer)
+      ),
+    };
+  }
+
+  getMediaInformationData(sessionId: number): MediaInformationData | undefined {
+    return this.withSession(sessionId, (session) => {
+      const info = numberResult(
+        this.call('media_information_session_get_media_information')(session)
+      );
+      if (!info) return undefined;
+      return this.withTemporaryHandle(info, (infoHandle) => {
+        const streams: Record<string, unknown>[] = [];
+        const streamCount = numberResult(
+          this.call('media_information_get_streams_count')(infoHandle)
+        );
+        for (let index = 0; index < streamCount; index += 1) {
+          const stream = numberResult(
+            this.call('media_information_get_stream_at')(
+              infoHandle,
+              int64(index)
+            )
+          );
+          if (!stream) continue;
+          streams.push(
+            this.withTemporaryHandle(stream, (handle) =>
+              this.streamInformationData(handle)
+            )
+          );
+        }
+
+        const chapters: Record<string, unknown>[] = [];
+        const chapterCount = numberResult(
+          this.call('media_information_get_chapters_count')(infoHandle)
+        );
+        for (let index = 0; index < chapterCount; index += 1) {
+          const chapter = numberResult(
+            this.call('media_information_get_chapter_at')(
+              infoHandle,
+              int64(index)
+            )
+          );
+          if (!chapter) continue;
+          chapters.push(
+            this.withTemporaryHandle(chapter, (handle) =>
+              this.chapterInformationData(handle)
+            )
+          );
+        }
+
+        return {
+          filename: this.readString(
+            this.call('media_information_get_filename')(info)
+          ),
+          format: this.readString(
+            this.call('media_information_get_format')(info)
+          ),
+          longFormat: this.readString(
+            this.call('media_information_get_long_format')(info)
+          ),
+          duration: this.readString(
+            this.call('media_information_get_duration')(info)
+          ),
+          startTime: this.readString(
+            this.call('media_information_get_start_time')(info)
+          ),
+          bitrate: this.readString(
+            this.call('media_information_get_bitrate')(info)
+          ),
+          size: this.readString(this.call('media_information_get_size')(info)),
+          tagsJson: this.readString(
+            this.call('media_information_get_tags_json')(info)
+          ),
+          allPropertiesJson: this.readString(
+            this.call('media_information_get_all_properties_json')(info)
+          ),
+          streams,
+          chapters,
+        };
+      });
+    });
+  }
+
+  ffplayStart(sessionId: number): void {
+    this.withSession(sessionId, (p) =>
+      this.call('ffplay_kit_session_start')(p)
+    );
+  }
+  ffplayPause(sessionId: number): void {
+    this.withSession(sessionId, (p) =>
+      this.call('ffplay_kit_session_pause')(p)
+    );
+  }
+  ffplayResume(sessionId: number): void {
+    this.withSession(sessionId, (p) =>
+      this.call('ffplay_kit_session_resume')(p)
+    );
+  }
+  ffplayStop(sessionId: number): void {
+    this.withSession(sessionId, (p) => this.call('ffplay_kit_session_stop')(p));
+  }
+  ffplaySeek(sessionId: number, seconds: number): void {
+    this.withSession(sessionId, (p) =>
+      this.call('ffplay_kit_session_seek')(p, seconds)
+    );
+  }
+  ffplayGetPosition(sessionId: number): number {
+    return this.withSession(sessionId, (p) =>
+      numberResult(this.call('ffplay_kit_session_get_position')(p))
+    );
+  }
+  ffplaySetPosition(sessionId: number, seconds: number): void {
+    this.withSession(sessionId, (p) =>
+      this.call('ffplay_kit_session_set_position')(p, seconds)
+    );
+  }
+  ffplayGetDuration(sessionId: number): number {
+    return this.withSession(sessionId, (p) =>
+      numberResult(this.call('ffplay_kit_session_get_duration')(p))
+    );
+  }
+  ffplayGetVideoWidth(sessionId: number): number {
+    return this.withSession(sessionId, (p) =>
+      numberResult(this.call('ffplay_kit_session_get_video_width')(p))
+    );
+  }
+  ffplayGetVideoHeight(sessionId: number): number {
+    return this.withSession(sessionId, (p) =>
+      numberResult(this.call('ffplay_kit_session_get_video_height')(p))
+    );
+  }
+  ffplayIsPlaying(sessionId: number): boolean {
+    return this.withSession(sessionId, (p) =>
+      boolResult(this.call('ffplay_kit_session_is_playing')(p))
+    );
+  }
+  ffplayIsPaused(sessionId: number): boolean {
+    return this.withSession(sessionId, (p) =>
+      boolResult(this.call('ffplay_kit_session_is_paused')(p))
+    );
+  }
+  ffplaySetVolume(sessionId: number, volume: number): void {
+    this.withSession(sessionId, (p) =>
+      this.call('ffplay_kit_session_set_volume')(p, volume)
+    );
+  }
+  ffplayGetVolume(sessionId: number): number {
+    return this.withSession(sessionId, (p) =>
+      numberResult(this.call('ffplay_kit_session_get_volume')(p))
+    );
+  }
+  ffplayHasVideoStream(path: string): boolean {
+    // The C probe opens input without the Web HTTP AVIO, so network schemes
+    // are rejected here instead of reporting a misleading result.
+    if (WEB_NETWORK_INPUT_PATTERN.test(path)) {
+      throw new Error(
+        'FFplayKit.hasVideoStream() does not accept network URLs on Web. Use the async FFprobeKit.getMediaInformation() for direct HTTP and HLS input.'
+      );
+    }
+    // The C probe returns 1 for a video stream, 0 for none and -1 on failure.
+    // Only 1 may report true; -1 must not become true.
+    return this.withString(
+      path,
+      (p) => numberResult(this.call('ffplay_kit_has_video_stream')(p)) === 1
+    );
+  }
+
+  getFrameBufferSize(): number {
+    return numberResult(this.call('ffplay_kit_get_frame_buffer_size')());
+  }
+
+  /** Reuses backend-owned metadata storage across high-frequency frame polls. */
+  private frameMetadataPointer(module: WasmModule): number {
+    const current = this.frameMetadataScratch;
+    if (current?.module === module) return current.pointer;
+
+    const pointer = module._malloc(24);
+    if (!pointer)
+      throw new Error(
+        'Unable to allocate FFplay frame metadata scratch memory'
+      );
+    this.frameMetadataScratch = { module, pointer };
+    return pointer;
+  }
+
+  copyFrame(
+    destination: number,
+    destinationSize: number
+  ): FFplayFrameCopyResult {
+    const module = this.module();
+    const metadata = this.frameMetadataPointer(module);
+    const width = metadata;
+    const height = metadata + 4;
+    const linesize = metadata + 8;
+    const generation = metadata + 16;
+    const result = numberResult(
+      this.call('ffplay_kit_copy_frame')(
+        destination,
+        destinationSize,
+        width,
+        height,
+        linesize,
+        generation
+      )
+    );
+    return {
+      width: module.HEAPU32[width / 4],
+      height: module.HEAPU32[height / 4],
+      linesize: module.HEAPU32[linesize / 4],
+      generation: Number(
+        new BigUint64Array(module.HEAPU8.buffer, generation, 1)[0]
+      ),
+      copied: result === 1,
+    };
+  }
+
+  /** Subscribes to structured v2 events before the next native execution. */
+  onLogEvent(handler: LogEventHandler): LogEventSubscription {
+    this.logEventHandlers.add(handler);
+    let removed = false;
+    return {
+      remove: () => {
+        if (removed) return;
+        removed = true;
+        this.logEventHandlers.delete(handler);
+      },
+    };
+  }
+
+  /**
+   * Installs the same owned structured Wasm ABI used by the native bridge.
+   */
+  installLogBridge(): void {
+    if (this.directLogBridgeInstalled) return;
+    const module = this.module();
+    const addFunction = module.addFunction;
+    if (typeof addFunction !== 'function') {
+      throw new Error(
+        'Wasm function table is unavailable for the structured log callback.'
+      );
+    }
+    const enable =
+      module.ffmpeg_kit_config_enable_log_callback ??
+      module._ffmpeg_kit_config_enable_log_callback;
+    if (typeof enable !== 'function') {
+      throw new Error(
+        'Wasm export is unavailable: ffmpeg_kit_config_enable_log_callback'
+      );
+    }
+
+    const pointer =
+      this.logCallbackPointer ?? addFunction(this.handleWasmLogEvent, 'vjjipp');
+    this.logCallbackPointer = pointer;
+    try {
+      (enable as WasmFunction)(pointer, 0);
+      this.directLogBridgeInstalled = true;
+    } catch (error) {
+      // Native callback registration may have accepted the pointer before
+      // reporting an error. Retain the table slot and retry with the same
+      // pointer; never recycle it into an unrelated callback.
+      throw error;
+    }
+  }
+
+  uninstallLogBridge(): void {
+    const pointer = this.logCallbackPointer;
+    this.directLogBridgeInstalled = false;
+    if (pointer === undefined) return;
+
+    let primaryError: unknown;
+    try {
+      this.call('ffmpeg_kit_config_enable_log_callback')(0, 0);
+    } catch (error) {
+      primaryError = error;
+    }
+    // Unregistration disables future native snapshots but does not revoke
+    // work already accepted by native code. The Wasm table slot is therefore
+    // retained for the lifetime of the loaded module.
+    if (primaryError !== undefined) throw primaryError;
+  }
+
+  isDirectLogBridgeActive(): boolean {
+    return this.directLogBridgeInstalled;
+  }
+
+  enableRedirection(): void {
+    this.call('ffmpeg_kit_config_enable_redirection')();
+  }
+  disableRedirection(): void {
+    this.call('ffmpeg_kit_config_disable_redirection')();
+  }
+  setLogLevel(level: number): void {
+    this.call('ffmpeg_kit_config_set_log_level')(level);
+  }
+  getLogLevel(): number {
+    return numberResult(this.call('ffmpeg_kit_config_get_log_level')());
+  }
+  logLevelToString(level: number): string {
+    return this.readString(
+      this.call('ffmpeg_kit_config_log_level_to_string')(level)
+    );
+  }
+  setFontDirectory(path: string, mappingJson: string): void {
+    this.withString(path, (p) =>
+      this.withString(mappingJson, (m) =>
+        this.call('ffmpeg_kit_config_set_font_directory')(p, m)
+      )
+    );
+  }
+  setEnvironmentVariable(name: string, value: string): void {
+    this.withString(name, (n) =>
+      this.withString(value, (v) =>
+        this.call('ffmpeg_kit_config_set_environment_variable')(n, v)
+      )
+    );
+  }
+  ignoreSignal(signal: number): void {
+    this.call('ffmpeg_kit_config_ignore_signal')(signal);
+  }
+  setAudioOutputDevice(deviceName: string): void {
+    this.withString(deviceName, (p) =>
+      this.call('ffmpeg_kit_config_set_audio_output_device')(p)
+    );
+  }
+  listAudioOutputDevices(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_config_list_audio_output_devices')()
+    );
+  }
+  getFFmpegVersion(): string {
+    return this.readString(this.call('ffmpeg_kit_config_get_ffmpeg_version')());
+  }
+  getFFmpegArchitecture(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_config_get_ffmpeg_architecture')()
+    );
+  }
+  getVersion(): string {
+    return this.readString(this.call('ffmpeg_kit_config_get_version')());
+  }
+  getPackageName(): string {
+    return this.readString(this.call('ffmpeg_kit_packages_get_package_name')());
+  }
+  getExternalLibraries(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_packages_get_external_libraries')()
+    );
+  }
+  getBundleType(): string {
+    return this.readString(this.call('ffmpeg_kit_packages_get_bundle_type')());
+  }
+  isGpl(): boolean {
+    return boolResult(this.call('ffmpeg_kit_packages_get_is_gpl')());
+  }
+  isNonfree(): boolean {
+    return boolResult(this.call('ffmpeg_kit_packages_get_is_nonfree')());
+  }
+  getRegisteredCodecs(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_packages_get_registered_codecs')()
+    );
+  }
+  getRegisteredEncoders(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_packages_get_registered_encoders')()
+    );
+  }
+  getRegisteredDecoders(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_packages_get_registered_decoders')()
+    );
+  }
+  getRegisteredMuxers(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_packages_get_registered_muxers')()
+    );
+  }
+  getRegisteredDemuxers(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_packages_get_registered_demuxers')()
+    );
+  }
+  getRegisteredFilters(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_packages_get_registered_filters')()
+    );
+  }
+  getRegisteredProtocols(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_packages_get_registered_protocols')()
+    );
+  }
+  getRegisteredBitstreamFilters(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_packages_get_registered_bitstream_filters')()
+    );
+  }
+  getBuildConfiguration(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_packages_get_build_configuration')()
+    );
+  }
+  getBuildDate(): string {
+    return this.readString(this.call('ffmpeg_kit_config_get_build_date')());
+  }
+  setSessionHistorySize(size: number): void {
+    this.call('ffmpeg_kit_set_session_history_size')(int64(size));
+    this.history.setCapacity(size);
+  }
+  getSessionHistorySize(): number {
+    return numberResult(this.call('ffmpeg_kit_get_session_history_size')());
+  }
+  clearSessions(): void {
+    for (const [sessionId, pointer] of this.sessions.entries()) {
+      this.call('ffmpeg_kit_handle_release')(pointer);
+      this.sessions.take(sessionId);
+      this.executingSessions.delete(sessionId);
+    }
+    this.call('ffmpeg_kit_clear_sessions')();
+    this.history.clear();
+  }
+  registerNewFFmpegPipe(): string {
+    return this.readString(
+      this.call('ffmpeg_kit_config_register_new_ffmpeg_pipe')()
+    );
+  }
+  closeFFmpegPipe(path: string): void {
+    this.withString(path, (p) =>
+      this.call('ffmpeg_kit_config_close_ffmpeg_pipe')(p)
+    );
+  }
+  messagesInTransmit(sessionId: number): number {
+    return numberResult(
+      this.call('ffmpeg_kit_config_messages_in_transmit')(int64(sessionId))
+    );
+  }
+  enableDebugLog(sessionId: number): void {
+    this.withSession(sessionId, (p) =>
+      this.call('session_enable_debug_log')(p)
+    );
+  }
+  disableDebugLog(sessionId: number): void {
+    this.withSession(sessionId, (p) =>
+      this.call('session_disable_debug_log')(p)
+    );
+  }
+  isDebugLogEnabled(sessionId: number): boolean {
+    return this.withSession(sessionId, (p) =>
+      boolResult(this.call('session_is_debug_log_enabled')(p))
+    );
+  }
+  getDebugLog(sessionId: number): string {
+    return this.withSession(sessionId, (p) =>
+      this.readString(this.call('session_get_debug_log')(p))
+    );
+  }
+  clearDebugLog(sessionId: number): void {
+    this.withSession(sessionId, (p) => this.call('session_clear_debug_log')(p));
+  }
+}
+
+export const webBackend: FFmpegKitBackend = new WebFFmpegKitBackend();

@@ -1,6 +1,6 @@
 {
   "name": "FFmpegKitExtendedExample",
-  "version": "0.6.2+1",
+  "version": "1.0.0+1",
   "private": true,
   "scripts": {
     "android": "react-native run-android",
@@ -10,7 +10,10 @@
     "test": "jest",
     "macos": "react-native run-macos --mode Debug",
     "appletvos": "../launch.sh appletvos",
-    "windows": "bash ../launch.sh windows",
+    "windows": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/launch-windows.ps1",
+    "prepare-web": "node ../scripts/prepare-web.js --app-root .",
+    "web": "npm run prepare-web && vite --config web/vite.config.js",
+    "build:web": "npm run prepare-web && vite build --config web/vite.config.js",
     "build:android": "bash ../build.sh android",
     "build:ios": "bash ../build.sh ios",
     "build:appletvos": "bash ../build.sh appletvos",
@@ -18,12 +21,18 @@
     "build:windows": "bash ../build.sh windows"
   },
   "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/icons-material": "^7.3.11",
+    "@mui/material": "^7.3.11",
     "@react-native-documents/picker": "^12.0.1",
     "ffmpeg-kit-extended": "file:..",
     "react": "19.2.3",
+    "react-dom": "19.2.3",
     "react-native": "0.81.6",
     "react-native-file-access": "^4.0.3",
     "react-native-macos": "0.81.9",
+    "react-native-web": "^0.20.0",
     "react-native-windows": "0.81.32"
   },
   "devDependencies": {
@@ -35,16 +44,19 @@
     "@react-native-community/cli-platform-ios": "^20.1.0",
     "@react-native/babel-preset": "0.81.6",
     "@react-native/eslint-config": "0.81.6",
+    "@react-native/jest-preset": "^0.85.3",
     "@react-native/metro-config": "0.81.6",
     "@react-native/typescript-config": "0.81.6",
     "@types/jest": "^29.5.13",
     "@types/react": "^19.2.0",
     "@types/react-test-renderer": "^19.1.0",
+    "@vitejs/plugin-react": "^5.0.4",
     "eslint": "^8.19.0",
     "jest": "^29.6.3",
     "prettier": "2.8.8",
     "react-test-renderer": "19.2.3",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vite": "^7.1.7"
   },
   "engines": {
     "node": ">= 22.11.0"

@@ -1,5 +1,31 @@
 # FFmpegKit Extended Flutter Plugin CHANGELOG
 
+## Version 1.0.0
+
+### Added
+- **Flutter Web / WebAssembly support:** Added a browser backend for executing FFmpeg, FFprobe, and FFplay commands using the Emscripten/Wasm runtime, with session management, callbacks, logging, and playback controls.
+- **Web filesystem API:** Added `FFmpegKitWebFiles` with `writeFile()`, `readFile()`, `deleteFile()`, and `exists()` for managing temporary binary files in the browser's WebAssembly filesystem.
+- **Web video playback:** Added canvas-based FFplay video rendering, including decoded RGBA frame delivery, playback lifecycle handling, and frame resource management.
+- **Web media streaming:** Added asynchronous Web execution support for direct HTTP(S) and HLS inputs when using compatible WebAssembly runtime bundles.
+- **Platform-specific bundle configuration:** Expanded build-hook support for selecting native and WebAssembly bundles, including platform-specific local or remote artifact overrides.
+
+### Improved
+- **Session lifecycle management:** Improved execution, cancellation, completion, disposal, and native handle ownership across FFmpeg, FFprobe, and FFplay sessions.
+- **Session queue management:** Improved cancellation of queued, starting, and running sessions, including cancellation propagation and error handling.
+- **Callback reliability:** Improved session completion, log, and statistics callback registration, delivery ordering, cleanup, and resource ownership.
+- **Session history:** Improved retained-session lookup, reconciliation, history cleanup, and native handle management.
+- **FFplay playback lifecycle:** Improved asynchronous startup, playback controls, session tracking, cancellation, and completion handling.
+- **Cross-platform FFplay rendering:** Improved native video frame delivery and texture lifecycle management across Android, iOS, macOS, Linux, and Windows.
+- **FFplayView:** Improved fullscreen transitions, cleanup, aspect-ratio handling, and video sizing.
+- **Native artifact handling:** Improved bundle extraction, caching, architecture validation, and Apple framework preparation.
+- **Documentation and examples:** Expanded API references, platform installation instructions, WebAssembly integration guidance, and FFmpeg/FFprobe/FFplay usage examples.
+
+### Breaking Changes
+- **Minimum SDK requirements:** Requires Dart `>=3.12.0` and Flutter `>=3.47.0`.
+- **Synchronous FFplay execution:** `FFplaySession.execute()` is no longer supported and throws `UnsupportedError`. Use `FFplaySession.executeAsync()` or `FFplayKit.executeAsync()` instead.
+- **Web execution constraints:** Synchronous FFmpeg and FFprobe operations cannot open network inputs on Web. Use asynchronous execution for remote media.
+- **Web runtime requirements:** WebAssembly execution requires compatible runtime assets and browser cross-origin isolation with `SharedArrayBuffer` support.
+
 ## Version 0.6.2
 
 - Preserve FFmpeg, FFprobe, and FFplay session arguments as argv all the way into their embedded CLI runtimes to fix argument parsing bug exposed by quotes in commands.

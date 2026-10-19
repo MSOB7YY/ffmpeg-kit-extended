@@ -19,32 +19,34 @@
 
 import 'dart:async';
 import 'dart:developer';
-import 'dart:ffi';
 
-import 'package:ffi/ffi.dart';
+import 'package:meta/meta.dart';
 
 import '../ffmpeg_kit_extended_flutter.dart';
 import 'callback_manager.dart';
-import 'generated/ffmpeg_kit_bindings.dart' as ffmpeg;
+import 'platform/backend.dart';
+import 'platform/backend_selector.dart';
 
 /// A session for executing FFmpeg commands.
 ///
 /// ### Lifecycle
 /// 1. Construct via [FFmpegSession.new] (or [create]) to allocate the native
-///    session object and register it with [CallbackManager].
-/// 2. Call [executeAsync] (or the static [executeCommandAsync]) to schedule
-///    execution and await the result.
-///    Use [execute] / [executeCommand] only when you deliberately want
-///    fire-and-forget behaviour and observe completion through [completeCallback].
+///    session object. Callback values and log listeners on a Created session
+///    are retained without a [CallbackManager] root; routing is registered
+///    when execution is submitted or a restored session is verified running.
+/// 2. Call [execute] / [executeCommand] for a blocking result, or
+///    [executeAsync] / [executeCommandAsync] to submit work to the managed
+///    asynchronous queue.
 /// 3. The session is automatically unregistered from [CallbackManager] after
-///    the completion callback fires.
+///    execution settles.
 ///
 /// ### execute() vs executeAsync()
-/// [execute] enqueues the native call and returns `this` immediately —
-/// *before* the session has necessarily started or finished.  It is therefore
-/// **not** a true synchronous call from the caller's perspective.
-/// Use [executeAsync] when you need a [Future] that resolves only after
-/// execution finishes.
+/// [execute] blocks until native execution and Dart-side cleanup complete, so
+/// its returned session has terminal state, output, and logs available without
+/// calling `SessionQueueManager().waitForAll()`. Do not use it for long work on
+/// the Flutter UI isolate. Use [executeAsync] for a [Future]-based,
+/// queue-managed operation; the queue concurrency limit applies to that async
+/// path.
 class FFmpegSession extends Session {
   FFmpegSessionCompleteCallback? _completeCallback;
   FFmpegLogCallback? _logCallback;
@@ -60,30 +62,60 @@ class FFmpegSession extends Session {
   // Constructors
   // ---------------------------------------------------------------------------
 
+  /// Creates an in-memory session for package tests.
+  ///
+  /// This constructor does not call the platform backend. It is intentionally
+  /// kept in the package's internal source tree so callback-manager tests can
+  /// exercise the real session type without requiring a native library.
+  FFmpegSession.test({
+    int sessionId = 1,
+    String command = 'test',
+    FFmpegSessionCompleteCallback? completeCallback,
+    FFmpegLogCallback? logCallback,
+    FFmpegStatisticsCallback? statisticsCallback,
+    bool register = true,
+  }) : super.noFinalizer() {
+    handle = const SessionHandle(Object());
+    this.sessionId = sessionId;
+    this.command = command;
+    _completeCallback = completeCallback;
+    _logCallback = logCallback;
+    _statisticsCallback = statisticsCallback;
+    if (register) {
+      CallbackManager().registerFFmpegSession(this);
+      _registered = true;
+    }
+  }
+
   /// Restores an [FFmpegSession] from an existing native [handle].
   ///
   /// Used internally when wrapping handles returned by session-history APIs.
   /// No callbacks are registered; call [setCompleteCallback] /
   /// [setLogCallback] / [setStatisticsCallback] if callbacks are needed.
-  FFmpegSession.fromHandle(Pointer<Void> handle, String command) {
-    this.handle = handle;
-    this.command = command;
-    sessionId = FFmpegKitExtended.getSessionId(handle);
-    _expectedTranscodingDurationMs = _deriveExpectedTranscodingDurationMs(
-      FFmpegKitExtended.parseArguments(command),
+  FFmpegSession.fromHandle(SessionHandle handle, String command) {
+    int? expectedDurationMs;
+    adoptOwnedHandle(
+      handle,
+      readSessionId: ffmpegKitBackend.getSessionId,
+      restoredSession: true,
+      onBeforeCommit: () {
+        expectedDurationMs = _deriveExpectedTranscodingDurationMs(
+          FFmpegKitExtended.parseArguments(command),
+        );
+      },
     );
-    registerFinalizer();
+    this.command = command;
+    _expectedTranscodingDurationMs = expectedDurationMs;
     // No registration: restored sessions are not expected to fire native
     // callbacks unless the caller explicitly sets callbacks and re-executes.
   }
 
   /// Creates a new [FFmpegSession] for [command].
   ///
-  /// The session is immediately registered with [CallbackManager] so that
-  /// global native callbacks (completion, log, statistics) can locate it by
-  /// session ID even before [executeAsync] is called.  Registration is
-  /// removed when the completion callback fires or when all per-session
-  /// callbacks are cleared via the remove* methods.
+  /// Callback values are retained on a Created session without a
+  /// [CallbackManager] root. Registration begins on execution submission, or
+  /// when a restored session is verified running, and is removed when
+  /// execution completes or all per-session callbacks and listeners clear.
   ///
   /// - [completeCallback]: Invoked once when execution finishes.
   /// - [logCallback]: Invoked for each buffered log line during execution.
@@ -95,12 +127,16 @@ class FFmpegSession extends Session {
     FFmpegStatisticsCallback? statisticsCallback,
   }) {
     FFmpegKitExtended.requireInitialized();
-    final cmdPtr = command.toNativeUtf8(allocator: calloc);
+    final expectedDurationMs = _deriveExpectedTranscodingDurationMs(
+      FFmpegKitExtended.parseArguments(command),
+    );
     try {
-      handle = ffmpeg.ffmpeg_kit_create_session(cmdPtr.cast());
+      final ownedHandle = ffmpegKitBackend.createFFmpegSession(command);
       this.command = command;
-      sessionId = FFmpegKitExtended.getSessionId(handle);
-      registerFinalizer();
+      adoptOwnedHandle(
+        ownedHandle,
+        readSessionId: ffmpegKitBackend.getSessionId,
+      );
     } catch (e, stack) {
       log(
         "FFmpegSession: Failed to call native function ffmpeg_kit_create_session",
@@ -108,18 +144,18 @@ class FFmpegSession extends Session {
         stackTrace: stack,
       );
       rethrow;
-    } finally {
-      calloc.free(cmdPtr);
     }
 
-    _expectedTranscodingDurationMs = _deriveExpectedTranscodingDurationMs(
-      FFmpegKitExtended.parseArguments(command),
-    );
+    _expectedTranscodingDurationMs = expectedDurationMs;
     _completeCallback = completeCallback;
     _logCallback = logCallback;
     _statisticsCallback = statisticsCallback;
-    CallbackManager().registerFFmpegSession(this);
-    _registered = true;
+    FFmpegKitExtended.registerCreatedSession(this);
+    if (completeCallback != null ||
+        logCallback != null ||
+        statisticsCallback != null) {
+      _ensureRegisteredForSinkDemand();
+    }
   }
 
   /// Creates a new [FFmpegSession] from an explicit argument list.
@@ -134,40 +170,25 @@ class FFmpegSession extends Session {
     FFmpegStatisticsCallback? statisticsCallback,
   }) {
     FFmpegKitExtended.requireInitialized();
-    final argv = calloc<Pointer<Char>>(arguments.length);
-    final nativeStrings = <Pointer<Utf8>>[];
-    try {
-      for (var i = 0; i < arguments.length; i++) {
-        final nativeString = arguments[i].toNativeUtf8(allocator: calloc);
-        nativeStrings.add(nativeString);
-        argv[i] = nativeString.cast<Char>();
-      }
+    final displayCommand = FFmpegKitExtended.argumentsToString(arguments);
+    final expectedDurationMs = _deriveExpectedTranscodingDurationMs(arguments);
+    final ownedHandle = ffmpegKitBackend.createFFmpegSessionFromArguments(
+      arguments,
+    );
 
-      handle = ffmpeg.ffmpeg_kit_create_session_from_argv(
-        arguments.length,
-        argv,
-      );
-      if (handle == nullptr) {
-        throw StateError('Failed to create FFmpeg session from arguments.');
-      }
-
-      command = FFmpegKitExtended.argumentsToString(arguments);
-      sessionId = FFmpegKitExtended.getSessionId(handle);
-      _expectedTranscodingDurationMs =
-          _deriveExpectedTranscodingDurationMs(arguments);
-      registerFinalizer();
-    } finally {
-      for (final nativeString in nativeStrings) {
-        calloc.free(nativeString);
-      }
-      calloc.free(argv);
-    }
+    command = displayCommand;
+    adoptOwnedHandle(ownedHandle, readSessionId: ffmpegKitBackend.getSessionId);
+    _expectedTranscodingDurationMs = expectedDurationMs;
 
     _completeCallback = completeCallback;
     _logCallback = logCallback;
     _statisticsCallback = statisticsCallback;
-    CallbackManager().registerFFmpegSession(this);
-    _registered = true;
+    FFmpegKitExtended.registerCreatedSession(this);
+    if (completeCallback != null ||
+        logCallback != null ||
+        statisticsCallback != null) {
+      _ensureRegisteredForSinkDemand();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -222,11 +243,16 @@ class FFmpegSession extends Session {
   /// drain. This is the preferred API for high-volume sessions because it keeps
   /// Dart-side dispatch and UI work off the per-line hot path.
   Stream<List<Log>> get logBatchStream {
-    final controller =
-        _logBatchStreamController ??= StreamController<List<Log>>.broadcast(
+    final controller = _logBatchStreamController ??=
+        StreamController<List<Log>>.broadcast(
           onListen: () {
-            _ensureRegistered();
+            _ensureRegisteredForSinkDemand();
+            _syncLogBridgeLease();
             dispatchPendingLogs();
+          },
+          onCancel: () {
+            _syncLogBridgeLease();
+            _unregisterIfIdle();
           },
         );
     return controller.stream;
@@ -266,8 +292,25 @@ class FFmpegSession extends Session {
   /// If the session is already registered the callback reference is updated
   /// in-place (no new registration entry is created).
   void setCompleteCallback(FFmpegSessionCompleteCallback? completeCallback) {
+    final previous = _completeCallback;
+    final hadBridgeLease = hasBridgeLease(CallbackBridgeKind.ffmpegCompletion);
     _completeCallback = completeCallback;
-    _ensureRegistered();
+    if (completeCallback == null) {
+      _syncCompletionBridgeLease();
+      _unregisterIfIdle();
+    } else {
+      try {
+        _ensureRegisteredForSinkDemand();
+        _syncCompletionBridgeLease();
+      } catch (_) {
+        _completeCallback = previous;
+        if (!hadBridgeLease) {
+          releaseBridgeLease(CallbackBridgeKind.ffmpegCompletion);
+        }
+        _unregisterIfIdle();
+        rethrow;
+      }
+    }
   }
 
   /// Clears the completion callback.
@@ -276,30 +319,67 @@ class FFmpegSession extends Session {
   /// [CallbackManager] to prevent memory leaks.
   void removeCompleteCallback() {
     _completeCallback = null;
+    _syncCompletionBridgeLease();
     _unregisterIfIdle();
   }
 
   /// Sets or replaces the log callback.
   void setLogCallback(FFmpegLogCallback? logCallback) {
+    final previous = _logCallback;
+    final hadBridgeLease = hasBridgeLease(CallbackBridgeKind.log);
     _logCallback = logCallback;
-    _ensureRegistered();
+    if (logCallback == null) {
+      _syncLogBridgeLease();
+      _unregisterIfIdle();
+    } else {
+      try {
+        _ensureRegisteredForSinkDemand();
+        _syncLogBridgeLease();
+      } catch (_) {
+        _logCallback = previous;
+        if (!hadBridgeLease) {
+          releaseBridgeLease(CallbackBridgeKind.log);
+        }
+        _unregisterIfIdle();
+        rethrow;
+      }
+    }
   }
 
   /// Clears the log callback.
   void removeLogCallback() {
     _logCallback = null;
+    _syncLogBridgeLease();
     _unregisterIfIdle();
   }
 
   /// Sets or replaces the statistics callback.
   void setStatisticsCallback(FFmpegStatisticsCallback? statisticsCallback) {
+    final previous = _statisticsCallback;
+    final hadBridgeLease = hasBridgeLease(CallbackBridgeKind.statistics);
     _statisticsCallback = statisticsCallback;
-    _ensureRegistered();
+    if (statisticsCallback == null) {
+      _syncStatisticsBridgeLease();
+      _unregisterIfIdle();
+    } else {
+      try {
+        _ensureRegisteredForSinkDemand();
+        _syncStatisticsBridgeLease();
+      } catch (_) {
+        _statisticsCallback = previous;
+        if (!hadBridgeLease) {
+          releaseBridgeLease(CallbackBridgeKind.statistics);
+        }
+        _unregisterIfIdle();
+        rethrow;
+      }
+    }
   }
 
   /// Clears the statistics callback.
   void removeStatisticsCallback() {
     _statisticsCallback = null;
+    _syncStatisticsBridgeLease();
     _unregisterIfIdle();
   }
 
@@ -307,62 +387,74 @@ class FFmpegSession extends Session {
   // Execution
   // ---------------------------------------------------------------------------
 
-  /// Enqueues this session for synchronous (blocking) native execution via
-  /// [SessionQueueManager] and returns `this` immediately.
+  /// Executes this session synchronously and returns only after native work
+  /// and Dart-side completion cleanup have finished.
   ///
-  /// This method returns as soon as the session is *enqueued*, not when it
-  /// has *finished*.  Depending on queue depth the native call may not have
-  /// started yet when this returns.  [getState()] immediately after [execute]
-  /// may still return [SessionState.created].
-  ///
-  /// If you need to await the result, use [executeAsync] instead.
+  /// Unlike [executeAsync], this path is deliberately not queue-managed. The
+  /// queue limit applies only to asynchronous execution. Backend failures are
+  /// rethrown with their original stack trace after cleanup.
   FFmpegSession execute() {
-    SessionQueueManager()
-        .executeSession(this, () async {
-          FFmpegKitExtended.requireInitialized();
-          _enableNativeLogCallback();
-          // Blocking native call — returns only after FFmpeg finishes.
-          try {
-            ffmpeg.ffmpeg_kit_session_execute(handle);
-          } catch (e, st) {
-            log(
-              'FFmpegSession.execute: error in native function ffmpeg_kit_session_execute for session $sessionId',
-              error: e,
-              stackTrace: st,
-            );
-            rethrow;
-          }
-          // Flush any remaining log entries before invoking the callback.
-          dispatchPendingLogs();
-          // Invoke the completion callback so callers using fire-and-forget
-          // still receive the notification.
-          try {
-            _completeCallback?.call(this);
-          } catch (e, st) {
-            log(
-              'FFmpegSession.execute: error in completeCallback for session $sessionId',
-              error: e,
-              stackTrace: st,
-            );
-            rethrow;
-          } finally {
-            _closeLogStreams();
-            _unregister();
-          }
-        })
-        .catchError((Object e, StackTrace st) {
-          log(
-            'FFmpegSession.execute: queue error for session $sessionId',
-            error: e,
-            stackTrace: st,
-          );
-        });
+    claimExecutionSubmission();
+    requireInitializedForExecution();
+    _ensureRegistered();
+
+    Object? primaryError;
+    StackTrace? primaryStackTrace;
+    void recordCleanupFailure(Object error, StackTrace stackTrace) {
+      if (primaryError == null) {
+        primaryError = error;
+        primaryStackTrace = stackTrace;
+      } else {
+        log(
+          'FFmpegSession.execute: cleanup failed after primary error for session $sessionId',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+    }
+
+    try {
+      _acquireOptionalBridgeLeases();
+      configureSynchronousNativeCallbacks();
+      // Mark the handoff immediately before the blocking native call.
+      markExecutionStarted();
+      executeSynchronously();
+      if (_hasLogDemand) dispatchPendingLogs();
+      commitTerminalHistory();
+      CallbackManager().dispatchFFmpegComplete(sessionId);
+    } catch (error, stackTrace) {
+      primaryError = error;
+      primaryStackTrace = stackTrace;
+      log(
+        'FFmpegSession.execute: synchronous execution failed for session $sessionId',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    } finally {
+      try {
+        _closeLogStreams();
+      } catch (error, stackTrace) {
+        recordCleanupFailure(error, stackTrace);
+      }
+      try {
+        _unregister();
+      } catch (error, stackTrace) {
+        recordCleanupFailure(error, stackTrace);
+      } finally {
+        releaseAllBridgeLeases();
+        markExecutionSettled();
+      }
+    }
+
+    if (primaryError != null) {
+      Error.throwWithStackTrace(primaryError!, primaryStackTrace!);
+    }
     return this;
   }
 
-  /// Creates and enqueues a session for synchronous execution.
+  /// Creates and executes a session synchronously.
   ///
-  /// See [execute] for the return-before-completion caveat.
+  /// Returns after the blocking execution has completed.
   static FFmpegSession executeCommand(
     String command, {
     FFmpegSessionCompleteCallback? completeCallback,
@@ -401,12 +493,10 @@ class FFmpegSession extends Session {
     FFmpegLogCallback? logCallback,
     FFmpegStatisticsCallback? statisticsCallback,
   }) async {
+    claimExecutionSubmission();
     if (completeCallback != null) _completeCallback = completeCallback;
     if (logCallback != null) _logCallback = logCallback;
     if (statisticsCallback != null) _statisticsCallback = statisticsCallback;
-
-    // Ensure registration is current after any callback mutations above.
-    _ensureRegistered();
 
     await SessionQueueManager().executeSession(this, _runAsync);
 
@@ -440,7 +530,11 @@ class FFmpegSession extends Session {
   /// Core async execution body, called by [executeAsync] through the queue.
   Future<void> _runAsync() async {
     FFmpegKitExtended.requireInitialized();
+    validateExecutionHandoff();
+    // Register only after native-ID admission and the immediate state check.
+    _ensureRegistered();
     final sessionCompleter = Completer<void>();
+    trackExecution(sessionCompleter);
 
     // Capture the user-supplied callback before we install the internal
     // wrapper so we can restore it after execution.
@@ -457,75 +551,89 @@ class FFmpegSession extends Session {
     //
     // This wrapper is visible to the native _onFFmpegComplete handler via
     // CallbackManager (the session is keyed by sessionId).
-    _completeCallback = (FFmpegSession s) {
-      dispatchPendingLogs();
-
-      // Restore and unregister before calling user code or completing the
-      // future, so the session is fully settled from any observer's perspective.
+    var completionHandled = false;
+    void handleExecutionError(Object error, StackTrace stackTrace) {
+      if (completionHandled) return;
+      completionHandled = true;
+      clearExecutionErrorHandler();
       _completeCallback = userCompleteCallback;
-      _closeLogStreams();
-      _unregister();
+      completeExecutionWithError(
+        completer: sessionCompleter,
+        error: error,
+        stackTrace: stackTrace,
+        cleanup: () {
+          try {
+            _closeLogStreams();
+          } finally {
+            try {
+              _unregister();
+            } finally {
+              releaseAllBridgeLeases();
+            }
+          }
+        },
+      );
+    }
+
+    registerExecutionErrorHandler(handleExecutionError);
+    _completeCallback = (FFmpegSession s) {
+      if (completionHandled) return;
+      completionHandled = true;
+      clearExecutionErrorHandler();
 
       try {
-        userCompleteCallback?.call(s);
+        if (_hasLogDemand) dispatchPendingLogs();
       } catch (e, st) {
         log(
-          'FFmpegSession: error in completeCallback for session $sessionId',
+          'FFmpegSession: error flushing logs for session $sessionId',
           error: e,
           stackTrace: st,
         );
-        rethrow;
-      }
-
-      // Complete last — everything is torn down, so any awaiter (test or
-      // production) gets a fully settled session.
-      if (!sessionCompleter.isCompleted) {
-        sessionCompleter.complete();
+      } finally {
+        // Restore and unregister before calling user code or completing the
+        // future, so the session is fully settled from any observer's
+        // perspective.
+        _completeCallback = userCompleteCallback;
+        try {
+          _closeLogStreams();
+        } finally {
+          try {
+            _unregister();
+          } finally {
+            releaseAllBridgeLeases();
+            commitTerminalHistory();
+            CallbackManager().invokeSafely(
+              'FFmpeg completion callback',
+              sessionId,
+              () => userCompleteCallback?.call(s),
+            );
+            // Complete last — callback failures are reported separately and
+            // never prevent the execution future from settling.
+            if (!sessionCompleter.isCompleted) sessionCompleter.complete();
+          }
+        }
       }
     };
 
-    _enableNativeLogCallback();
-
-    // Enable the global native completion and statistics callbacks so the C
-    // layer can post events back to Dart.  These calls are idempotent.
     try {
-      ffmpeg.ffmpeg_kit_config_enable_ffmpeg_session_complete_callback(
-        nativeFFmpegComplete.nativeFunction,
-        nullptr,
-      );
+      _acquireExecutionBridgeLeases();
+      // Enable the global native completion and statistics callbacks so the C
+      // layer can post events back to Dart. These calls are idempotent.
+      ffmpegKitBackend.executeFFmpegSessionAsync(handle);
     } catch (e, st) {
       log(
-        'FFmpegSession: error enabling ffmpeg session complete callback for session $sessionId',
+        'FFmpegSession: error starting async execution for session $sessionId',
         error: e,
         stackTrace: st,
       );
-      rethrow;
-    }
-    try {
-      ffmpeg.ffmpeg_kit_config_enable_statistics_callback(
-        nativeFFmpegStatistics.nativeFunction,
-        nullptr,
-      );
-    } catch (e, st) {
-      log(
-        'FFmpegSession: error enabling ffmpeg statistics callback for session $sessionId',
-        error: e,
-        stackTrace: st,
-      );
-      rethrow;
-    }
-
-    // Start async native execution.
-    try {
-      ffmpeg.ffmpeg_kit_session_execute_async(handle);
-    } catch (e, st) {
-      log(
-        'FFmpegSession: error starting async session $sessionId',
-        error: e,
-        stackTrace: st,
-      );
+      clearExecutionErrorHandler();
+      _completeCallback = userCompleteCallback;
       _closeLogStreams();
-      _unregister();
+      try {
+        _unregister();
+      } finally {
+        releaseAllBridgeLeases();
+      }
       if (!sessionCompleter.isCompleted) sessionCompleter.complete();
       rethrow;
     }
@@ -552,25 +660,40 @@ class FFmpegSession extends Session {
     }
 
     for (final logObj in batch) {
-      try {
-        CallbackManager().globalLogCallback?.call(logObj);
-        _logCallback?.call(logObj);
-      } catch (e, st) {
-        log(
-          'FFmpegSession: error dispatching log for session '
-          '$sessionId: $e\n$st',
-        );
-        rethrow;
-      }
+      CallbackManager().invokeSafely(
+        'FFmpeg global log callback',
+        sessionId,
+        () => CallbackManager().globalLogCallback?.call(logObj),
+      );
+      CallbackManager().invokeSafely(
+        'FFmpeg session log callback',
+        sessionId,
+        () => _logCallback?.call(logObj),
+      );
     }
   }
 
-  void _enableNativeLogCallback() {
+  /// Configures native completion and statistics callbacks for sync execution.
+  @protected
+  void configureSynchronousNativeCallbacks() {
+    if (_hasStatisticsDemand) {
+      // The statistics bridge is acquired before the native call. This method
+      // remains as the synchronous configuration seam used by subclasses and
+      // tests, but it no longer installs an unnecessary completion bridge.
+      assert(CallbackManager().isBridgeActive(CallbackBridgeKind.statistics));
+    }
+  }
+
+  /// Invokes the blocking FFmpeg backend operation.
+  @protected
+  void executeSynchronously() {
+    ffmpegKitBackend.executeFFmpegSession(handle);
+  }
+
+  @protected
+  void enableNativeLogCallback() {
     try {
-      ffmpeg.ffmpeg_kit_config_enable_log_callback(
-        nativeFFmpegLog.nativeFunction,
-        nullptr,
-      );
+      ffmpegKitBackend.enableFFmpegLogCallback();
     } catch (e, st) {
       log(
         'FFmpegSession: error enabling ffmpeg log callback for session $sessionId',
@@ -581,11 +704,114 @@ class FFmpegSession extends Session {
     }
   }
 
+  bool get _hasLocalLogDemand =>
+      _logCallback != null || (_logBatchStreamController?.hasListener ?? false);
+
+  bool get _hasLogDemand =>
+      _hasLocalLogDemand || CallbackManager().globalLogCallback != null;
+
+  bool get _hasStatisticsDemand =>
+      _statisticsCallback != null ||
+      CallbackManager().globalStatisticsCallback != null;
+
+  void _acquireOptionalBridgeLeases() {
+    if (_hasLocalLogDemand) {
+      acquireBridgeLease(
+        CallbackBridgeKind.log,
+        install: ffmpegKitBackend.configureLogCallback,
+        uninstall: ffmpegKitBackend.disableLogCallback,
+      );
+    }
+    if (_statisticsCallback != null) {
+      acquireBridgeLease(
+        CallbackBridgeKind.statistics,
+        install: ffmpegKitBackend.configureStatisticsCallback,
+        uninstall: ffmpegKitBackend.disableStatisticsCallback,
+      );
+    }
+  }
+
+  void _acquireExecutionBridgeLeases() {
+    _acquireOptionalBridgeLeases();
+    acquireBridgeLease(
+      CallbackBridgeKind.ffmpegCompletion,
+      install: ffmpegKitBackend.configureFFmpegSessionCompleteCallback,
+      uninstall: ffmpegKitBackend.disableFFmpegSessionCompleteCallback,
+    );
+  }
+
+  void _syncCompletionBridgeLease() {
+    final needsLease =
+        _completeCallback != null &&
+        ((hasExecutionStarted && !hasExecutionSettled) ||
+            isRestoredObserverRunning);
+    if (needsLease) {
+      acquireBridgeLease(
+        CallbackBridgeKind.ffmpegCompletion,
+        install: ffmpegKitBackend.configureFFmpegSessionCompleteCallback,
+        uninstall: ffmpegKitBackend.disableFFmpegSessionCompleteCallback,
+      );
+    } else if (_completeCallback == null ||
+        (isRestoredSession && hasTerminalCompletionBeenObserved)) {
+      releaseBridgeLease(CallbackBridgeKind.ffmpegCompletion);
+    }
+  }
+
+  void _syncLogBridgeLease() {
+    final needsLease =
+        _hasLocalLogDemand &&
+        ((hasExecutionStarted && !hasExecutionSettled) ||
+            isRestoredObserverRunning);
+    if (needsLease) {
+      _acquireOptionalBridgeLeases();
+    } else if (!_hasLocalLogDemand ||
+        (isRestoredSession && hasTerminalCompletionBeenObserved)) {
+      releaseBridgeLease(CallbackBridgeKind.log);
+    }
+  }
+
+  void _syncStatisticsBridgeLease() {
+    final needsLease =
+        _statisticsCallback != null &&
+        ((hasExecutionStarted && !hasExecutionSettled) ||
+            isRestoredObserverRunning);
+    if (needsLease) {
+      _acquireOptionalBridgeLeases();
+    } else if (_statisticsCallback == null ||
+        (isRestoredSession && hasTerminalCompletionBeenObserved)) {
+      releaseBridgeLease(CallbackBridgeKind.statistics);
+    }
+  }
+
   void _closeLogStreams() {
     final controller = _logBatchStreamController;
     if (controller != null && !controller.isClosed) {
       controller.close();
     }
+  }
+
+  @override
+  void onDispose() {
+    _completeCallback = null;
+    _logCallback = null;
+    _statisticsCallback = null;
+    _closeLogStreams();
+    _unregister();
+  }
+
+  @override
+  @protected
+  void onRestoredCompletionSettled() {
+    removeCompleteCallback();
+    releaseBridgeLease(CallbackBridgeKind.ffmpegCompletion);
+    releaseBridgeLease(CallbackBridgeKind.log);
+    releaseBridgeLease(CallbackBridgeKind.statistics);
+  }
+
+  @override
+  void onCancelledBeforeStart() {
+    _closeLogStreams();
+    _unregister();
   }
 
   /// Ensures the session is registered with [CallbackManager].
@@ -594,9 +820,15 @@ class FFmpegSession extends Session {
   /// fully unregistered (e.g. after all callbacks were removed and a new
   /// callback is set).
   void _ensureRegistered() {
+    if (isDisposed) return;
     if (_registered) return;
     CallbackManager().registerFFmpegSession(this);
     _registered = true;
+  }
+
+  void _ensureRegisteredForSinkDemand() {
+    if (isDisposed || _registered) return;
+    ensureRoutingForSinkDemand(_ensureRegistered);
   }
 
   /// Unregisters this session from [CallbackManager].
@@ -615,7 +847,8 @@ class FFmpegSession extends Session {
     if (_completeCallback == null &&
         _logCallback == null &&
         _statisticsCallback == null &&
-        !(_logBatchStreamController?.hasListener ?? false)) {
+        !(_logBatchStreamController?.hasListener ?? false) &&
+        !hasPendingExecutionRouting) {
       _unregister();
     }
   }
@@ -664,8 +897,9 @@ class FFmpegSession extends Session {
       return null;
     }
 
-    final sexagesimal =
-        RegExp(r'^(-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$').firstMatch(trimmed);
+    final sexagesimal = RegExp(
+      r'^(-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$',
+    ).firstMatch(trimmed);
     if (sexagesimal != null) {
       final sign = sexagesimal.group(1) == '-' ? -1 : 1;
       final hours = int.tryParse(sexagesimal.group(2) ?? '0') ?? 0;
@@ -679,8 +913,9 @@ class FFmpegSession extends Session {
       return sign * totalMs;
     }
 
-    final unitMatch =
-        RegExp(r'^(-?\d+(?:\.\d+)?)(us|ms|s|m|h)?$').firstMatch(trimmed);
+    final unitMatch = RegExp(
+      r'^(-?\d+(?:\.\d+)?)(us|ms|s|m|h)?$',
+    ).firstMatch(trimmed);
     if (unitMatch == null) {
       return null;
     }

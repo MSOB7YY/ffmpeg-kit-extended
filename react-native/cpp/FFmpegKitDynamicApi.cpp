@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <condition_variable>
 #include <iomanip>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -21,7 +23,17 @@ namespace ffmpegkit::bridge {
 namespace {
 
 using Handle = void *;
-using HandleArray = void **;
+
+using HandleReleaseFn = void (*)(Handle);
+using FreeMemoryFn = void (*)(void *);
+
+struct RuntimeLifetimeApi {
+  HandleReleaseFn releaseHandle = nullptr;
+  FreeMemoryFn freeMemory = nullptr;
+};
+
+RuntimeLifetimeApi runtimeLifetimeApi;
+DynamicSymbolResolverForTesting dynamicSymbolResolverForTesting = nullptr;
 
 std::once_flag initFlag;
 #if defined(_WIN32)
@@ -32,10 +44,55 @@ void *libraryHandle = nullptr;
 
 // C API session handles are owning handles. Releasing a handle for a running
 // session requests cancellation, so React Native must retain the handle created
-// for each session until execution has actually completed.
+// for each session until execution has actually completed. A retained entry is
+// the per-session lifetime authority, while a registry operation lease covers
+// every native call and history projection that must not overlap clear.
+//
+// The semantic state machine is:
+//   Retained  -> Releasing -> Released (removed from retainedSessionHandles).
+// A Retained entry admits leases and counts each active native borrow. Release
+// first changes the entry to Releasing, then waits for those leases to drain;
+// new leases are rejected while that state is visible. Clear is a registry-wide
+// barrier: it stops new acquisition/release transactions, waits for all leases
+// and release transactions, calls the native clear entrypoint, and only then
+// discards the retained map and history projection. No registry mutex is held
+// while a lease-protected operation is running in native code. The clear flag
+// blocks new top-level admission only; already-admitted work drains naturally.
+// Nested helpers reuse the same shared operation token and never re-enter the
+// clear gate, so clear waits for the final token holder instead of suspending
+// an admitted transaction.
 std::mutex sessionHandlesMutex;
-std::unordered_map<std::int64_t, Handle> retainedSessionHandles;
-std::vector<std::int64_t> knownSessionIds;
+std::condition_variable sessionHandlesCondition;
+
+struct RetainedSessionEntry {
+  std::int64_t id;
+  Handle handle;
+  bool releasing = false;
+  std::size_t activeBorrows = 0;
+};
+
+std::unordered_map<std::int64_t, std::shared_ptr<RetainedSessionEntry>>
+    retainedSessionHandles;
+std::size_t activeSessionOperations = 0;
+std::size_t activeRetainedBorrows = 0;
+std::size_t activeRetainedReleases = 0;
+bool clearSessionsInProgress = false;
+
+struct HistoryRecord {
+  std::int64_t sessionId;
+  std::string type;
+  std::uint64_t creationOrder;
+  bool visible = true;
+  bool terminal = false;
+};
+
+constexpr std::int32_t kCreatedSessionState = 0;
+constexpr std::int32_t kCompletedSessionState = 2;
+constexpr std::int32_t kFailedSessionState = 3;
+
+std::mutex historyMutex;
+std::unordered_map<std::int64_t, HistoryRecord> historyRecords;
+std::uint64_t nextHistoryOrder = 0;
 
 void ensureLibraryLoaded() {
   if (libraryHandle != nullptr) {
@@ -89,6 +146,13 @@ using RawSymbol = void *;
 #endif
 
 RawSymbol resolveRaw(const char *name) {
+  if (dynamicSymbolResolverForTesting != nullptr) {
+    const auto symbol = dynamicSymbolResolverForTesting(name);
+    if (symbol == nullptr) {
+      throw std::runtime_error(std::string("test dynamic symbol not found: ") + name);
+    }
+    return reinterpret_cast<RawSymbol>(symbol);
+  }
   ensureLibraryLoaded();
 #if defined(_WIN32)
   if (libraryHandle == nullptr) {
@@ -128,21 +192,31 @@ template <typename Fn> Fn resolve(const char *name) {
 
 void ensureInitialized() {
   std::call_once(initFlag, [] {
-    using Fn = void (*)();
-    resolve<Fn>("ffmpeg_kit_initialize")();
+    using InitializeFn = void (*)();
+    // Resolve and validate every mandatory ownership function before the
+    // native runtime can create a handle. Publish the cache only after the
+    // initialization transaction succeeds so call_once remains retryable.
+    const RuntimeLifetimeApi lifetimeApi{
+        resolve<HandleReleaseFn>("ffmpeg_kit_handle_release"),
+        resolve<FreeMemoryFn>("ffmpeg_kit_free"),
+    };
+    resolve<InitializeFn>("ffmpeg_kit_initialize")();
+    runtimeLifetimeApi = lifetimeApi;
   });
 }
 
-void release(Handle handle) {
+void release(Handle handle) noexcept {
   if (handle == nullptr) return;
-  using Fn = void (*)(Handle);
-  resolve<Fn>("ffmpeg_kit_handle_release")(handle);
+  if (runtimeLifetimeApi.releaseHandle != nullptr) {
+    runtimeLifetimeApi.releaseHandle(handle);
+  }
 }
 
-void freeNative(void *ptr) {
+void freeNative(void *ptr) noexcept {
   if (ptr == nullptr) return;
-  using Fn = void (*)(void *);
-  resolve<Fn>("ffmpeg_kit_free")(ptr);
+  if (runtimeLifetimeApi.freeMemory != nullptr) {
+    runtimeLifetimeApi.freeMemory(ptr);
+  }
 }
 
 std::string takeString(char *value) {
@@ -188,31 +262,148 @@ Handle getSession(std::int64_t id) {
   return resolve<Fn>("ffmpeg_kit_get_session")(id);
 }
 
+void releaseSessionOperation() noexcept {
+  std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+  if (activeSessionOperations > 0) --activeSessionOperations;
+  sessionHandlesCondition.notify_all();
+}
+
+struct SessionOperationToken {
+  ~SessionOperationToken() noexcept { releaseSessionOperation(); }
+};
+
+class SessionOperationLease {
+ public:
+  SessionOperationLease() = default;
+  SessionOperationLease(const SessionOperationLease &) = default;
+  SessionOperationLease &operator=(const SessionOperationLease &) = default;
+  SessionOperationLease(SessionOperationLease &&) noexcept = default;
+  SessionOperationLease &operator=(SessionOperationLease &&) noexcept = default;
+  ~SessionOperationLease() noexcept = default;
+
+  explicit operator bool() const noexcept { return token_ != nullptr; }
+
+  void reset() noexcept {
+    token_.reset();
+  }
+
+ private:
+  explicit SessionOperationLease(std::shared_ptr<SessionOperationToken> token)
+      : token_(std::move(token)) {}
+
+  std::shared_ptr<SessionOperationToken> token_;
+
+  friend SessionOperationLease acquireSessionOperation();
+};
+
+SessionOperationLease acquireSessionOperation() {
+  std::unique_lock<std::mutex> lock(sessionHandlesMutex);
+  sessionHandlesCondition.wait(lock, [] { return !clearSessionsInProgress; });
+  ++activeSessionOperations;
+  return SessionOperationLease(std::make_shared<SessionOperationToken>());
+}
+
+void releaseRetainedBorrow(
+    const std::shared_ptr<RetainedSessionEntry> &entry) noexcept {
+  std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+  if (entry->activeBorrows > 0) {
+    --entry->activeBorrows;
+    --activeRetainedBorrows;
+  }
+  sessionHandlesCondition.notify_all();
+}
+
+class RetainedHandleLease {
+ public:
+  RetainedHandleLease() = default;
+  explicit RetainedHandleLease(std::shared_ptr<RetainedSessionEntry> entry)
+      : entry_(std::move(entry)) {}
+  RetainedHandleLease(const RetainedHandleLease &) = delete;
+  RetainedHandleLease &operator=(const RetainedHandleLease &) = delete;
+  RetainedHandleLease(RetainedHandleLease &&other) noexcept
+      : entry_(std::move(other.entry_)) {}
+  RetainedHandleLease &operator=(RetainedHandleLease &&other) noexcept {
+    if (this != &other) {
+      reset();
+      entry_ = std::move(other.entry_);
+    }
+    return *this;
+  }
+  ~RetainedHandleLease() noexcept { reset(); }
+
+  explicit operator bool() const noexcept { return entry_ != nullptr; }
+  Handle get() const noexcept { return entry_ ? entry_->handle : nullptr; }
+
+  void reset() noexcept {
+    if (entry_ != nullptr) {
+      releaseRetainedBorrow(entry_);
+      entry_.reset();
+    }
+  }
+
+ private:
+  std::shared_ptr<RetainedSessionEntry> entry_;
+};
+
 struct HandleGuard {
   Handle handle = nullptr;
   bool owned = true;
+  SessionOperationLease operationLease;
+  RetainedHandleLease retainedLease;
 
   HandleGuard() = default;
-  explicit HandleGuard(Handle value, bool owns = true) : handle(value), owned(owns) {}
+  explicit HandleGuard(
+      Handle value,
+      bool owns = true,
+      SessionOperationLease operation = SessionOperationLease())
+      : handle(value), owned(owns), operationLease(std::move(operation)) {}
+  HandleGuard(
+      RetainedHandleLease lease,
+      SessionOperationLease operation)
+      : handle(lease.get()),
+        owned(false),
+        operationLease(std::move(operation)),
+        retainedLease(std::move(lease)) {}
   HandleGuard(const HandleGuard &) = delete;
   HandleGuard &operator=(const HandleGuard &) = delete;
   HandleGuard(HandleGuard &&other) noexcept
-      : handle(other.handle), owned(other.owned) {
+      : handle(other.handle),
+        owned(other.owned),
+        operationLease(std::move(other.operationLease)),
+        retainedLease(std::move(other.retainedLease)) {
     other.handle = nullptr;
     other.owned = false;
   }
   HandleGuard &operator=(HandleGuard &&other) noexcept {
     if (this != &other) {
-      if (owned) release(handle);
+      reset();
       handle = other.handle;
       owned = other.owned;
+      operationLease = std::move(other.operationLease);
+      retainedLease = std::move(other.retainedLease);
       other.handle = nullptr;
       other.owned = false;
     }
     return *this;
   }
-  ~HandleGuard() {
+  ~HandleGuard() noexcept { reset(); }
+
+  void releaseOwnership() noexcept {
+    handle = nullptr;
+    owned = false;
+  }
+
+  SessionOperationLease takeOperationLease() noexcept {
+    return std::move(operationLease);
+  }
+
+ private:
+  void reset() noexcept {
     if (owned) release(handle);
+    handle = nullptr;
+    owned = false;
+    retainedLease.reset();
+    operationLease.reset();
   }
 };
 
@@ -221,63 +412,247 @@ std::int64_t sessionIdOf(Handle handle) {
   return resolve<Fn>("ffmpeg_kit_session_get_session_id")(handle);
 }
 
-HandleGuard acquireSession(std::int64_t id) {
+HandleGuard acquireSessionWithinOperation(
+    std::int64_t id,
+    const SessionOperationLease &operation) {
   {
     std::lock_guard<std::mutex> lock(sessionHandlesMutex);
     const auto it = retainedSessionHandles.find(id);
     if (it != retainedSessionHandles.end()) {
-      // Borrow the retained handle. Releasing it while Running would cancel
-      // the underlying native session.
-      return HandleGuard(it->second, false);
+      if (it->second->releasing) {
+        throw std::runtime_error("Session handle release is already in progress");
+      }
+      ++it->second->activeBorrows;
+      ++activeRetainedBorrows;
+      return HandleGuard(
+          RetainedHandleLease(it->second), operation);
     }
   }
-  return HandleGuard(getSession(id), true);
+  return HandleGuard(getSession(id), true, operation);
+}
+
+HandleGuard acquireSession(std::int64_t id) {
+  auto operation = acquireSessionOperation();
+  return acquireSessionWithinOperation(id, operation);
 }
 
 HandleGuard ensureRetainedSession(std::int64_t id) {
-  std::lock_guard<std::mutex> lock(sessionHandlesMutex);
-  const auto existing = retainedSessionHandles.find(id);
-  if (existing != retainedSessionHandles.end()) {
-    return HandleGuard(existing->second, false);
+  auto operation = acquireSessionOperation();
+  {
+    std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+    const auto existing = retainedSessionHandles.find(id);
+    if (existing != retainedSessionHandles.end()) {
+      if (existing->second->releasing) {
+        throw std::runtime_error("Session handle release is already in progress");
+      }
+      ++existing->second->activeBorrows;
+      ++activeRetainedBorrows;
+      return HandleGuard(
+          RetainedHandleLease(existing->second), std::move(operation));
+    }
   }
 
   Handle handle = getSession(id);
   if (handle == nullptr) {
-    return HandleGuard(nullptr, false);
+    return HandleGuard(nullptr, false, std::move(operation));
   }
-  retainedSessionHandles.emplace(id, handle);
-  if (std::find(knownSessionIds.begin(), knownSessionIds.end(), id) ==
-      knownSessionIds.end()) {
-    knownSessionIds.push_back(id);
+  std::shared_ptr<RetainedSessionEntry> entry;
+  bool releaseTemporaryHandle = false;
+  bool releaseCreation = false;
+  {
+    std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+    const auto current = retainedSessionHandles.find(id);
+    if (current != retainedSessionHandles.end()) {
+      if (current->second->releasing) {
+        releaseCreation = true;
+      } else {
+        entry = current->second;
+        ++entry->activeBorrows;
+        ++activeRetainedBorrows;
+        releaseTemporaryHandle = true;
+      }
+    } else {
+      entry = std::make_shared<RetainedSessionEntry>(
+          RetainedSessionEntry{id, handle, false, 1});
+      retainedSessionHandles.emplace(id, entry);
+      ++activeRetainedBorrows;
+    }
   }
-  return HandleGuard(handle, false);
+  if (releaseCreation) {
+    release(handle);
+    throw std::runtime_error("Session handle release is already in progress");
+  }
+  if (releaseTemporaryHandle) release(handle);
+  return HandleGuard(RetainedHandleLease(entry), std::move(operation));
 }
 
-void recordKnownSessionId(std::int64_t id) {
-  std::lock_guard<std::mutex> lock(sessionHandlesMutex);
-  if (std::find(knownSessionIds.begin(), knownSessionIds.end(), id) ==
-      knownSessionIds.end()) {
-    knownSessionIds.push_back(id);
+void rememberHistorySession(std::int64_t id, const std::string &type) {
+  std::lock_guard<std::mutex> lock(historyMutex);
+  if (historyRecords.find(id) != historyRecords.end()) return;
+  historyRecords.emplace(
+      id, HistoryRecord{id, type, nextHistoryOrder++, true});
+}
+
+void removeHistorySession(std::int64_t id) {
+  std::lock_guard<std::mutex> lock(historyMutex);
+  historyRecords.erase(id);
+}
+
+void markHistorySessionTerminal(std::int64_t id) {
+  std::lock_guard<std::mutex> lock(historyMutex);
+  const auto it = historyRecords.find(id);
+  if (it != historyRecords.end()) it->second.terminal = true;
+}
+
+void removeNonTerminalHistorySession(std::int64_t id) {
+  std::lock_guard<std::mutex> lock(historyMutex);
+  const auto it = historyRecords.find(id);
+  if (it != historyRecords.end() && !it->second.terminal) {
+    historyRecords.erase(it);
   }
+}
+
+void pruneTerminalHistory(std::int64_t capacity) {
+  if (capacity < 0) return;
+  std::vector<HistoryRecord> terminal;
+  {
+    std::lock_guard<std::mutex> lock(historyMutex);
+    for (const auto &[id, record] : historyRecords) {
+      if (record.visible && record.terminal) terminal.push_back(record);
+    }
+  }
+  std::sort(terminal.begin(), terminal.end(), [](const auto &left, const auto &right) {
+    return left.creationOrder < right.creationOrder;
+  });
+  const auto removeCount = static_cast<std::size_t>(
+      std::max<std::int64_t>(0, static_cast<std::int64_t>(terminal.size()) - capacity));
+  if (removeCount == 0) return;
+  std::lock_guard<std::mutex> lock(historyMutex);
+  for (std::size_t index = 0; index < removeCount; ++index) {
+    historyRecords.erase(terminal[index].sessionId);
+  }
+}
+
+std::vector<HistoryRecord> visibleHistoryRecords(const std::string &kind) {
+  std::vector<HistoryRecord> result;
+  {
+    std::lock_guard<std::mutex> lock(historyMutex);
+    for (const auto &[id, record] : historyRecords) {
+      if (!record.visible ||
+          (kind != "all" && record.type != kind)) {
+        continue;
+      }
+      result.push_back(record);
+    }
+  }
+  std::sort(result.begin(), result.end(), [](const auto &left, const auto &right) {
+    return left.creationOrder < right.creationOrder;
+  });
+  return result;
+}
+
+HandleGuard acquireHistorySessionWithinOperation(
+    std::int64_t id,
+    const SessionOperationLease &operation) {
+  // Running-session promotion occurs under an already-admitted operation.
+  // It must not wait for global clear admission to reopen; clear is waiting
+  // for this history transaction to finish.
+  HandleGuard guard = acquireSessionWithinOperation(id, operation);
+  if (guard.handle == nullptr || !guard.owned) return guard;
+
+  using StateFn = int (*)(Handle);
+  if (resolve<StateFn>("ffmpeg_kit_session_get_state")(guard.handle) != 1) {
+    return guard;
+  }
+
+  std::unique_lock<std::mutex> lock(sessionHandlesMutex);
+  const auto existing = retainedSessionHandles.find(id);
+  if (existing != retainedSessionHandles.end()) {
+    if (existing->second->releasing) {
+      throw std::runtime_error("Session handle release is already in progress");
+    }
+    ++existing->second->activeBorrows;
+    ++activeRetainedBorrows;
+    const auto temporaryHandle = guard.handle;
+    guard.releaseOwnership();
+    auto retainedOperation = guard.takeOperationLease();
+    lock.unlock();
+    release(temporaryHandle);
+    return HandleGuard(
+        RetainedHandleLease(existing->second), std::move(retainedOperation));
+  }
+  const auto entry = std::make_shared<RetainedSessionEntry>(
+      RetainedSessionEntry{id, guard.handle, false, 1});
+  retainedSessionHandles.emplace(id, entry);
+  ++activeRetainedBorrows;
+  guard.releaseOwnership();
+  auto retainedOperation = guard.takeOperationLease();
+  lock.unlock();
+  return HandleGuard(RetainedHandleLease(entry), std::move(retainedOperation));
 }
 
 void releaseRetainedSession(std::int64_t id) {
-  Handle handle = nullptr;
+  auto operation = acquireSessionOperation();
+  std::shared_ptr<RetainedSessionEntry> entry;
+  std::int32_t state = -1;
   {
-    std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+    std::unique_lock<std::mutex> lock(sessionHandlesMutex);
     const auto it = retainedSessionHandles.find(id);
     if (it == retainedSessionHandles.end()) return;
-    handle = it->second;
-    retainedSessionHandles.erase(it);
+    entry = it->second;
+    if (entry->releasing) {
+      throw std::runtime_error("Session handle release is already in progress");
+    }
+    entry->releasing = true;
+    ++activeRetainedReleases;
+    sessionHandlesCondition.wait(lock, [&] { return entry->activeBorrows == 0; });
+    lock.unlock();
+    try {
+      using StateFn = int (*)(Handle);
+      state = static_cast<std::int32_t>(
+          resolve<StateFn>("ffmpeg_kit_session_get_state")(entry->handle));
+    } catch (...) {
+      lock.lock();
+      entry->releasing = false;
+      --activeRetainedReleases;
+      sessionHandlesCondition.notify_all();
+      throw;
+    }
   }
   // Called by the JS monitor only after a terminal session state has been
   // observed and final logs/statistics have been drained.
-  release(handle);
-}
-
-std::vector<std::int64_t> sessionIdsSnapshot() {
+  release(entry->handle);
+  {
+    std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+    const auto it = retainedSessionHandles.find(id);
+    if (it == retainedSessionHandles.end() || it->second != entry) {
+      entry->releasing = false;
+      --activeRetainedReleases;
+      sessionHandlesCondition.notify_all();
+      throw std::runtime_error("Retained session handle changed during release");
+    }
+    retainedSessionHandles.erase(it);
+  }
+  try {
+    if (state == kCompletedSessionState || state == kFailedSessionState) {
+      markHistorySessionTerminal(id);
+      using SizeFn = std::int64_t (*)();
+      pruneTerminalHistory(
+          resolve<SizeFn>("ffmpeg_kit_get_session_history_size")());
+    } else if (state == kCreatedSessionState) {
+      removeNonTerminalHistorySession(id);
+    }
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+    entry->releasing = false;
+    --activeRetainedReleases;
+    sessionHandlesCondition.notify_all();
+    throw;
+  }
   std::lock_guard<std::mutex> lock(sessionHandlesMutex);
-  return knownSessionIds;
+  entry->releasing = false;
+  --activeRetainedReleases;
+  sessionHandlesCondition.notify_all();
 }
 
 std::string sessionType(Handle handle) {
@@ -408,6 +783,29 @@ std::string serializeChapter(Handle chapter) {
 
 } // namespace
 
+namespace testing {
+
+void setDynamicSymbolResolver(DynamicSymbolResolverForTesting resolver) {
+  dynamicSymbolResolverForTesting = resolver;
+}
+
+void resetDynamicSymbolResolver() {
+  dynamicSymbolResolverForTesting = nullptr;
+}
+
+bool isRetainedSessionReleasing(std::int64_t sessionId) {
+  std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+  const auto it = retainedSessionHandles.find(sessionId);
+  return it != retainedSessionHandles.end() && it->second->releasing;
+}
+
+bool isSessionClearInProgress() {
+  std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+  return clearSessionsInProgress;
+}
+
+} // namespace testing
+
 void initialize() { ensureInitialized(); }
 
 std::string getBuildStamp() {
@@ -419,11 +817,21 @@ std::string getBuildStamp() {
 
 static double createSessionWith(const char *symbol, const std::string &command) {
   ensureInitialized();
+  auto operation = acquireSessionOperation();
   using Fn = Handle (*)(const char *);
-  HandleGuard guard(resolve<Fn>(symbol)(command.c_str()));
+  HandleGuard guard(
+      resolve<Fn>(symbol)(command.c_str()), true, std::move(operation));
   if (guard.handle == nullptr) throw std::runtime_error("Failed to create FFmpegKit session");
   const auto id = sessionIdOf(guard.handle);
-  recordKnownSessionId(id);
+  const std::string type =
+      std::string(symbol) == "ffprobe_kit_create_session"
+          ? "ffprobe"
+          : std::string(symbol) == "ffplay_kit_create_session"
+              ? "ffplay"
+              : std::string(symbol) == "media_information_create_session"
+                  ? "media-information"
+                  : "ffmpeg";
+  rememberHistorySession(id, type);
   // The session is still in Created state, so releasing this temporary handle is
   // safe. executeSessionAsync() obtains and retains a fresh owning handle before
   // starting the native worker.
@@ -436,6 +844,7 @@ static double createSessionWithArguments(
   if (arguments.empty()) {
     throw std::invalid_argument("FFmpegKit argument list must not be empty");
   }
+  auto operation = acquireSessionOperation();
 
   std::vector<const char *> argv;
   argv.reserve(arguments.size());
@@ -444,12 +853,19 @@ static double createSessionWithArguments(
   }
 
   using Fn = Handle (*)(int, const char **);
-  HandleGuard guard(resolve<Fn>(symbol)(static_cast<int>(argv.size()), argv.data()));
+  HandleGuard guard(
+      resolve<Fn>(symbol)(static_cast<int>(argv.size()), argv.data()),
+      true,
+      std::move(operation));
   if (guard.handle == nullptr) {
     throw std::runtime_error("Failed to create FFmpegKit session from arguments");
   }
   const auto id = sessionIdOf(guard.handle);
-  recordKnownSessionId(id);
+  const std::string type =
+      std::string(symbol) == "ffplay_kit_create_session_from_argv"
+          ? "ffplay"
+          : "ffmpeg";
+  rememberHistorySession(id, type);
   return static_cast<double>(id);
 }
 
@@ -462,6 +878,7 @@ double createMediaInformationSession(const std::string &command) { return create
 
 double createMediaInformationSessionFromPath(const std::string &path) {
   ensureInitialized();
+  auto operation = acquireSessionOperation();
   const std::vector<std::string> arguments = {
       "-v",            "error",          "-hide_banner",
       "-print_format", "json",           "-show_format",
@@ -474,13 +891,16 @@ double createMediaInformationSessionFromPath(const std::string &path) {
   }
 
   using Fn = Handle (*)(int, const char **);
-  HandleGuard guard(resolve<Fn>("media_information_create_session_from_argv")(
-      static_cast<int>(argv.size()), argv.data()));
+  HandleGuard guard(
+      resolve<Fn>("media_information_create_session_from_argv")(
+          static_cast<int>(argv.size()), argv.data()),
+      true,
+      std::move(operation));
   if (guard.handle == nullptr) {
     throw std::runtime_error("Failed to create FFmpegKit media information session");
   }
   const auto id = sessionIdOf(guard.handle);
-  recordKnownSessionId(id);
+  rememberHistorySession(id, "media-information");
   return static_cast<double>(id);
 }
 
@@ -506,8 +926,19 @@ void executeSessionAsync(double sessionId, double timeoutMs) {
 
 void cancelSession(double sessionId) {
   ensureInitialized();
+  auto operation = acquireSessionOperation();
   using Fn = void (*)(std::int64_t);
   resolve<Fn>("ffmpeg_kit_cancel_session")(toId(sessionId));
+}
+
+void enableLogCallback(LogCallback callback, void *userData) {
+  ensureInitialized();
+  using Fn = void (*)(LogCallback, void *);
+  resolve<Fn>("ffmpeg_kit_config_enable_log_callback")(callback, userData);
+}
+
+void releaseOwnedLogMessage(char *message) {
+  freeNative(message);
 }
 
 std::string getSessionJson(double sessionId) {
@@ -516,21 +947,55 @@ std::string getSessionJson(double sessionId) {
   return sessionJson(guard.handle);
 }
 
+std::int32_t getSessionState(double sessionId) {
+  ensureInitialized();
+  HandleGuard guard = acquireSession(toId(sessionId));
+  if (guard.handle == nullptr) {
+    throw std::runtime_error("Session not found");
+  }
+  using Fn = int (*)(Handle);
+  return static_cast<std::int32_t>(
+      resolve<Fn>("ffmpeg_kit_session_get_state")(guard.handle));
+}
+
+double getLogsCount(double sessionId) {
+  ensureInitialized();
+  HandleGuard guard = acquireSession(toId(sessionId));
+  if (guard.handle == nullptr) return 0;
+  using Fn = std::int64_t (*)(Handle);
+  return static_cast<double>(resolve<Fn>("ffmpeg_kit_session_get_logs_count")(guard.handle));
+}
+
 void releaseSessionHandle(double sessionId) {
   ensureInitialized();
   releaseRetainedSession(toId(sessionId));
 }
 
+void abandonCreatedSession(double sessionId) {
+  ensureInitialized();
+  auto operation = acquireSessionOperation();
+  // The JavaScript queue has explicitly established that this identity was
+  // discarded before execution. Do not acquire or release a native handle:
+  // queued Created sessions intentionally have no retained execution handle.
+  removeNonTerminalHistorySession(toId(sessionId));
+}
+
 std::string getSessionsJson(const std::string &kind) {
   ensureInitialized();
-  const auto ids = sessionIdsSnapshot();
+  auto operation = acquireSessionOperation();
+  const auto records = visibleHistoryRecords(kind);
   std::ostringstream out;
   out << '[';
   bool first = true;
-  for (const auto id : ids) {
-    HandleGuard guard = acquireSession(id);
-    if (guard.handle == nullptr) continue;
-    if (!kind.empty() && kind != "all" && sessionType(guard.handle) != kind) continue;
+  for (const auto &record : records) {
+    // One operation token spans the entire projection. Destructive clear
+    // cannot split the result or invalidate a handle between records.
+    HandleGuard guard =
+        acquireHistorySessionWithinOperation(record.sessionId, operation);
+    if (guard.handle == nullptr) {
+      removeHistorySession(record.sessionId);
+      continue;
+    }
     if (!first) out << ',';
     first = false;
     out << sessionJson(guard.handle);
@@ -541,12 +1006,16 @@ std::string getSessionsJson(const std::string &kind) {
 
 std::string getLastSessionJson(const std::string &kind) {
   ensureInitialized();
-  const auto ids = sessionIdsSnapshot();
-  for (auto it = ids.rbegin(); it != ids.rend(); ++it) {
-    HandleGuard guard = acquireSession(*it);
-    if (guard.handle == nullptr) continue;
-    if (!kind.empty() && kind != "all" && sessionType(guard.handle) != kind) continue;
-    return sessionJson(guard.handle);
+  auto operation = acquireSessionOperation();
+  const auto records = visibleHistoryRecords(kind);
+  for (auto it = records.rbegin(); it != records.rend(); ++it) {
+    HandleGuard session =
+        acquireHistorySessionWithinOperation(it->sessionId, operation);
+    if (session.handle == nullptr) {
+      removeHistorySession(it->sessionId);
+      continue;
+    }
+    return sessionJson(session.handle);
   }
   return {};
 }
@@ -708,22 +1177,64 @@ std::string getRegisteredBitstreamFilters() { ensureInitialized(); return string
 std::string getBuildConfiguration() { ensureInitialized(); return stringCall("ffmpeg_kit_packages_get_build_configuration"); }
 std::string getBuildDate() { ensureInitialized(); return stringCall("ffmpeg_kit_config_get_build_date"); }
 
-void setSessionHistorySize(double size) { ensureInitialized(); using Fn = void (*)(std::int64_t); resolve<Fn>("ffmpeg_kit_set_session_history_size")(static_cast<std::int64_t>(size)); }
-double getSessionHistorySize() { ensureInitialized(); using Fn = std::int64_t (*)(); return static_cast<double>(resolve<Fn>("ffmpeg_kit_get_session_history_size")()); }
+void setSessionHistorySize(double size) {
+  ensureInitialized();
+  auto operation = acquireSessionOperation();
+  using Fn = void (*)(std::int64_t);
+  resolve<Fn>("ffmpeg_kit_set_session_history_size")(static_cast<std::int64_t>(size));
+  pruneTerminalHistory(static_cast<std::int64_t>(size));
+}
+double getSessionHistorySize() {
+  ensureInitialized();
+  auto operation = acquireSessionOperation();
+  using Fn = std::int64_t (*)();
+  return static_cast<double>(resolve<Fn>("ffmpeg_kit_get_session_history_size")());
+}
 void clearSessions() {
   ensureInitialized();
   using Fn = void (*)();
-  resolve<Fn>("ffmpeg_kit_clear_sessions")();
-  // The core clear operation removes all wrapper handles from its registry and
-  // cancels/drains active sessions. The raw keys retained here are therefore no
-  // longer releasable and can simply be forgotten.
-  std::lock_guard<std::mutex> lock(sessionHandlesMutex);
-  retainedSessionHandles.clear();
-  knownSessionIds.clear();
+  // The clear lease is exclusive from the native clear call through the local
+  // history commit. Every session lookup, creation, retained release, and
+  // history projection holds a shared operation lease, so no handle or history
+  // identity can be admitted while the native registry is being discarded.
+  {
+    std::unique_lock<std::mutex> lock(sessionHandlesMutex);
+    sessionHandlesCondition.wait(lock, [] { return !clearSessionsInProgress; });
+    clearSessionsInProgress = true;
+    sessionHandlesCondition.wait(lock, [] { return activeSessionOperations == 0; });
+  }
+  try {
+    resolve<Fn>("ffmpeg_kit_config_clear_sessions")();
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+    clearSessionsInProgress = false;
+    sessionHandlesCondition.notify_all();
+    throw;
+  }
+  {
+    std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+    retainedSessionHandles.clear();
+  }
+  {
+    std::lock_guard<std::mutex> historyLock(historyMutex);
+    historyRecords.clear();
+    nextHistoryOrder = 0;
+  }
+  {
+    std::lock_guard<std::mutex> lock(sessionHandlesMutex);
+    clearSessionsInProgress = false;
+    sessionHandlesCondition.notify_all();
+  }
 }
 std::string registerNewFFmpegPipe() { ensureInitialized(); return stringCall("ffmpeg_kit_config_register_new_ffmpeg_pipe"); }
 void closeFFmpegPipe(const std::string &path) { ensureInitialized(); using Fn = void (*)(const char*); resolve<Fn>("ffmpeg_kit_config_close_ffmpeg_pipe")(path.c_str()); }
-double messagesInTransmit(double sessionId) { ensureInitialized(); using Fn = std::int64_t (*)(std::int64_t); return static_cast<double>(resolve<Fn>("ffmpeg_kit_config_messages_in_transmit")(toId(sessionId))); }
+double messagesInTransmit(double sessionId) {
+  ensureInitialized();
+  auto operation = acquireSessionOperation();
+  using Fn = std::int64_t (*)(std::int64_t);
+  return static_cast<double>(
+      resolve<Fn>("ffmpeg_kit_config_messages_in_transmit")(toId(sessionId)));
+}
 
 void enableDebugLog(double sessionId) { ensureInitialized(); HandleGuard h = acquireSession(toId(sessionId)); if (!h.handle) throw std::runtime_error("Session not found"); using Fn = void (*)(Handle); resolve<Fn>("session_enable_debug_log")(h.handle); }
 void disableDebugLog(double sessionId) { ensureInitialized(); HandleGuard h = acquireSession(toId(sessionId)); if (!h.handle) throw std::runtime_error("Session not found"); using Fn = void (*)(Handle); resolve<Fn>("session_disable_debug_log")(h.handle); }

@@ -4,14 +4,27 @@ The `FFplayKit` class provides a convenient interface for media playback using F
 
 ## Overview
 
-`FFplayKit` manages a single global FFplay session for media playback. Since FFplay typically involves a single active playback window, this class provides:
+`FFplayKit` exposes one current global control owner for convenient playback
+control while submitted executions remain tracked until their terminal Futures
+settle. Creating a newer global session changes the current owner; it does not
+implicitly cancel older tracked executions. The class provides:
 
 - Simple playback control (play, pause, resume, stop)
 - Seek functionality
 - Position and duration tracking
 - Video surface management
 
-**Important**: Only one FFplay session can be active at a time. Starting a new session automatically replaces any existing one.
+`FFplayKit.execute` and `executeAsync` are Future-based playback APIs managed
+by the session queue. Their Future completes after native startup has been
+handed off, not after full playback; use `onComplete` for the terminal event.
+The direct `FFplaySession.execute` method is deprecated and always throws
+`UnsupportedError` on every platform. Synchronous playback blocks the calling
+thread for the whole session: on Web that is the browser main thread, so frames,
+audio, network callbacks and controls cannot run; on native platforms the Dart
+isolate is blocked, so pause, stop, seek, callbacks and streams cannot reach
+Dart. The rejection happens before any backend call and leaves the session
+created and unregistered, so it can still be started with `executeAsync()`.
+Use `FFplayKit.executeAsync` for all playback.
 
 ## Video Playback
 
@@ -20,12 +33,13 @@ For video playback, use the `FFplaySurface` class to create a cross-platform vid
 ```dart
 // Create surface before starting playback
 final surface = await FFplaySurface.create();
+if (surface == null) return;
 
 // Start playback
 final session = await FFplayKit.executeAsync('-i "video.mp4"');
 
-// Use surface in widget tree
-Texture(textureId: surface.textureId)
+// Use the platform-appropriate surface widget in the widget tree
+final videoWidget = surface.toWidget();
 
 // Clean up when done
 await surface.release();
@@ -49,7 +63,8 @@ static Future<FFplaySession> execute(String command)
 
 **Returns:**
 
-- `Future<FFplaySession>`: A Future that completes with the session
+- `Future<FFplaySession>`: A Future that completes after startup handoff with
+  the live session; playback remains tracked until completion
 
 **Example:**
 
@@ -71,6 +86,7 @@ Starts playback asynchronously with an optional completion callback.
 static Future<FFplaySession> executeAsync(
   String command, {
   FFplaySessionCompleteCallback? onComplete,
+  FFmpegLogCallback? onLog,
 })
 ```
 
@@ -78,10 +94,12 @@ static Future<FFplaySession> executeAsync(
 
 - `command` (String): The FFplay command to execute
 - `onComplete` (FFplaySessionCompleteCallback?, optional): Callback when playback ends
+- `onLog` (FFmpegLogCallback?, optional): Callback for native log messages
 
 **Returns:**
 
-- `Future<FFplaySession>`: A Future that completes with the session
+- `Future<FFplaySession>`: A Future that completes after startup handoff with
+  the live session; playback remains tracked until `onComplete`
 
 **Example:**
 
@@ -92,6 +110,7 @@ await FFplayKit.executeAsync(
     print('Playback finished');
     print('Return code: ${session.getReturnCode()}');
   },
+  onLog: (log) => print(log.getMessage()),
 );
 ```
 
@@ -105,6 +124,7 @@ Creates a new FFplay session without starting playback. Call `FFplayKit.start()`
 static Future<FFplaySession> createSession(
   String command, {
   FFplaySessionCompleteCallback? onComplete,
+  FFmpegLogCallback? onLog,
 })
 ```
 
@@ -112,6 +132,7 @@ static Future<FFplaySession> createSession(
 
 - `command` (String): The FFplay command for the session
 - `onComplete` (FFplaySessionCompleteCallback?, optional): Completion callback
+- `onLog` (FFmpegLogCallback?, optional): Callback for native log messages
 
 **Returns:**
 
@@ -127,6 +148,24 @@ final session = await FFplayKit.createSession(
 // Start playback later
 FFplayKit.start();
 ```
+
+---
+
+### FFplayKit.createSessionFromArguments
+
+Creates a new FFplay session from pre-tokenized arguments without starting
+playback. Call `FFplayKit.start()` to begin execution.
+
+```dart
+static Future<FFplaySession> createSessionFromArguments(
+  List<String> arguments, {
+  FFplaySessionCompleteCallback? onComplete,
+  FFmpegLogCallback? onLog,
+})
+```
+
+Use this form when argument boundaries must be preserved instead of parsing a
+single command string.
 
 ---
 
@@ -182,7 +221,8 @@ FFplayKit.resume();
 
 #### stop
 
-Stops playback and closes the session.
+Requests playback stop for the current global control owner. Stop is distinct
+from `close` and from `FFplaySession.dispose`.
 
 ```dart
 static void stop()
@@ -356,7 +396,10 @@ if (FFplayKit.isClosed()) {
 
 #### cancel
 
-Cancels a specific FFplay session.
+Cancels a specific FFplay session. Cancellation intent is recorded before the
+playback stop is attempted, so a stop failure cannot erase the request. A
+successful cancel clears an untracked current session; tracked executions keep
+global ownership until their execution Future settles.
 
 ```dart
 static void cancel(FFplaySession session)
@@ -378,7 +421,9 @@ FFplayKit.cancel(session);
 
 #### close
 
-Closes the active session and releases resources.
+Delegates FFplay close control for the current global owner. Deterministic
+native handle release is owned by `FFplaySession.dispose`; tracked executions
+remain globally owned until their execution Futures settle.
 
 ```dart
 static void close()
@@ -394,7 +439,9 @@ FFplayKit.close();
 
 #### getCurrentSession
 
-Returns the current active FFplay session.
+Returns the current global control owner. This does not imply that no other
+execution remains tracked or that the returned session is the only retained
+session.
 
 ```dart
 static FFplaySession? getCurrentSession()
@@ -402,7 +449,7 @@ static FFplaySession? getCurrentSession()
 
 **Returns:**
 
-- `FFplaySession?`: The active session, or null if none
+- `FFplaySession?`: The current control owner, or null if none
 
 **Example:**
 
@@ -418,7 +465,10 @@ if (session != null) {
 
 #### getFFplaySessions
 
-Returns all active FFplay sessions (always a single element or empty).
+Returns all retained FFplay sessions in session history. A newer global
+control owner does not cancel older tracked executions automatically. Inspect
+`session.getState()` when filtering history; active asynchronous executions are
+available from `SessionQueueManager().activeSessions`.
 
 ```dart
 static List<FFplaySession> getFFplaySessions()
@@ -426,14 +476,14 @@ static List<FFplaySession> getFFplaySessions()
 
 **Returns:**
 
-- `List<FFplaySession>`: List with at most one session
+- `List<FFplaySession>`: List of retained FFplay sessions in creation order
 
 **Example:**
 
 ```dart
 final sessions = FFplayKit.getFFplaySessions();
 if (sessions.isNotEmpty) {
-  print('Active session: ${sessions.first.getCommand()}');
+  print('Most recently retained session: ${sessions.first.getCommand()}');
 }
 ```
 
@@ -690,7 +740,10 @@ await FFplayKit.executeAsync(
 
 ## Best Practices
 
-1. **Single Session**: Only one FFplay session can be active at a time. Starting a new session automatically replaces the previous one.
+1. **Current control owner**: Global controls address the current owner. A
+   newer owner does not implicitly cancel older executions; inspect the
+   retained history or `SessionQueueManager().activeSessions` when you need
+   execution inventory.
 
 2. **Resource Cleanup**: Always stop or close sessions when done:
 
@@ -712,10 +765,14 @@ await FFplayKit.executeAsync(
 
 4. **Position and Duration**: `getPosition()` and `getDuration()` return `0.0` when no session is active — no null check needed.
 
-5. **Use Async for UI**: Use `executeAsync` to avoid blocking the UI thread:
+5. **Use Async for UI**: Use `executeAsync` to avoid blocking the UI thread.
+   Its Future is a startup handoff; use `onComplete` for playback completion:
 
    ```dart
-   await FFplayKit.executeAsync('video.mp4');
+   await FFplayKit.executeAsync(
+     'video.mp4',
+     onComplete: (_) => print('Playback finished'),
+   );
    ```
 
 6. **Periodic Updates**: Use timers for smooth progress updates:
@@ -729,7 +786,6 @@ await FFplayKit.executeAsync(
 
 ## Limitations
 
-- **Single Session**: Only one FFplay session can be active at a time
 - **Platform Windows**: FFplay creates a native window that may not integrate seamlessly with Flutter UI
 - **Limited Control**: Some advanced playback features may require custom FFplay command options
 

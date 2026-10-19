@@ -8,6 +8,10 @@ Complete documentation for FFmpeg Kit Extended Flutter plugin.
 - **[Installation Guide](installation.md)** - Platform-specific setup instructions
 - **[Quick Start Guide](quick-start.md)** - Get up and running in minutes
 
+## Developer Architecture
+
+- **[Architecture and maintenance handoff](architecture.md)** - Platform boundaries, generated bindings, initialization, callbacks, handles, Wasm memory, FFplay rendering, and verification commands
+
 ## API Reference
 
 Complete API documentation for all classes and methods:
@@ -43,6 +47,13 @@ Complete API documentation for all classes and methods:
   - Font directory configuration
   - Global callbacks
   - Session history management
+
+- **[FFmpegKitExtended API](api/ffmpeg-kit-extended.md)** - Advanced central
+  facade
+  - Initialization and session factories
+  - Retained history and cancellation compatibility
+  - Package/build introspection
+  - Audio, environment, debug, and argument utilities
 
 - **[Session API](api/sessions.md)** - Session management
   - FFmpegSession, FFprobeSession, FFplaySession
@@ -161,6 +172,10 @@ void main() async {
 }
 ```
 
+Successful initialization is idempotent and concurrent calls share one
+in-flight attempt. A failed Web initialization rejects that attempt and can be
+retried with a later call.
+
 ### Basic Usage
 
 ```dart
@@ -189,10 +204,11 @@ await FFmpegKit.executeAsync(
 | Platform | Status        | Notes        |
 |----------|---------------|--------------|
 | Android  | ✅ Supported  | API 21+      |
-| iOS      | Not Supported | iOS 12+      |
-| macOS    | Not Supported | macOS 10.13+ |
+| iOS      | ✅ Supported | iOS 12+      |
+| macOS    | ✅ Supported | macOS 10.13+ |
 | Linux    | ✅ Supported  | x86_64       |
 | Windows  | ✅ Supported  | x86_64       |
+| Web      | ✅ Supported  | WebAssembly  |
 
 ## Additional Resources
 

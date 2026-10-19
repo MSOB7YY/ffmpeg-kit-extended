@@ -7,11 +7,7 @@
  * the destination for decoded frames.
  */
 import React from 'react';
-import {
-  Platform,
-  View,
-  type ViewProps,
-} from 'react-native';
+import type {ViewProps} from 'react-native';
 
 import NativeFFplayView from './FFplayViewNativeComponent';
 
@@ -25,7 +21,8 @@ import NativeFFplayView from './FFplayViewNativeComponent';
 export type FFplayViewProps = ViewProps;
 
 /**
- * Renders the platform-native FFplay video surface.
+ * Renders the platform-native FFplay video surface. The Web resolver selects
+ * `ffplay-view.web.tsx`, which renders the same API with a canvas.
  *
  * @example
  * ```tsx
@@ -34,18 +31,11 @@ export type FFplayViewProps = ViewProps;
  *
  * On unsupported React Native hosts this renders a normal `View`, allowing
  * shared layouts to remain valid even though no native video frames are shown.
+ *
+ * @category FFplay UI
  */
 export function FFplayView(
   props: FFplayViewProps,
 ): React.JSX.Element {
-  if (
-    Platform.OS === 'android' ||
-    Platform.OS === 'ios' ||
-    Platform.OS === 'macos' ||
-    Platform.OS === 'windows'
-  ) {
-    return <NativeFFplayView {...props} />;
-  }
-
-  return <View {...props} />;
+  return <NativeFFplayView {...props} />;
 }

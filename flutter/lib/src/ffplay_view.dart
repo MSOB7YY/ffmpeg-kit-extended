@@ -16,9 +16,9 @@
 /// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 library;
 
-import 'dart:io' show Platform;
 import 'dart:math' show min;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -114,9 +114,10 @@ class FFplayViewController extends ChangeNotifier {
 ///
 /// ### Sizing in normal mode
 ///
-/// * Both [aspectRatio] and [videoWidth] provided → widget sizes itself to
-///   `min(containerWidth, videoWidth) × (w / aspectRatio)`.  Never upscales
-///   beyond native dimensions.
+/// * Both [aspectRatio] and source dimensions provided → widget uses the finite
+///   available width (or a source-derived fallback when width is unbounded),
+///   then computes `min(width / aspectRatio, sourceHeight)` where
+///   `sourceHeight` is `videoHeight ?? videoWidth / aspectRatio`.
 /// * Only [aspectRatio] → fills parent container at that ratio.
 /// * Neither → expands to fill parent.
 ///
@@ -151,11 +152,12 @@ class FFplayView extends StatefulWidget {
   /// Aspect ratio of the video (e.g. `16 / 9`).
   final double? aspectRatio;
 
-  /// Native pixel width of the video stream.  Used to cap the widget to the
-  /// video's natural dimensions in normal mode.
+  /// Native pixel width of the video stream. Used to derive the source height
+  /// when [videoHeight] is not supplied; it does not cap the widget width.
   final int? videoWidth;
 
-  /// Native pixel height of the video stream (informational).
+  /// Native pixel height of the video stream. When supplied, it participates
+  /// in the computed height cap while preserving [aspectRatio].
   final int? videoHeight;
 
   /// Background colour for letterbox / pillarbox areas.
@@ -166,10 +168,14 @@ class FFplayView extends StatefulWidget {
 }
 
 class _FFplayViewState extends State<FFplayView> {
-  static bool get _isMobile => Platform.isAndroid || Platform.isIOS;
+  static bool get _isMobile =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS);
 
   /// Stored while a fullscreen route is active; used by [_popFullscreen].
   NavigatorState? _fullscreenNav;
+  bool _fullscreenTransitionActive = false;
 
   @override
   void initState() {
@@ -188,7 +194,9 @@ class _FFplayViewState extends State<FFplayView> {
 
   @override
   void dispose() {
-    widget.controller?._detach();
+    final controller = widget.controller;
+    controller?._detach();
+    controller?._setIsFullscreen(false);
     super.dispose();
   }
 
@@ -197,39 +205,92 @@ class _FFplayViewState extends State<FFplayView> {
   }
 
   Future<void> _enterFullscreen(BuildContext context) async {
-    if (_fullscreenNav != null) return; // already in fullscreen
+    if (_fullscreenNav != null || _fullscreenTransitionActive) return;
+    _fullscreenTransitionActive = true;
     // Capture the Navigator synchronously before any awaits — using
     // `context` after an async gap would risk referencing a deactivated
     // element and trips the use_build_context_synchronously lint.
     final navigator = Navigator.of(context);
-    if (_isMobile) {
-      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    }
-    await widget.controller?.onEnterFullscreen?.call();
-    if (!mounted) return;
-    widget.controller?._setIsFullscreen(true);
+    final controller = widget.controller;
+    var immersiveApplied = false;
+    var externalFullscreenEntered = false;
+    Object? primaryError;
+    StackTrace? primaryStackTrace;
 
-    _fullscreenNav = navigator;
-    await _fullscreenNav!.push(
-      MaterialPageRoute<void>(
-        fullscreenDialog: true,
-        builder: (_) => _FullscreenVideoPage(
-          surface: widget.surface,
-          backgroundColor: widget.backgroundColor,
-          aspectRatio: widget.aspectRatio,
-        ),
-      ),
-    );
-    // Reached here after route is popped (any mechanism: button, back gesture,
-    // or external controller.exitFullscreen()).
+    if (_isMobile) {
+      try {
+        await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+        immersiveApplied = true;
+      } catch (error, stackTrace) {
+        primaryError = error;
+        primaryStackTrace = stackTrace;
+      }
+    }
+
+    if (primaryError == null) {
+      try {
+        await controller?.onEnterFullscreen?.call();
+        externalFullscreenEntered = controller?.onEnterFullscreen != null;
+        if (mounted) {
+          controller?._setIsFullscreen(true);
+          _fullscreenNav = navigator;
+          await _fullscreenNav!.push(
+            MaterialPageRoute<void>(
+              fullscreenDialog: true,
+              builder: (_) => _FullscreenVideoPage(
+                surface: widget.surface,
+                backgroundColor: widget.backgroundColor,
+                aspectRatio: widget.aspectRatio,
+              ),
+            ),
+          );
+        }
+      } catch (error, stackTrace) {
+        primaryError = error;
+        primaryStackTrace = stackTrace;
+      }
+    }
+
+    Object? cleanupError;
+    StackTrace? cleanupStackTrace;
+    Future<void> runCleanup(Future<void> Function() cleanup) async {
+      try {
+        await cleanup();
+      } catch (error, stackTrace) {
+        cleanupError ??= error;
+        cleanupStackTrace ??= stackTrace;
+      }
+    }
+
     _fullscreenNav = null;
-
-    if (!mounted) return;
-    if (_isMobile) {
-      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    if (immersiveApplied) {
+      await runCleanup(
+        () => SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
+      );
     }
-    await widget.controller?.onExitFullscreen?.call();
-    widget.controller?._setIsFullscreen(false);
+    if (externalFullscreenEntered) {
+      await runCleanup(() async {
+        await controller?.onExitFullscreen?.call();
+      });
+    }
+    if (mounted) {
+      controller?._setIsFullscreen(false);
+    }
+    _fullscreenTransitionActive = false;
+
+    if (primaryError != null) {
+      if (cleanupError != null) {
+        debugPrint(
+          'FFplayView fullscreen cleanup failed after the primary transition '
+          'error: $cleanupError',
+        );
+      }
+      Error.throwWithStackTrace(primaryError, primaryStackTrace!);
+    }
+    final finalCleanupError = cleanupError;
+    if (finalCleanupError != null) {
+      Error.throwWithStackTrace(finalCleanupError, cleanupStackTrace!);
+    }
   }
 
   /// Called by [FFplayViewController.exitFullscreen] to programmatically pop
@@ -241,6 +302,7 @@ class _FFplayViewState extends State<FFplayView> {
   Widget _buildVideo() {
     final ar = widget.aspectRatio;
     final nativeW = widget.videoWidth?.toDouble();
+    final nativeH = widget.videoHeight?.toDouble();
 
     final video = ColoredBox(
       color: widget.backgroundColor,
@@ -249,15 +311,15 @@ class _FFplayViewState extends State<FFplayView> {
 
     if (ar == null) return SizedBox.expand(child: video);
 
-    if (nativeW != null) {
+    if (nativeW != null || nativeH != null) {
       return LayoutBuilder(
         builder: (_, constraints) {
+          final sourceH = nativeH ?? nativeW! / ar;
           final maxW = constraints.maxWidth.isFinite
               ? constraints.maxWidth
-              : nativeW;
-          final w = min(maxW, nativeW);
-          final h = w / ar;
-          return SizedBox(width: w, height: h, child: video);
+              : nativeW ?? sourceH * ar;
+          final h = min(maxW / ar, sourceH);
+          return SizedBox(width: maxW, height: h, child: video);
         },
       );
     }

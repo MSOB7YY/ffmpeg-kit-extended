@@ -423,13 +423,15 @@ def flutter_command(build: Build) -> list[str]:
     if executable is None:
         raise RuntimeError("Flutter was not found on PATH. Add the Flutter SDK bin directory to PATH and rerun this script.")
     target = {"android": "apk"}.get(build.platform, build.platform)
-    command = [executable, "build", target, f"--{build.release_type}"]
+    command = [executable, "build", target, f"--{build.release_type}", "--verbose"]
     if build.platform == "web":
         command.append("--wasm")
     if sys.platform == "win32" and Path(executable).suffix.lower() in {".bat", ".cmd"}:
         command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "call", *command]
     if build.platform == "ios":
         command.append("--simulator")
+        command.remove(f"--{build.release_type}")
+        command.append("--debug")
     return command
 
 
@@ -706,7 +708,11 @@ def main() -> int:
         framework_builds = [build for build in builds if build.framework == framework]
         if not framework_builds:
             continue
-        with tempfile.TemporaryDirectory(prefix=".FKE_example_build_", dir=ROOT / framework) as directory:
+        # Keep nested Flutter native-asset cache paths below Windows MAX_PATH.
+        temporary_parent = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir())
+        if not temporary_parent.is_dir():
+            temporary_parent = Path(tempfile.gettempdir())
+        with tempfile.TemporaryDirectory(prefix="FKE_", dir=temporary_parent) as directory:
             staged = stage_example(framework, Path(directory))
             rn_web_library_built = False
             rn_web_dependencies_installed = (staged / "node_modules").is_dir()

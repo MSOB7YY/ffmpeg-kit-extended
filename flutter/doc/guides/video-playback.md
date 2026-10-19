@@ -4,7 +4,9 @@ Complete guide to implementing video playback using FFmpegKit Extended Flutter.
 
 ## Overview
 
-FFmpegKit Extended provides a unified cross-platform video playback API that works seamlessly across Android, Linux, and Windows. The `FFplaySurface` class handles platform-specific differences while providing a consistent Dart API.
+FFmpegKit Extended provides a unified cross-platform video playback API across
+Android, iOS, macOS, Linux, Windows, and Web/Wasm. The `FFplaySurface` class
+handles platform-specific differences while providing a consistent Dart API.
 
 ## Platform Implementation Details
 
@@ -13,10 +15,18 @@ FFmpegKit Extended provides a unified cross-platform video playback API that wor
 - Leverages SDL2's Android backend for hardware-accelerated output
 - Method channel for surface lifecycle management
 
-### Linux & Windows  
+### iOS & macOS
+- Uses Apple Flutter textures backed by `CVPixelBuffer`
+- The shared surface exposes `toWidget()`; Apple texture details remain native
+
+### Linux & Windows
 - Uses pixel buffer textures with Flutter's texture system
 - Frame callbacks deliver RGBA8888 pixels from FFplay decoder
 - Double-buffered rendering for smooth playback
+
+### Web/Wasm
+- Copies generation-tracked RGBA8888 frames from Wasm memory
+- Renders the copied frames with Flutter `RawImage` through `toWidget()`
 
 ### Audio-only Content
 - Surface creation is safe for audio-only files
@@ -440,7 +450,8 @@ When in fullscreen:
 ### Common Issues
 
 **Surface creation fails**
-- Check platform support (iOS/macOS not supported)
+- Check that the selected platform runtime and FFplay surface implementation
+  are available
 - Verify native libraries are properly loaded
 - Ensure `FFmpegKitExtended.initialize()` completed
 
@@ -483,3 +494,17 @@ void _debugPlaybackState() {
 ## Complete Example
 
 See the `flutter/example/` directory for a complete working video player implementation that demonstrates all features discussed in this guide.
+
+### FFplayKit lifecycle
+
+`FFplayKit.executeAsync` returns the live session after native startup handoff,
+without waiting for full playback. The global `currentSession` remains set until the tracked execution Future settles,
+including startup and transport failures. `FFplayKit.start` starts a Created
+global session or resumes a paused session; it does not submit an already
+executing or terminal session again.
+`FFplaySession.cancel()` records the cancellation request before stopping
+playback. If stopping fails, the request remains visible through
+`isCancelled`; queued or pre-start sessions skip the playback stop call.
+The global `currentSession` is cleared after a successful cancel or close only
+for an untracked session. A tracked execution remains current until its
+execution Future settles, including a failed close attempt.

@@ -11,6 +11,26 @@ The `FFprobeKit` class provides a convenient interface for extracting media info
 - Execute custom FFprobe commands
 - Get chapter and metadata information
 
+### Execution contract
+
+The synchronous `execute` and `getMediaInformation` methods block until
+FFprobe has finished and cleanup has completed. Their returned sessions can be
+inspected immediately; no `SessionQueueManager().waitForAll()` call is needed
+for their own result. Use the asynchronous methods for long work on the
+Flutter UI isolate. Those Future-based methods are managed by
+`SessionQueueManager` and honor its concurrency limit.
+
+#### Web support
+
+| API | Local and MEMFS input | Direct HTTP or HLS input |
+|---|---|---|
+| `FFprobeKit.execute` (sync) | Supported | Rejected with `UnsupportedError` before any native call: use `executeAsync` |
+| `FFprobeKit.getMediaInformation` (sync) | Supported | Rejected with `UnsupportedError` before any native call: use `getMediaInformationAsync` |
+| `FFprobeKit.executeAsync` and `getMediaInformationAsync` | Supported | Supported (direct HTTPS and HLS through the Web bridge) |
+
+Indirect network opens, such as a local playlist that references remote
+segments, fail with `EPERM` in the session state and logs on Web.
+
 ## Class Methods
 
 ### getMediaInformation
@@ -123,6 +143,7 @@ Executes a custom FFprobe command asynchronously.
 static Future<FFprobeSession> executeAsync(
   String command, {
   FFprobeSessionCompleteCallback? onComplete,
+  FFmpegLogCallback? onLog,
 })
 ```
 
@@ -130,6 +151,7 @@ static Future<FFprobeSession> executeAsync(
 
 - `command` (String): The FFprobe command to execute
 - `onComplete` (FFprobeSessionCompleteCallback?, optional): Callback invoked when complete
+- `onLog` (FFmpegLogCallback?, optional): Callback for native log messages
 
 **Returns:**
 
@@ -143,6 +165,7 @@ await FFprobeKit.executeAsync(
   onComplete: (session) {
     print('Output: ${session.getOutput()}');
   },
+  onLog: (log) => print(log.message),
 );
 ```
 
@@ -178,6 +201,7 @@ Creates a new FFprobe session without executing it.
 static FFprobeSession createSession(
   String command, {
   FFprobeSessionCompleteCallback? onComplete,
+  FFmpegLogCallback? onLog,
 })
 ```
 
@@ -185,6 +209,7 @@ static FFprobeSession createSession(
 
 - `command` (String): The FFprobe command for the session
 - `onComplete` (FFprobeSessionCompleteCallback?, optional): Completion callback
+- `onLog` (FFmpegLogCallback?, optional): Callback for native log messages
 
 **Returns:**
 
@@ -204,7 +229,10 @@ final session = FFprobeKit.createSession(
 
 ### getFFprobeSessions
 
-Returns all active FFprobe sessions.
+Returns all retained FFprobe sessions in session history. Inspect
+`session.getState()` when you need to filter the history for Running or
+terminal sessions; active asynchronous executions are available from
+`SessionQueueManager().activeSessions`.
 
 ```dart
 static List<FFprobeSession> getFFprobeSessions()
@@ -212,13 +240,13 @@ static List<FFprobeSession> getFFprobeSessions()
 
 **Returns:**
 
-- `List<FFprobeSession>`: A list of all active FFprobe sessions
+- `List<FFprobeSession>`: A list of retained FFprobe sessions in creation order
 
 **Example:**
 
 ```dart
 final sessions = FFprobeKit.getFFprobeSessions();
-print('Active FFprobe sessions: ${sessions.length}');
+print('Retained FFprobe sessions: ${sessions.length}');
 ```
 
 ## Callback Types

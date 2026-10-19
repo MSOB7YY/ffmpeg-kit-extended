@@ -13,6 +13,27 @@ The `FFmpegKit` class provides a convenient interface for executing FFmpeg comma
 - Manage and track FFmpeg sessions
 - Cancel running operations
 
+### Execution contract
+
+`execute` is blocking and returns a terminal session after the command and
+cleanup finish. Inspect its output, logs, and return code immediately; it does
+not require `SessionQueueManager().waitForAll()`. Avoid long synchronous work
+on the Flutter UI isolate. `executeAsync` returns a `Future`, is managed by
+`SessionQueueManager`, and honors its concurrency limit.
+
+#### Web support
+
+| API | Local and MEMFS input | Direct HTTP or HLS input |
+|---|---|---|
+| `FFmpegKit.execute` (sync) | Supported | Rejected with `UnsupportedError` before any native call: use `executeAsync` |
+| `FFmpegKit.executeAsync` | Supported | Supported (direct HTTPS and HLS through the Web bridge) |
+
+A playlist or concat list on local storage that references remote URLs cannot
+be seen before execution. Those indirect network opens fail with `EPERM` in the
+session state and logs. The synchronous call is blocking, and on Web it runs on
+the browser main thread, where network reads cannot complete, so network input
+belongs to `executeAsync`.
+
 ## Class Methods
 
 ### execute
@@ -137,9 +158,33 @@ final session = FFmpegKit.createSession('-i input.mp4 output.mp4');
 
 ---
 
+### FFmpegKit.createSessionFromArguments
+
+Creates a new FFmpeg session from an already tokenized argument list. Use this
+when the caller already owns argument boundaries; do not manually join and
+reparse the tokens through a command string.
+
+```dart
+static FFmpegSession createSessionFromArguments(List<String> arguments)
+```
+
+**Example:**
+
+```dart
+final session = FFmpegKit.createSessionFromArguments([
+  '-i',
+  'input file.mp4',
+  '-c:v',
+  'copy',
+  'output.mp4',
+]);
+```
+
+---
+
 ### getLastFFmpegSession
 
-Returns the most recently executed FFmpeg session.
+Returns the most recently created FFmpeg session retained in session history.
 
 ```dart
 static FFmpegSession? getLastFFmpegSession()
@@ -147,7 +192,7 @@ static FFmpegSession? getLastFFmpegSession()
 
 **Returns:**
 
-- `FFmpegSession?`: The last session, or null if no sessions have been executed
+- `FFmpegSession?`: The most recently created retained session, or null when history is empty
 
 **Example:**
 
@@ -163,7 +208,10 @@ if (lastSession != null) {
 
 ### getFFmpegSessions
 
-Returns all active FFmpeg sessions.
+Returns all retained FFmpeg sessions in session history. These results may
+include Created, Running, Completed, or Failed sessions; inspect
+`session.getState()` when filtering by lifecycle state. For currently active
+asynchronous executions, use `SessionQueueManager().activeSessions`.
 
 ```dart
 static List<FFmpegSession> getFFmpegSessions()
@@ -171,13 +219,13 @@ static List<FFmpegSession> getFFmpegSessions()
 
 **Returns:**
 
-- `List<FFmpegSession>`: A list of all active sessions
+- `List<FFmpegSession>`: A list of retained sessions in creation order
 
 **Example:**
 
 ```dart
 final sessions = FFmpegKit.getFFmpegSessions();
-print('Active sessions: ${sessions.length}');
+print('Retained FFmpeg sessions: ${sessions.length}');
 
 for (final session in sessions) {
   print('Session ${session.getSessionId()}: ${session.getState()}');

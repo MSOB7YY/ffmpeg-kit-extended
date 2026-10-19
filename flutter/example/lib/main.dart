@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:path/path.dart' as path;
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:ffmpeg_kit_extended_flutter/ffmpeg_kit_extended_flutter.dart';
@@ -8,14 +11,146 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:android_media_store/android_media_store.dart';
 import 'package:path_provider/path_provider.dart'; // Import for getTemporaryDirectory
 import 'package:window_manager/window_manager.dart';
+import 'package:marionette_flutter/marionette_flutter.dart';
+import 'web_download_stub.dart'
+    if (dart.library.js_interop) 'web_download.dart'
+    as web_download;
+import 'platform_flags.dart' as platform;
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
-    await windowManager.ensureInitialized();
+const _ffplayFrameSource =
+    'color=c=red:size=512x512:rate=30:duration=2[red];'
+    'color=c=green:size=512x512:rate=30:duration=2[green];'
+    'color=c=blue:size=512x512:rate=30:duration=2[blue];'
+    'color=c=white:size=512x512:rate=30:duration=2[white];'
+    '[red][green][blue][white]concat=n=4:v=1:a=0';
+
+const _ffplayFramePhases = <({String name, double atSeconds, List<int> rgba})>[
+  (name: 'red phase', atSeconds: 0.5, rgba: [253, 0, 0, 255]),
+  (name: 'green phase', atSeconds: 2.5, rgba: [0, 127, 0, 255]),
+  (name: 'blue phase', atSeconds: 4.5, rgba: [0, 0, 254, 255]),
+  (name: 'white phase', atSeconds: 6.5, rgba: [255, 255, 255, 255]),
+];
+
+/// ABI of the Phase 2 Web bundle that supports direct HTTP(S) input.
+const _ffplayFrameWidth = 512;
+const _ffplayFrameHeight = 512;
+const _ffplayFrameRgbaTolerance = 32;
+
+class WebMediaOperationLeaseManager {
+  int activeCount = 0;
+
+  void Function() begin(void Function() onTerminalSignal) {
+    activeCount++;
+    var released = false;
+    return () {
+      if (!released) {
+        released = true;
+        activeCount--;
+      }
+      onTerminalSignal();
+    };
   }
-  await FFmpegKitExtended.initialize();
-  runApp(const MyApp());
+}
+
+void main() {
+  if (kDebugMode) {
+    MarionetteBinding.ensureInitialized();
+  } else {
+    WidgetsFlutterBinding.ensureInitialized();
+  }
+  runApp(const _BootstrapApp());
+}
+
+class _BootstrapApp extends StatefulWidget {
+  const _BootstrapApp();
+
+  @override
+  State<_BootstrapApp> createState() => _BootstrapAppState();
+}
+
+class _BootstrapAppState extends State<_BootstrapApp> {
+  late Future<void> _initialization;
+
+  @override
+  void initState() {
+    super.initState();
+    _initialization = _initialize();
+  }
+
+  Future<void> _initialize() async {
+    if (platform.isDesktop) {
+      await windowManager.ensureInitialized();
+    }
+    await FFmpegKitExtended.initialize();
+  }
+
+  void _retry() {
+    setState(() {
+      _initialization = _initialize();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<void>(
+      future: _initialization,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.done &&
+            !snapshot.hasError) {
+          return const MyApp();
+        }
+
+        return MaterialApp(
+          title: 'FFmpeg Kit Extended Demo',
+          theme: ThemeData.dark(useMaterial3: true),
+          home: Scaffold(
+            body: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 640),
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: snapshot.hasError
+                      ? Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.error_outline, size: 48),
+                            const SizedBox(height: 16),
+                            const Text(
+                              'Unable to initialize FFmpeg Kit',
+                              style: TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            SelectableText(
+                              '${snapshot.error}',
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(height: 20),
+                            FilledButton.icon(
+                              onPressed: _retry,
+                              icon: const Icon(Icons.refresh),
+                              label: const Text('Retry'),
+                            ),
+                          ],
+                        )
+                      : const Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            CircularProgressIndicator(),
+                            SizedBox(height: 20),
+                            Text('Loading FFmpeg Kit...'),
+                          ],
+                        ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -61,7 +196,7 @@ class _HomePageState extends State<HomePage>
   final TextEditingController _outputController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final TextEditingController _ffmpegCommandController = TextEditingController(
-    text: "-version",
+    text: "-nostdin -version",
   );
   final TextEditingController _ffprobeCommandController = TextEditingController(
     text: "-version",
@@ -74,6 +209,11 @@ class _HomePageState extends State<HomePage>
         text: "https://endpnt.com/hls/nasa4k/playlist.m3u8",
       );
   String? _selectedProbePath;
+  String? _selectedWebMediaPath;
+  final Set<String> _retiredWebMediaPaths = <String>{};
+  final WebMediaOperationLeaseManager _customWebMediaOperations =
+      WebMediaOperationLeaseManager();
+  final Set<String> _webDownloadableFiles = <String>{};
   String _status = 'Ready';
   final _mediaStore = AndroidMediaStore.instance;
   StreamSubscription<bool>? _permissionStreamSub;
@@ -124,6 +264,7 @@ class _HomePageState extends State<HomePage>
     _outputLogFlushTimer?.cancel();
     _remoteScenarioFileFlushTimer?.cancel();
     _remoteStreamUrlController.dispose();
+    _webRemoteUrlController.dispose();
     _surface?.release();
     _fsController.dispose();
     super.dispose();
@@ -133,19 +274,19 @@ class _HomePageState extends State<HomePage>
   void initState() {
     super.initState();
     _fsController = FFplayViewController(
-      onEnterFullscreen:
-          (Platform.isWindows || Platform.isLinux || Platform.isMacOS)
+      onEnterFullscreen: platform.isDesktop
           ? () => windowManager.setFullScreen(true)
           : null,
-      onExitFullscreen:
-          (Platform.isWindows || Platform.isLinux || Platform.isMacOS)
+      onExitFullscreen: platform.isDesktop
           ? () => windowManager.setFullScreen(false)
           : null,
     );
     _initializePlugin();
-    _currentLogLevel = FFmpegKitConfig.getLogLevel();
+    _currentLogLevel = FFmpegKitExtended.initialized
+        ? FFmpegKitConfig.getLogLevel()
+        : LogLevel.info;
     final tabController = TabController(length: 5, vsync: this);
-    if (Platform.isAndroid) {
+    if (platform.isAndroid) {
       // Listen for MANAGE_MEDIA permission changes.
       _permissionStreamSub = _mediaStore.onManageMediaPermissionChanged.listen((
         isGranted,
@@ -167,7 +308,7 @@ class _HomePageState extends State<HomePage>
   }
 
   Future<void> _initializePlugin() async {
-    if (!Platform.isAndroid) return;
+    if (!platform.isAndroid) return;
     try {
       await AndroidMediaStore.ensureInitialized();
       setState(() {
@@ -184,7 +325,7 @@ class _HomePageState extends State<HomePage>
   }
 
   Future<void> _checkPermissions({bool silent = false}) async {
-    if (!Platform.isAndroid) return;
+    if (!platform.isAndroid) return;
     if (!silent) {
       setState(() {
         _status = 'Checking permissions...';
@@ -226,7 +367,7 @@ class _HomePageState extends State<HomePage>
 
   void _addLog(String log, {bool printToConsole = false}) {
     if (printToConsole) {
-      print(log);
+      debugPrint(log);
     }
     _pendingOutputLogs += "$log\n";
     _outputLogFlushTimer ??= Timer(
@@ -309,7 +450,7 @@ class _HomePageState extends State<HomePage>
 
     // Async execution captures logs in real-time.
     await FFmpegKit.executeAsync(
-      "-version",
+      "-nostdin -version",
       onLog: (log) {
         _addLog(log.message);
       },
@@ -321,23 +462,120 @@ class _HomePageState extends State<HomePage>
 
   void _runFFmpegInfoSync() {
     _addLog("--- Running FFmpeg -version (Sync) ---", printToConsole: true);
-    // Synchronous execution blocks the current isolate.
-    final session = FFmpegKit.execute("-version");
-    final output = session.getOutput();
+    try {
+      // Synchronous execution blocks the current isolate.
+      final session = FFmpegKit.execute("-nostdin -version");
+      final output = session.getOutput();
 
-    _addLog("Output captured from sync session:");
-    _addLog(output ?? "No output captured.");
-    _addLog("Return code: ${session.getReturnCode()}");
+      _addLog("Output captured from sync session:");
+      _addLog(output ?? "No output captured.");
+      _addLog("Return code: ${session.getReturnCode()}");
+    } catch (error, stackTrace) {
+      _addLog(
+        "FFmpeg sync execution failed: $error\n$stackTrace",
+        printToConsole: true,
+      );
+    }
   }
 
-  Future<void> _generateTestVideo() async {
-    // Use temporary directory for FFmpeg output.
+  Future<String> _exampleDirectoryPath() async {
+    if (kIsWeb) {
+      // Web FFmpeg uses Emscripten's temporary in-memory filesystem. Keep all
+      // demo and imported media under the same flat /tmp/ namespace.
+      return '/tmp';
+    }
+
     final tempDir = await getTemporaryDirectory();
     final exampleDir = Directory(
       path.join(tempDir.path, 'ffmpeg_kit_extended_flutter_example'),
     );
     await exampleDir.create(recursive: true);
-    final tempOutputPath = path.join(exampleDir.path, 'test_video.mp4');
+    return exampleDir.path;
+  }
+
+  bool _exampleFileExists(String filePath) =>
+      kIsWeb ? FFmpegKitWebFiles.exists(filePath) : File(filePath).existsSync();
+
+  String _importWebMedia(String fileName, Uint8List bytes) {
+    final baseName = fileName.replaceAll('\\', '/').split('/').last;
+    final safeName = baseName.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final suffix = safeName.isEmpty ? 'media.bin' : safeName;
+    var unique = DateTime.now().microsecondsSinceEpoch;
+    var virtualPath = '/tmp/ffmpeg-kit-import-$unique-$suffix';
+    while (FFmpegKitWebFiles.exists(virtualPath)) {
+      unique++;
+      virtualPath = '/tmp/ffmpeg-kit-import-$unique-$suffix';
+    }
+    FFmpegKitWebFiles.writeFile(virtualPath, bytes);
+    return virtualPath;
+  }
+
+  bool _webMediaPathIsInUse(String filePath) =>
+      FFmpegKitExtended.listSessions().any((session) {
+        final state = session.getState();
+        return (state == SessionState.created ||
+                state == SessionState.running) &&
+            session.getCommand().contains(filePath);
+      });
+
+  void _retireWebMediaPath(String filePath) {
+    if (!kIsWeb) return;
+    _retiredWebMediaPaths.add(filePath);
+    _cleanupRetiredWebMediaPaths();
+  }
+
+  void _cleanupRetiredWebMediaPaths() {
+    if (!kIsWeb ||
+        _retiredWebMediaPaths.isEmpty ||
+        _customWebMediaOperations.activeCount > 0) {
+      return;
+    }
+    for (final filePath in _retiredWebMediaPaths.toList()) {
+      if (_webMediaPathIsInUse(filePath)) continue;
+      try {
+        if (FFmpegKitWebFiles.exists(filePath)) {
+          FFmpegKitWebFiles.deleteFile(filePath);
+        }
+        _retiredWebMediaPaths.remove(filePath);
+      } catch (error) {
+        _addLog('Unable to remove retired Web media $filePath: $error');
+      }
+    }
+  }
+
+  void Function() _beginCustomWebMediaOperation() {
+    if (!kIsWeb) return () {};
+    return _customWebMediaOperations.begin(_cleanupRetiredWebMediaPaths);
+  }
+
+  Future<void> _downloadWebFile(String filePath) async {
+    if (!kIsWeb) return;
+    try {
+      if (!FFmpegKitWebFiles.exists(filePath)) {
+        throw StateError('No Wasm file exists at $filePath.');
+      }
+      final fileName = path.basename(filePath);
+      final extension = path.extension(fileName).toLowerCase();
+      final mimeType = switch (extension) {
+        '.mp4' => 'video/mp4',
+        '.wav' => 'audio/wav',
+        '.avi' => 'video/x-msvideo',
+        _ => 'application/octet-stream',
+      };
+      web_download.downloadBytes(
+        fileName,
+        FFmpegKitWebFiles.readFile(filePath),
+        mimeType,
+      );
+      _addLog('Browser download requested for $fileName.');
+    } catch (error) {
+      _addLog('Web file download failed for $filePath: $error');
+    }
+  }
+
+  Future<void> _generateTestVideo() async {
+    final exampleDirPath = await _exampleDirectoryPath();
+    final tempOutputPath = path.join(exampleDirPath, 'test_video.mp4');
     _addLog(
       "--- Generating Test Video with Audio to temporary path: $tempOutputPath ---",
       printToConsole: true,
@@ -345,7 +583,12 @@ class _HomePageState extends State<HomePage>
 
     // Command with both video and audio streams
     final command =
-        "-hide_banner -loglevel ${_currentLogLevel.name} -f lavfi -i testsrc=duration=5:size=512x512:rate=30 -f lavfi -i sine=frequency=1000:duration=5 -c:v mpeg2video -c:a aac -shortest -y";
+        // "-hide_banner -nostdin -loglevel ${_currentLogLevel.name} -f lavfi -i testsrc=duration=5:size=512x512:rate=30 -f lavfi -i sine=frequency=1000:duration=5 -c:v mpeg2video -c:a aac -shortest -y";
+        "-hide_banner -nostdin -loglevel ${_currentLogLevel.name} -f lavfi -i \"$_ffplayFrameSource\" -f lavfi -i sine=frequency=1000:duration=8 -c:v mpeg2video -c:a aac -shortest -y";
+
+    if (kIsWeb) {
+      setState(() => _webDownloadableFiles.remove(tempOutputPath));
+    }
 
     await FFmpegKit.executeAsync(
       "$command \"$tempOutputPath\"",
@@ -354,21 +597,131 @@ class _HomePageState extends State<HomePage>
       },
       onComplete: (session) {
         if (ReturnCode.isSuccess(session.getReturnCode())) {
+          if (kIsWeb && mounted) {
+            setState(() => _webDownloadableFiles.add(tempOutputPath));
+          }
           _addLog("✅ Video with audio generated successfully!");
         } else {
           _addLog("❌ Generation failed. Code: ${session.getReturnCode()}");
         }
       },
     );
+    if (!kIsWeb) {
+      await _verifyGeneratedVideoPixels(tempOutputPath);
+    }
+  }
+
+  Future<List<int>> _decodeFrameRgba({
+    required String inputArguments,
+    required String outputPath,
+    required String label,
+  }) async {
+    final outputFile = File(outputPath);
+    if (await outputFile.exists()) {
+      await outputFile.delete();
+    }
+    final session = await FFmpegKit.executeAsync(
+      '-hide_banner -loglevel info $inputArguments '
+      '-frames:v 1 -pix_fmt rgba -f rawvideo -y "$outputPath"',
+    );
+    if (!ReturnCode.isSuccess(session.getReturnCode())) {
+      throw StateError(
+        '$label frame decode failed: '
+        '${session.getReturnCode()}',
+      );
+    }
+    if (!await outputFile.exists()) {
+      throw StateError('$label frame decode did not produce $outputPath');
+    }
+    final bytes = await outputFile.readAsBytes();
+    final expectedLength = _ffplayFrameWidth * _ffplayFrameHeight * 4;
+    if (bytes.length < expectedLength) {
+      throw StateError(
+        '$label frame decode produced ${bytes.length} bytes; '
+        'expected at least $expectedLength',
+      );
+    }
+    return bytes;
+  }
+
+  Future<void> _verifyGeneratedVideoPixels(String videoPath) async {
+    _addLog(
+      '--- Verifying decoded video frame pixels against original input ---',
+    );
+    final directory = path.dirname(videoPath);
+    final originalFramePath = path.join(
+      directory,
+      '.ffplay-original-frame.rgba',
+    );
+    final outputFramePath = path.join(directory, '.ffplay-output-frame.rgba');
+    try {
+      final originalSignatures = <String>{};
+      final outputSignatures = <String>{};
+      for (final phase in _ffplayFramePhases) {
+        final originalFrame = await _decodeFrameRgba(
+          inputArguments:
+              '-f lavfi -i "$_ffplayFrameSource" -ss ${phase.atSeconds}',
+          outputPath: originalFramePath,
+          label: 'Original input at ${phase.atSeconds}s',
+        );
+        final outputFrame = await _decodeFrameRgba(
+          inputArguments: '-ss ${phase.atSeconds} -i "$videoPath"',
+          outputPath: outputFramePath,
+          label: 'Final output at ${phase.atSeconds}s',
+        );
+        final offset =
+            ((_ffplayFrameHeight ~/ 2) * _ffplayFrameWidth +
+                (_ffplayFrameWidth ~/ 2)) *
+            4;
+        final originalPixel = originalFrame.sublist(offset, offset + 4);
+        final outputPixel = outputFrame.sublist(offset, offset + 4);
+        if (originalPixel.asMap().entries.any(
+          (entry) =>
+              (entry.value - phase.rgba[entry.key]).abs() >
+              _ffplayFrameRgbaTolerance,
+        )) {
+          throw StateError(
+            'Original input pixel mismatch for ${phase.name}: '
+            'expected RGBA=${phase.rgba}, actual=$originalPixel',
+          );
+        }
+        if (outputPixel.asMap().entries.any(
+          (entry) =>
+              (entry.value - originalPixel[entry.key]).abs() >
+              _ffplayFrameRgbaTolerance,
+        )) {
+          throw StateError(
+            'Final output frame differs from original input for ${phase.name}: '
+            'original RGBA=$originalPixel, final RGBA=$outputPixel',
+          );
+        }
+        originalSignatures.add(originalPixel.join(','));
+        outputSignatures.add(outputPixel.join(','));
+        _addLog(
+          'Verified ${phase.name} at ${phase.atSeconds}s: '
+          'original RGBA=${originalPixel.join(',')}, '
+          'final RGBA=${outputPixel.join(',')}',
+        );
+      }
+      if (originalSignatures.length != _ffplayFramePhases.length ||
+          outputSignatures.length != _ffplayFramePhases.length) {
+        throw StateError(
+          'Generated video did not change pixel values across all four '
+          'playback phases',
+        );
+      }
+    } finally {
+      for (final file in [File(originalFramePath), File(outputFramePath)]) {
+        if (await file.exists()) {
+          await file.delete();
+        }
+      }
+    }
   }
 
   Future<void> _generateTestAudio() async {
-    final tempDir = await getTemporaryDirectory();
-    final exampleDir = Directory(
-      path.join(tempDir.path, 'ffmpeg_kit_extended_flutter_example'),
-    );
-    await exampleDir.create(recursive: true);
-    final outputPath = path.join(exampleDir.path, 'test_audio.wav');
+    final exampleDirPath = await _exampleDirectoryPath();
+    final outputPath = path.join(exampleDirPath, 'test_audio.wav');
     _addLog(
       "--- Generating Test Audio to: $outputPath ---",
       printToConsole: true,
@@ -376,7 +729,11 @@ class _HomePageState extends State<HomePage>
 
     // Command from integration tests
     final command =
-        "-hide_banner -loglevel ${_currentLogLevel.name} -f lavfi -i sine=frequency=1000:duration=10 -y";
+        "-hide_banner -nostdin -loglevel ${_currentLogLevel.name} -f lavfi -i sine=frequency=1000:duration=10 -y";
+
+    if (kIsWeb) {
+      setState(() => _webDownloadableFiles.remove(outputPath));
+    }
 
     await FFmpegKit.executeAsync(
       "$command \"$outputPath\"",
@@ -385,6 +742,9 @@ class _HomePageState extends State<HomePage>
       },
       onComplete: (session) {
         if (ReturnCode.isSuccess(session.getReturnCode())) {
+          if (kIsWeb && mounted) {
+            setState(() => _webDownloadableFiles.add(outputPath));
+          }
           _addLog("✅ Audio generated successfully!");
         } else {
           _addLog("❌ Generation failed. Code: ${session.getReturnCode()}");
@@ -394,10 +754,19 @@ class _HomePageState extends State<HomePage>
   }
 
   Future<void> _pickTranscodeFile() async {
-    final result = await FilePicker.pickFiles(type: FileType.video);
-    if (result.single.path != null) {
-      final pickedPath = result.single.path!;
-      final pickedDir = path.dirname(pickedPath);
+    try {
+      final result = await FilePicker.pickFiles(type: FileType.video);
+      if (result.isEmpty) return;
+      final file = result.single;
+      final previousWebPath = _selectedWebMediaPath;
+      final pickedPath = kIsWeb
+          ? _importWebMedia(file.name, await file.readAsBytes())
+          : file.path;
+      if (pickedPath == null) {
+        _addLog('The selected file did not provide a local path.');
+        return;
+      }
+      final pickedDir = kIsWeb ? '/tmp' : path.dirname(pickedPath);
       final baseName = path.basenameWithoutExtension(pickedPath);
       setState(() {
         _transcodeInputPath = pickedPath;
@@ -405,8 +774,17 @@ class _HomePageState extends State<HomePage>
           pickedDir,
           '${baseName}_transcoded.avi',
         );
+        if (kIsWeb) {
+          _selectedWebMediaPath = pickedPath;
+          _selectedProbePath = pickedPath;
+        }
       });
+      if (kIsWeb && previousWebPath != null && previousWebPath != pickedPath) {
+        _retireWebMediaPath(previousWebPath);
+      }
       _addLog("Selected file: $pickedPath");
+    } catch (error) {
+      _addLog('Unable to import the selected video: $error');
     }
   }
 
@@ -416,37 +794,37 @@ class _HomePageState extends State<HomePage>
       return;
     }
 
-    final tempDir = await getTemporaryDirectory();
-    final exampleDir = Directory(
-      path.join(tempDir.path, 'ffmpeg_kit_extended_flutter_example'),
-    );
-    await exampleDir.create(recursive: true);
+    final exampleDirPath = await _exampleDirectoryPath();
 
     // Use picked file or generate test video
     String inputPath;
     String outputPath;
 
-    if (_transcodeInputPath != null &&
-        File(_transcodeInputPath!).existsSync()) {
-      inputPath = _transcodeInputPath!;
+    final selectedInputPath = kIsWeb
+        ? _selectedWebMediaPath
+        : _transcodeInputPath;
+    if (selectedInputPath != null && _exampleFileExists(selectedInputPath)) {
+      inputPath = selectedInputPath;
       outputPath =
-          _transcodeOutputPath ?? path.join(exampleDir.path, 'test_video.avi');
+          _transcodeOutputPath ?? path.join(exampleDirPath, 'test_video.avi');
     } else {
-      inputPath = path.join(exampleDir.path, 'test_video.mp4');
-      outputPath = path.join(exampleDir.path, 'test_video.avi');
+      inputPath = path.join(exampleDirPath, 'test_video.mp4');
+      outputPath = path.join(exampleDirPath, 'test_video.avi');
 
       // Check if source file exists
-      if (!File(inputPath).existsSync()) {
+      if (!_exampleFileExists(inputPath)) {
         _addLog("⚠️ Source video not found. Generating test video first...");
         await _generateTestVideo();
-        // Wait a bit for generation to complete (simplified approach)
-        await Future.delayed(const Duration(seconds: 6));
       }
 
-      if (!File(inputPath).existsSync()) {
+      if (!_exampleFileExists(inputPath)) {
         _addLog("❌ Failed to generate source video.");
         return;
       }
+    }
+
+    if (kIsWeb) {
+      setState(() => _webDownloadableFiles.remove(outputPath));
     }
 
     setState(() {
@@ -466,7 +844,7 @@ class _HomePageState extends State<HomePage>
         (double.tryParse((mediaInfo?.duration ?? "0")) ?? 0) * 1000;
 
     final command =
-        "-hide_banner -i \"$inputPath\" -c:v mpeg4 -c:a aac -b:v 2M -y \"$outputPath\"";
+        "-hide_banner -nostdin -i \"$inputPath\" -c:v mpeg4 -c:a aac -b:v 2M -y \"$outputPath\"";
 
     final session = FFmpegKit.createSession(command);
     session.setExpectedTranscodingDuration(
@@ -504,6 +882,7 @@ class _HomePageState extends State<HomePage>
             if (ReturnCode.isSuccess(session.getReturnCode())) {
               _transcodeProgress = 1.0;
               _transcodeStatus = '✅ Transcode complete!';
+              if (kIsWeb) _webDownloadableFiles.add(outputPath);
               _addLog("✅ Video transcoded successfully to AVI!");
             } else {
               _transcodeStatus = '❌ Transcode failed.';
@@ -511,6 +890,7 @@ class _HomePageState extends State<HomePage>
             }
           });
         }
+        _cleanupRetiredWebMediaPaths();
       },
     );
   }
@@ -646,7 +1026,7 @@ class _HomePageState extends State<HomePage>
   }
 
   Future<void> _runCustomFFmpeg() async {
-    final command = _ffmpegCommandController.text;
+    final command = _ensureNoStdin(_ffmpegCommandController.text);
     _addLog("--- Running Custom FFmpeg: $command ---", printToConsole: true);
     await FFmpegKit.executeAsync(
       command,
@@ -655,8 +1035,275 @@ class _HomePageState extends State<HomePage>
       },
       onComplete: (session) {
         _addLog("Return code: ${session.getReturnCode()}");
+        _cleanupRetiredWebMediaPaths();
       },
     );
+  }
+
+  // --- Web remote URL: direct HTTP(S) input through the async APIs only ---
+
+  // A ?remoteUrl= query parameter prefills the field on Web (a deep link). It
+  // never starts an operation by itself.
+  final TextEditingController _webRemoteUrlController = TextEditingController(
+    text: kIsWeb && Uri.base.queryParameters['remoteUrl'] != null
+        ? Uri.base.queryParameters['remoteUrl']!
+        : "https://endpnt.com/hls/nasa4k/playlist.m3u8",
+  );
+  String _webRemoteState = "idle";
+  String _webRemoteDetail = "";
+  String? _webRemoteRecordingPath;
+  void Function()? _webRemoteCancelAction;
+  bool _webRemoteCancelRequested = false;
+  int _webRemoteRecordingCounter = 0;
+
+  bool get _webRemoteBusy =>
+      _webRemoteState == "loading" ||
+      _webRemoteState == "playing" ||
+      _webRemoteState == "recording";
+
+  /// Returns a finite validation message, or null when [raw] is a direct URL.
+  String? _validateWebRemoteUrl(String raw) {
+    final url = raw.trim();
+    final uri = Uri.tryParse(url);
+    if (url.isEmpty || uri == null || uri.host.isEmpty) {
+      return "Enter a direct http:// or https:// URL.";
+    }
+    if (uri.scheme != "http" && uri.scheme != "https") {
+      return "Only direct http:// and https:// URLs run on Web. RTMP, RTSP, file and chained schemes such as hls+https:// are not supported.";
+    }
+    if (url.contains('"') || url.contains(RegExp(r"\s"))) {
+      return "The URL must not contain spaces or double quotes.";
+    }
+    return null;
+  }
+
+  /// Maps captured FFmpeg output to a short, honest failure reason.
+  String _diagnoseWebRemoteFailure(String output) {
+    final text = output.toLowerCase();
+    if (text.contains("eperm") ||
+        text.contains("operation not permitted") ||
+        text.contains("pthread")) {
+      return "The Web runtime could not open this network input (EPERM). Check that the URL is a direct media URL. Remote segments listed in a local playlist fail the same way.";
+    }
+    if (text.contains("403")) {
+      return "The server refused the request (HTTP 403).";
+    }
+    if (text.contains("404")) return "The media was not found (HTTP 404).";
+    if (text.contains("cors") ||
+        text.contains("failed to fetch") ||
+        text.contains("cross-origin")) {
+      return "The browser blocked the request (CORS). The server must allow this page's origin and expose Content-Range.";
+    }
+    return "The command failed. See the output below.";
+  }
+
+  void _setWebRemote(String state, [String detail = ""]) {
+    if (!mounted) return;
+    setState(() {
+      _webRemoteState = state;
+      _webRemoteDetail = detail;
+    });
+  }
+
+  /// Keeps a cancel action only while the operation is still running.
+  void _trackWebRemoteAction(void Function() cancel) {
+    if (!_webRemoteBusy) return;
+    if (_webRemoteCancelRequested) {
+      cancel();
+    } else {
+      _webRemoteCancelAction = cancel;
+    }
+  }
+
+  Future<void> _runWebRemoteFFprobe(String command, String label) async {
+    _webRemoteCancelRequested = false;
+    _setWebRemote("loading", label);
+    try {
+      // Register the cancel action before waiting, so Stop works during the probe.
+      final session = FFprobeKit.createSession(command);
+      _trackWebRemoteAction(session.cancel);
+      await session.executeAsync(
+        completeCallback: (completed) {
+          _webRemoteCancelAction = null;
+          final output = completed.getOutput() ?? "";
+          if (_webRemoteCancelRequested) {
+            _setWebRemote("cancelled", "Probe cancelled.");
+          } else if (completed.getReturnCode() == 0) {
+            _setWebRemote("completed", output);
+          } else {
+            _setWebRemote(
+              "failed",
+              "${_diagnoseWebRemoteFailure(output)}\n\n$output",
+            );
+          }
+        },
+      );
+    } catch (error) {
+      _webRemoteCancelAction = null;
+      _setWebRemote("failed", "$error");
+    }
+  }
+
+  Future<void> _runWebRemoteProbe() async {
+    final url = _webRemoteUrlController.text.trim();
+    final invalid = _validateWebRemoteUrl(url);
+    if (invalid != null) {
+      _setWebRemote("failed", invalid);
+      return;
+    }
+    await _runWebRemoteFFprobe(
+      '-hide_banner -v error -show_format -show_streams -of json "$url"',
+      "Probing $url",
+    );
+  }
+
+  Future<void> _runWebRemotePlay() async {
+    final url = _webRemoteUrlController.text.trim();
+    final invalid = _validateWebRemoteUrl(url);
+    if (invalid != null) {
+      _setWebRemote("failed", invalid);
+      return;
+    }
+    _webRemoteCancelRequested = false;
+    _setWebRemote("loading", "Starting playback of $url");
+    try {
+      await _prepareSurface();
+      final surface = await FFplaySurface.create();
+      if (surface != null && mounted) {
+        setState(() => _surface = surface);
+      }
+      final session = await FFplayKit.executeAsync(
+        '-hide_banner -loglevel info -i "$url"',
+        onComplete: (session) {
+          _webRemoteCancelAction = null;
+          final output = session.getOutput() ?? "";
+          if (_webRemoteCancelRequested) {
+            _setWebRemote("cancelled", "Playback stopped.");
+          } else if (session.getReturnCode() == 0) {
+            _setWebRemote(
+              "completed",
+              "Playback reached the end of the media.",
+            );
+          } else {
+            _setWebRemote(
+              "failed",
+              "${_diagnoseWebRemoteFailure(output)}\n\n$output",
+            );
+          }
+        },
+      );
+      _attachPositionStream(session);
+      if (_webRemoteState == "loading" && !_webRemoteCancelRequested) {
+        _setWebRemote(
+          "playing",
+          "Playing $url. Video renders in the FFplay tab.",
+        );
+      }
+      _trackWebRemoteAction(session.stop);
+    } catch (error) {
+      _webRemoteCancelAction = null;
+      _setWebRemote("failed", "$error");
+    }
+  }
+
+  Future<void> _runWebRemoteRecord() async {
+    final url = _webRemoteUrlController.text.trim();
+    final invalid = _validateWebRemoteUrl(url);
+    if (invalid != null) {
+      _setWebRemote("failed", invalid);
+      return;
+    }
+    _webRemoteRecordingCounter++;
+    final previousPath = _webRemoteRecordingPath;
+    if (previousPath != null && FFmpegKitWebFiles.exists(previousPath)) {
+      FFmpegKitWebFiles.deleteFile(previousPath);
+    }
+    // Recordings live in the Wasm MEMFS until the user downloads them.
+    final outputPath =
+        "/tmp/web-remote-recording-$_webRemoteRecordingCounter.mkv";
+    if (FFmpegKitWebFiles.exists(outputPath)) {
+      FFmpegKitWebFiles.deleteFile(outputPath);
+    }
+    _webRemoteRecordingPath = null;
+    _webRemoteCancelRequested = false;
+    _setWebRemote("recording", "Recording 15 seconds to $outputPath");
+    try {
+      // Register the cancel action before waiting, so Stop works during the recording.
+      final session = FFmpegKit.createSession(
+        '-hide_banner -nostdin -y -t 15 -i "$url" '
+        '-map 0:v:0 -map 0:a:0? -c copy -f matroska "$outputPath"',
+      );
+      _trackWebRemoteAction(session.cancel);
+      await session.executeAsync(
+        statisticsCallback: (statistics) {
+          if (_webRemoteCancelRequested) return;
+          final elapsed = (statistics.time / 1000).clamp(0, 15).toDouble();
+          final percent =
+              statistics.transcodingProgressPercent ??
+              (elapsed / 15 * 100).round().clamp(0, 100);
+          _setWebRemote(
+            "recording",
+            "Recording: $percent% · ${statistics.size} bytes · "
+                "${elapsed.toStringAsFixed(1)} / 15 s",
+          );
+        },
+        completeCallback: (completed) {
+          _webRemoteCancelAction = null;
+          final output = completed.getOutput() ?? "";
+          if (_webRemoteCancelRequested) {
+            if (FFmpegKitWebFiles.exists(outputPath)) {
+              FFmpegKitWebFiles.deleteFile(outputPath);
+            }
+            _setWebRemote("cancelled", "Recording cancelled.");
+            return;
+          }
+          final bytes = FFmpegKitWebFiles.exists(outputPath)
+              ? FFmpegKitWebFiles.readFile(outputPath).length
+              : 0;
+          if (completed.getReturnCode() == 0 && bytes > 0) {
+            _webRemoteRecordingPath = outputPath;
+            _setWebRemote(
+              "completed",
+              "Recorded $bytes bytes to $outputPath. Probe or download it.",
+            );
+          } else {
+            if (FFmpegKitWebFiles.exists(outputPath)) {
+              FFmpegKitWebFiles.deleteFile(outputPath);
+            }
+            _setWebRemote(
+              "failed",
+              "${_diagnoseWebRemoteFailure(output)}\n\n$output",
+            );
+          }
+        },
+      );
+    } catch (error) {
+      _webRemoteCancelAction = null;
+      if (FFmpegKitWebFiles.exists(outputPath)) {
+        FFmpegKitWebFiles.deleteFile(outputPath);
+      }
+      _setWebRemote("failed", "$error");
+    }
+  }
+
+  /// Cancels the running Web remote operation once.
+  void _cancelWebRemote() {
+    if (!_webRemoteBusy || _webRemoteCancelRequested) return;
+    final cancel = _webRemoteCancelAction;
+    _webRemoteCancelAction = null;
+    _webRemoteCancelRequested = true;
+    try {
+      cancel?.call();
+    } catch (error) {
+      _addLog("Web remote cancel failed: $error");
+    }
+    // Completion owns the terminal state; another operation cannot start yet.
+    if (_webRemoteBusy) {
+      _setWebRemote(
+        _webRemoteState,
+        "Cancellation requested; waiting for completion.",
+      );
+    }
   }
 
   Future<void> _runRemoteRecordingScenario() async {
@@ -845,10 +1492,46 @@ class _HomePageState extends State<HomePage>
   }
 
   String _normalizeFfmpegPath(String input) {
-    if (Platform.isWindows) {
+    if (platform.isWindows) {
       return input.replaceAll('\\', '/');
     }
     return input;
+  }
+
+  String _commandWithInputFile(String command, String filePath) {
+    final inputPattern = RegExp(
+      r"""(^|\s)-i(?=\s|$)(?:\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+))?""",
+    );
+    final quotedPath = '"$filePath"';
+    final match = inputPattern.firstMatch(command);
+    if (match != null) {
+      return command.replaceRange(
+        match.start,
+        match.end,
+        '${match.group(1)}-i $quotedPath',
+      );
+    }
+
+    final appendBase = command
+        .replaceFirst(RegExp(r'(^|\s)-version(?=\s|$)'), '')
+        .trim();
+    final prefix = appendBase.isEmpty ? '' : '$appendBase ';
+    return '$prefix-i $quotedPath';
+  }
+
+  String _ensureNoStdin(String command) {
+    final trimmed = command.trim();
+    if (RegExp(r'(^|\s)-nostdin(?:\s|$)').hasMatch(trimmed)) {
+      return trimmed;
+    }
+    return '-nostdin $trimmed';
+  }
+
+  String _removeNoStdin(String command) {
+    return command
+        .replaceAll(RegExp(r'(^|\s)-nostdin(?=\s|$)'), ' ')
+        .trim()
+        .replaceAll(RegExp(r'\s+'), ' ');
   }
 
   // --- FFprobe Examples ---
@@ -877,29 +1560,83 @@ class _HomePageState extends State<HomePage>
   }
 
   Future<void> _pickProbeFile() async {
-    final result = await FilePicker.pickFiles();
-    if (result.single.path != null) {
+    try {
+      final result = await FilePicker.pickFiles();
+      if (result.isEmpty) return;
+      final file = result.single;
+      final previousWebPath = _selectedWebMediaPath;
+      final pickedPath = kIsWeb
+          ? _importWebMedia(file.name, await file.readAsBytes())
+          : file.path;
+      if (pickedPath == null) {
+        _addLog('The selected file did not provide a local path.');
+        return;
+      }
       setState(() {
-        _selectedProbePath = result.single.path;
+        _selectedProbePath = pickedPath;
+        if (kIsWeb) {
+          _selectedWebMediaPath = pickedPath;
+          _transcodeInputPath = pickedPath;
+          _transcodeOutputPath = path.join(
+            '/tmp',
+            '${path.basenameWithoutExtension(pickedPath)}_transcoded.avi',
+          );
+        }
       });
-      _addLog("Selected for probe: $_selectedProbePath");
+      if (kIsWeb && previousWebPath != null && previousWebPath != pickedPath) {
+        _retireWebMediaPath(previousWebPath);
+      }
+      _addLog("Selected for probe: $pickedPath");
+    } catch (error) {
+      _addLog('Unable to import the selected media: $error');
+    }
+  }
+
+  Future<void> _pickCommandInputFile(TextEditingController controller) async {
+    if (!kIsWeb) return;
+    try {
+      final result = await FilePicker.pickFiles(type: FileType.any);
+      if (result.isEmpty) return;
+      final file = result.single;
+      final previousWebPath = _selectedWebMediaPath;
+      final pickedPath = _importWebMedia(file.name, await file.readAsBytes());
+      final baseName = path.basenameWithoutExtension(pickedPath);
+      controller.text = _commandWithInputFile(controller.text, pickedPath);
+      setState(() {
+        _selectedProbePath = pickedPath;
+        _selectedWebMediaPath = pickedPath;
+        _transcodeInputPath = pickedPath;
+        _transcodeOutputPath = path.join('/tmp', '${baseName}_transcoded.avi');
+      });
+      if (previousWebPath != null && previousWebPath != pickedPath) {
+        _retireWebMediaPath(previousWebPath);
+      }
+      _addLog('Selected input file: $pickedPath');
+    } catch (error) {
+      _addLog('Unable to import the selected input file: $error');
     }
   }
 
   Future<void> _runMediaInformation() async {
     // Use picked file, local test video, or remote URL fallback.
-    final tempDir = await getTemporaryDirectory();
-    final exampleDir = Directory(
-      path.join(tempDir.path, 'ffmpeg_kit_extended_flutter_example'),
-    );
-    await exampleDir.create(recursive: true);
-    final localTestPath = path.join(exampleDir.path, 'test_video.mp4');
+    final exampleDirPath = await _exampleDirectoryPath();
+    final localTestPath = path.join(exampleDirPath, 'test_video.mp4');
 
     final String probePath;
-    if (_selectedProbePath != null && File(_selectedProbePath!).existsSync()) {
+    if (kIsWeb &&
+        _selectedWebMediaPath != null &&
+        _exampleFileExists(_selectedWebMediaPath!)) {
+      probePath = _selectedWebMediaPath!;
+    } else if (_selectedProbePath != null &&
+        _exampleFileExists(_selectedProbePath!)) {
       probePath = _selectedProbePath!;
-    } else if (File(localTestPath).existsSync()) {
+    } else if (_exampleFileExists(localTestPath)) {
       probePath = localTestPath;
+    } else if (kIsWeb) {
+      _addLog(
+        'Pick a local file or generate the example video before probing.',
+      );
+      return;
     } else {
       probePath =
           "https://raw.githubusercontent.com/tanersener/ffmpeg-kit/master/test-data/video.mp4";
@@ -933,21 +1670,34 @@ class _HomePageState extends State<HomePage>
             _addLog(session.getLogs() ?? "Empty logs.");
           }
         }
+        _cleanupRetiredWebMediaPaths();
       },
     );
   }
 
   Future<void> _runCustomFFprobe() async {
-    final command = _ffprobeCommandController.text;
+    final command = _removeNoStdin(_ffprobeCommandController.text);
     _addLog("--- Running Custom FFprobe: $command ---", printToConsole: true);
-    await FFprobeKit.executeAsync(
-      command,
-      onComplete: (session) {
-        final output = session.getOutput();
-        if (output != null) _addLog(output);
-        _addLog("Return code: ${session.getReturnCode()}");
-      },
-    );
+    final releaseMediaOperation = _beginCustomWebMediaOperation();
+    var submitted = false;
+    try {
+      await FFprobeKit.executeAsync(
+        command,
+        onComplete: (session) {
+          try {
+            final output = session.getOutput();
+            if (output != null) _addLog(output);
+            _addLog("Return code: ${session.getReturnCode()}");
+          } finally {
+            releaseMediaOperation();
+          }
+        },
+      );
+      submitted = true;
+    } catch (_) {
+      if (!submitted) releaseMediaOperation();
+      rethrow;
+    }
   }
 
   // --- FFplay Example ---
@@ -963,7 +1713,10 @@ class _HomePageState extends State<HomePage>
     await old?.release();
   }
 
-  void _attachPositionStream(FFplaySession session) {
+  void _attachPositionStream(
+    FFplaySession session, {
+    void Function()? onTerminal,
+  }) {
     _positionSub?.cancel();
     _videoSizeSub?.cancel();
     setState(() {
@@ -981,7 +1734,10 @@ class _HomePageState extends State<HomePage>
 
     _positionSub = session.positionStream.listen(
       (pos) {
-        if (mounted) {
+        // The position label only displays tenths of a second. Avoid rebuilding
+        // the full example screen for every ~16 ms stream tick, especially in
+        // Flutter's instrumented Web debug build.
+        if (mounted && (pos - _playbackPosition).abs() >= 0.1) {
           setState(() {
             _playbackPosition = pos;
           });
@@ -989,6 +1745,8 @@ class _HomePageState extends State<HomePage>
       },
       onDone: () {
         if (mounted) setState(() => _hasActiveSession = false);
+        _cleanupRetiredWebMediaPaths();
+        onTerminal?.call();
         surfaceToRelease?.release().then((_) {
           if (mounted) {
             setState(() {
@@ -1014,14 +1772,12 @@ class _HomePageState extends State<HomePage>
   }
 
   Future<void> _runFFplay(String fileName) async {
-    final tempDir = await getTemporaryDirectory();
-    final exampleDir = Directory(
-      path.join(tempDir.path, 'ffmpeg_kit_extended_flutter_example'),
-    );
-    await exampleDir.create(recursive: true);
-    final localPath = path.join(exampleDir.path, fileName);
+    final exampleDirPath = await _exampleDirectoryPath();
+    final localPath = path.isAbsolute(fileName)
+        ? fileName
+        : path.join(exampleDirPath, fileName);
 
-    if (!File(localPath).existsSync()) {
+    if (!_exampleFileExists(localPath)) {
       _addLog("⚠️ File not found: $localPath. Please generate it first!");
       return;
     }
@@ -1040,6 +1796,7 @@ class _HomePageState extends State<HomePage>
       "-autoexit -i \"$localPath\"",
       onComplete: (session) {
         _addLog("FFplay playback of $fileName finished");
+        _cleanupRetiredWebMediaPaths();
       },
       onLog: (log) => _addLog("FFplay: ${log.message}"),
     );
@@ -1047,24 +1804,47 @@ class _HomePageState extends State<HomePage>
     _addLog("Playback started.");
   }
 
+  Future<void> _playImportedMedia() async {
+    final filePath = kIsWeb
+        ? _selectedWebMediaPath
+        : _selectedProbePath ?? _transcodeInputPath;
+    if (filePath == null || !_exampleFileExists(filePath)) {
+      _addLog('Pick a local media file before playing imported media.');
+      return;
+    }
+    await _runFFplay(filePath);
+  }
+
   Future<void> _runCustomFFplay() async {
-    final command = _ffplayCommandController.text;
+    final command = _ffplayCommandController.text.trim();
     _addLog("--- Running Custom FFplay: $command ---", printToConsole: true);
 
-    await _prepareSurface();
-    final surface = await FFplaySurface.create();
-    if (surface != null && mounted) {
-      setState(() => _surface = surface);
-    }
+    final releaseMediaOperation = _beginCustomWebMediaOperation();
+    var submitted = false;
+    try {
+      await _prepareSurface();
+      final surface = await FFplaySurface.create();
+      if (surface != null && mounted) {
+        setState(() => _surface = surface);
+      }
 
-    final session = await FFplayKit.executeAsync(
-      command,
-      onComplete: (session) {
-        final output = session.getOutput();
-        _addLog("FFplay playback finished. Output: $output");
-      },
-    );
-    _attachPositionStream(session);
+      final session = await FFplayKit.executeAsync(
+        command,
+        onComplete: (session) {
+          try {
+            final output = session.getOutput();
+            _addLog("FFplay playback finished. Output: $output");
+          } finally {
+            releaseMediaOperation();
+          }
+        },
+      );
+      submitted = true;
+      _attachPositionStream(session, onTerminal: releaseMediaOperation);
+    } catch (_) {
+      if (!submitted) releaseMediaOperation();
+      rethrow;
+    }
   }
 
   void _seekForward() {
@@ -1100,28 +1880,34 @@ class _HomePageState extends State<HomePage>
         final isMobile = constraints.maxWidth < 600;
 
         return Scaffold(
+          key: const ValueKey<String>('app.root'),
           appBar: AppBar(
             title: Text(isMobile ? 'FFmpeg Kit' : 'FFmpeg Kit Extended'),
             bottom: TabBar(
               controller: _tabController,
               tabs: [
                 Tab(
+                  key: const ValueKey<String>('tab.ffmpeg'),
                   icon: const Icon(Icons.movie),
                   text: isMobile ? null : "FFmpeg",
                 ),
                 Tab(
+                  key: const ValueKey<String>('tab.stream'),
                   icon: const Icon(Icons.sensors),
                   text: isMobile ? null : "Stream",
                 ),
                 Tab(
+                  key: const ValueKey<String>('tab.ffprobe'),
                   icon: const Icon(Icons.info),
                   text: isMobile ? null : "FFprobe",
                 ),
                 Tab(
+                  key: const ValueKey<String>('tab.ffplay'),
                   icon: const Icon(Icons.play_arrow),
                   text: isMobile ? null : "FFplay",
                 ),
                 Tab(
+                  key: const ValueKey<String>('tab.transcode'),
                   icon: const Icon(Icons.transform),
                   text: isMobile ? null : "Transcode",
                 ),
@@ -1129,6 +1915,7 @@ class _HomePageState extends State<HomePage>
             ),
             actions: [
               PopupMenuButton<LogLevel>(
+                key: const ValueKey<String>('toolbar.log-level'),
                 icon: const Icon(Icons.tune),
                 tooltip: "Log Level",
                 onSelected: _setLogLevel,
@@ -1153,6 +1940,7 @@ class _HomePageState extends State<HomePage>
                 },
               ),
               PopupMenuButton<String>(
+                key: const ValueKey<String>('toolbar.system-info'),
                 icon: const Icon(Icons.settings),
                 tooltip: "System Info",
                 onSelected: (String value) {
@@ -1219,6 +2007,7 @@ class _HomePageState extends State<HomePage>
                 itemBuilder: (BuildContext context) {
                   return [
                     const PopupMenuItem<String>(
+                      key: ValueKey<String>('system-info.basic'),
                       value: 'basic_info',
                       child: Row(
                         children: [
@@ -1230,6 +2019,7 @@ class _HomePageState extends State<HomePage>
                     ),
                     const PopupMenuDivider(),
                     const PopupMenuItem<String>(
+                      key: ValueKey<String>('system-info.ffmpeg-version'),
                       value: 'ffmpeg_version',
                       child: Row(
                         children: [
@@ -1250,6 +2040,7 @@ class _HomePageState extends State<HomePage>
                       ),
                     ),
                     const PopupMenuItem<String>(
+                      key: ValueKey<String>('system-info.ffmpegkit-version'),
                       value: 'ffmpegkit_version',
                       child: Row(
                         children: [
@@ -1280,6 +2071,7 @@ class _HomePageState extends State<HomePage>
                       ),
                     ),
                     const PopupMenuItem<String>(
+                      key: ValueKey<String>('system-info.bundle'),
                       value: 'bundle_type',
                       child: Row(
                         children: [
@@ -1403,6 +2195,7 @@ class _HomePageState extends State<HomePage>
                       ),
                     ),
                     const PopupMenuItem<String>(
+                      key: ValueKey<String>('system-info.build-date'),
                       value: 'build_date',
                       child: Row(
                         children: [
@@ -1416,11 +2209,13 @@ class _HomePageState extends State<HomePage>
                 },
               ),
               IconButton(
+                key: const ValueKey<String>('toolbar.clear-logs'),
                 icon: const Icon(Icons.delete),
                 onPressed: _clearLogs,
                 tooltip: "Clear Logs",
               ),
               IconButton(
+                key: const ValueKey<String>('toolbar.permissions'),
                 icon: const Icon(Icons.verified_user),
                 onPressed: _checkPermissions,
                 tooltip: "Check / Request Permissions",
@@ -1459,6 +2254,7 @@ class _HomePageState extends State<HomePage>
       child: SingleChildScrollView(
         controller: _scrollController,
         child: TextField(
+          key: const ValueKey<String>('logs.output'),
           controller: _outputController,
           maxLines: null,
           readOnly: true,
@@ -1483,28 +2279,80 @@ class _HomePageState extends State<HomePage>
             spacing: 12,
             runSpacing: 12,
             children: [
-              _demoButton(_generateTestVideo, Icons.video_call, "Gen Video"),
-              _demoButton(_generateTestAudio, Icons.audiotrack, "Gen Audio"),
-              _demoButton(_runFFmpegVersion, Icons.bolt, "Async Version"),
-              _demoButton(_runFFmpegInfoSync, Icons.timer, "Sync Version"),
+              _demoButton(
+                _generateTestVideo,
+                Icons.video_call,
+                "Gen Video",
+                key: const ValueKey<String>('ffmpeg.generate-video'),
+              ),
+              _demoButton(
+                _generateTestAudio,
+                Icons.audiotrack,
+                "Gen Audio",
+                key: const ValueKey<String>('ffmpeg.generate-audio'),
+              ),
+              _demoButton(
+                _runFFmpegVersion,
+                Icons.bolt,
+                "Async Version",
+                key: const ValueKey<String>('ffmpeg.version.async'),
+              ),
+              _demoButton(
+                _runFFmpegInfoSync,
+                Icons.timer,
+                "Sync Version",
+                key: const ValueKey<String>('ffmpeg.version.awaited'),
+              ),
               _demoButton(
                 () async {
                   _addLog("--- Running Help ---", printToConsole: true);
                   await FFmpegKit.executeAsync(
-                    "-h",
+                    "-nostdin -h",
                     onLog: (l) => _addLog(l.message),
                   );
                 },
                 Icons.help_outline,
                 "Help",
+                key: const ValueKey<String>('ffmpeg.help'),
               ),
             ],
           ),
+          if (kIsWeb &&
+              (_webDownloadableFiles.contains('/tmp/test_video.mp4') ||
+                  _webDownloadableFiles.contains('/tmp/test_audio.wav'))) ...[
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              children: [
+                if (_webDownloadableFiles.contains('/tmp/test_video.mp4'))
+                  _demoButton(
+                    () => _downloadWebFile('/tmp/test_video.mp4'),
+                    Icons.download,
+                    'Download MP4',
+                    key: const ValueKey<String>('ffmpeg.download-mp4'),
+                  ),
+                if (_webDownloadableFiles.contains('/tmp/test_audio.wav'))
+                  _demoButton(
+                    () => _downloadWebFile('/tmp/test_audio.wav'),
+                    Icons.download,
+                    'Download WAV',
+                    key: const ValueKey<String>('ffmpeg.download-wav'),
+                  ),
+              ],
+            ),
+          ],
           const SizedBox(height: 24),
           _buildCustomCommandSection(
             _ffmpegCommandController,
             _runCustomFFmpeg,
             "Enter FFmpeg command",
+            inputKey: const ValueKey<String>('ffmpeg.command.input'),
+            runKey: const ValueKey<String>('ffmpeg.command.run'),
+            onPickFile: kIsWeb
+                ? () => _pickCommandInputFile(_ffmpegCommandController)
+                : null,
+            pickKey: const ValueKey<String>('ffmpeg.command.pick-file'),
           ),
         ],
       ),
@@ -1517,7 +2365,12 @@ class _HomePageState extends State<HomePage>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _buildRemoteRecordingScenarioSection(),
+          // Native builds keep the dart:io recording scenario. Web uses the
+          // MEMFS-backed remote URL panel instead.
+          if (kIsWeb)
+            _buildWebRemoteSection()
+          else
+            _buildRemoteRecordingScenarioSection(),
           const SizedBox(height: 20),
           _buildActiveSessionsPanel(),
         ],
@@ -1526,14 +2379,17 @@ class _HomePageState extends State<HomePage>
   }
 
   Widget _buildFFprobeTab() {
+    final selectedProbePath = kIsWeb
+        ? _selectedWebMediaPath
+        : _selectedProbePath;
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16.0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (_selectedProbePath != null) ...[
+          if (selectedProbePath != null) ...[
             Text(
-              "Selected: ${path.basename(_selectedProbePath!)}",
+              "Selected: ${path.basename(selectedProbePath)}",
               style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic),
             ),
             const SizedBox(height: 8),
@@ -1542,14 +2398,30 @@ class _HomePageState extends State<HomePage>
             spacing: 12,
             runSpacing: 12,
             children: [
-              _demoButton(_pickProbeFile, Icons.file_open, "Pick File"),
+              _demoButton(
+                _pickProbeFile,
+                Icons.file_open,
+                "Pick File",
+                key: const ValueKey<String>('ffprobe.pick-file'),
+              ),
               _demoButton(
                 _runMediaInformation,
                 Icons.analytics,
                 "Get Media Info",
+                key: const ValueKey<String>('ffprobe.media-info'),
               ),
-              _demoButton(_runFFprobeVersion, Icons.bolt, "Async Version"),
-              _demoButton(_runFFprobeInfoSync, Icons.timer, "Sync Version"),
+              _demoButton(
+                _runFFprobeVersion,
+                Icons.bolt,
+                "Async Version",
+                key: const ValueKey<String>('ffprobe.version.async'),
+              ),
+              _demoButton(
+                _runFFprobeInfoSync,
+                Icons.timer,
+                "Sync Version",
+                key: const ValueKey<String>('ffprobe.version.awaited'),
+              ),
             ],
           ),
           const SizedBox(height: 24),
@@ -1557,6 +2429,8 @@ class _HomePageState extends State<HomePage>
             _ffprobeCommandController,
             _runCustomFFprobe,
             "Enter FFprobe command",
+            inputKey: const ValueKey<String>('ffprobe.command.input'),
+            runKey: const ValueKey<String>('ffprobe.command.run'),
           ),
         ],
       ),
@@ -1574,6 +2448,7 @@ class _HomePageState extends State<HomePage>
               child: Stack(
                 children: [
                   FFplayView(
+                    key: const ValueKey<String>('ffplay.video-surface'),
                     surface: _surface!,
                     controller: _fsController,
                     aspectRatio: _videoWidth > 0 && _videoHeight > 0
@@ -1615,6 +2490,12 @@ class _HomePageState extends State<HomePage>
             _ffplayCommandController,
             _runCustomFFplay,
             "Enter FFplay command",
+            inputKey: const ValueKey<String>('ffplay.command.input'),
+            runKey: const ValueKey<String>('ffplay.command.run'),
+            onPickFile: kIsWeb
+                ? () => _pickCommandInputFile(_ffplayCommandController)
+                : null,
+            pickKey: const ValueKey<String>('ffplay.command.pick-file'),
           ),
           const SizedBox(height: 20),
           const Text(
@@ -1625,10 +2506,29 @@ class _HomePageState extends State<HomePage>
           Wrap(
             spacing: 10,
             children: [
-              _demoButton(_generateTestVideo, Icons.video_call, "Gen Video"),
-              _demoButton(_generateTestAudio, Icons.audiotrack, "Gen Audio"),
+              _demoButton(
+                _generateTestVideo,
+                Icons.video_call,
+                "Gen Video",
+                key: const ValueKey<String>('ffplay.generate-video'),
+              ),
+              _demoButton(
+                _generateTestAudio,
+                Icons.audiotrack,
+                "Gen Audio",
+                key: const ValueKey<String>('ffplay.generate-audio'),
+              ),
             ],
           ),
+          if (kIsWeb) ...[
+            const SizedBox(height: 12),
+            _demoButton(
+              _playImportedMedia,
+              Icons.play_circle_outline,
+              'Play Imported File',
+              key: const ValueKey<String>('ffplay.play-imported'),
+            ),
+          ],
           const SizedBox(height: 20),
           const Text(
             "2. Play Generated:",
@@ -1642,11 +2542,13 @@ class _HomePageState extends State<HomePage>
                 () => _runFFplay('test_video.mp4'),
                 Icons.play_circle_filled,
                 "Play Video",
+                key: const ValueKey<String>('ffplay.play-video'),
               ),
               _demoButton(
                 () => _runFFplay('test_audio.wav'),
                 Icons.music_note,
                 "Play Audio",
+                key: const ValueKey<String>('ffplay.play-audio'),
               ),
             ],
           ),
@@ -1658,22 +2560,27 @@ class _HomePageState extends State<HomePage>
           Row(
             children: [
               IconButton(
+                key: const ValueKey<String>('ffplay.pause'),
                 onPressed: () => FFplayKit.pause(),
                 icon: const Icon(Icons.pause),
               ),
               IconButton(
+                key: const ValueKey<String>('ffplay.resume'),
                 onPressed: () => FFplayKit.resume(),
                 icon: const Icon(Icons.play_arrow),
               ),
               IconButton(
+                key: const ValueKey<String>('ffplay.stop'),
                 onPressed: () => FFplayKit.stop(),
                 icon: const Icon(Icons.stop),
               ),
               IconButton(
+                key: const ValueKey<String>('ffplay.seek-forward'),
                 onPressed: () => _seekForward(),
                 icon: const Icon(Icons.fast_forward),
               ),
               IconButton(
+                key: const ValueKey<String>('ffplay.seek-back'),
                 onPressed: () => _seekBackward(),
                 icon: const Icon(Icons.fast_rewind),
               ),
@@ -1683,6 +2590,7 @@ class _HomePageState extends State<HomePage>
           if (_hasActiveSession) ...[
             Text(
               "State: ${FFplayKit.playing ? 'Playing' : (FFplayKit.paused ? 'Paused' : 'Stopped')}",
+              key: const ValueKey<String>('ffplay.position'),
             ),
             Text(
               "Position: ${_playbackPosition.toStringAsFixed(1)}s / ${FFplayKit.duration.toStringAsFixed(1)}s",
@@ -1704,6 +2612,7 @@ class _HomePageState extends State<HomePage>
                 const Icon(Icons.volume_down),
                 Expanded(
                   child: Slider(
+                    key: const ValueKey<String>('ffplay.volume'),
                     value: _volume,
                     min: 0.0,
                     max: 1.0,
@@ -1735,6 +2644,11 @@ class _HomePageState extends State<HomePage>
   }
 
   Widget _buildTranscodeTab() {
+    final selectedInputPath = kIsWeb
+        ? _selectedWebMediaPath
+        : _transcodeInputPath;
+    final webTranscodeOutputPath =
+        _transcodeOutputPath ?? (kIsWeb ? '/tmp/test_video.avi' : null);
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16.0),
       child: Column(
@@ -1763,7 +2677,7 @@ class _HomePageState extends State<HomePage>
                     style: TextStyle(fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 8),
-                  if (_transcodeInputPath != null) ...[
+                  if (selectedInputPath != null) ...[
                     Container(
                       padding: const EdgeInsets.all(8),
                       decoration: BoxDecoration(
@@ -1776,20 +2690,32 @@ class _HomePageState extends State<HomePage>
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
-                              path.basename(_transcodeInputPath!),
+                              path.basename(selectedInputPath),
                               style: const TextStyle(fontSize: 12),
                               overflow: TextOverflow.ellipsis,
                             ),
                           ),
                           IconButton(
+                            key: const ValueKey<String>(
+                              'transcode.clear-input',
+                            ),
                             icon: const Icon(Icons.close, size: 18),
                             onPressed: _isTranscoding
                                 ? null
                                 : () {
+                                    final previousWebPath =
+                                        _selectedWebMediaPath;
                                     setState(() {
                                       _transcodeInputPath = null;
                                       _transcodeOutputPath = null;
+                                      if (kIsWeb) {
+                                        _selectedWebMediaPath = null;
+                                        _selectedProbePath = null;
+                                      }
                                     });
+                                    if (previousWebPath != null) {
+                                      _retireWebMediaPath(previousWebPath);
+                                    }
                                   },
                             tooltip: "Clear selection",
                           ),
@@ -1808,6 +2734,7 @@ class _HomePageState extends State<HomePage>
                     ),
                   const SizedBox(height: 12),
                   ElevatedButton.icon(
+                    key: const ValueKey<String>('transcode.pick-input'),
                     onPressed: _isTranscoding ? null : _pickTranscodeFile,
                     icon: const Icon(Icons.file_open, size: 18),
                     label: const Text("Pick Video File"),
@@ -1837,6 +2764,7 @@ class _HomePageState extends State<HomePage>
                       children: [
                         Text(
                           _isTranscoding ? 'Transcoding...' : 'Complete',
+                          key: const ValueKey<String>('transcode.status'),
                           style: const TextStyle(fontWeight: FontWeight.w600),
                         ),
                         Text(
@@ -1849,6 +2777,7 @@ class _HomePageState extends State<HomePage>
                     ClipRRect(
                       borderRadius: BorderRadius.circular(8),
                       child: LinearProgressIndicator(
+                        key: const ValueKey<String>('transcode.progress'),
                         value: _transcodeProgress,
                         minHeight: 12,
                         backgroundColor: Colors.grey[800],
@@ -1883,9 +2812,21 @@ class _HomePageState extends State<HomePage>
                 _transcodeVideo,
                 Icons.transform,
                 _isTranscoding ? "Transcoding..." : "Transcode MP4 → AVI",
+                key: const ValueKey<String>('transcode.run'),
               ),
             ],
           ),
+          if (kIsWeb &&
+              webTranscodeOutputPath != null &&
+              _webDownloadableFiles.contains(webTranscodeOutputPath)) ...[
+            const SizedBox(height: 12),
+            _demoButton(
+              () => _downloadWebFile(webTranscodeOutputPath),
+              Icons.download,
+              'Download AVI',
+              key: const ValueKey<String>('transcode.download-avi'),
+            ),
+          ],
           const SizedBox(height: 24),
           // Info card
           Card(
@@ -1930,6 +2871,137 @@ class _HomePageState extends State<HomePage>
     );
   }
 
+  Widget _webRemoteButton(
+    String label,
+    IconData icon,
+    FutureOr<void> Function()? onPressed,
+    String key,
+  ) {
+    return ElevatedButton.icon(
+      key: ValueKey<String>(key),
+      onPressed: onPressed == null ? null : () => onPressed(),
+      icon: Icon(icon, size: 18),
+      label: Text(label),
+    );
+  }
+
+  Widget _buildWebRemoteSection() {
+    final validation = _validateWebRemoteUrl(_webRemoteUrlController.text);
+    final busy = _webRemoteBusy;
+    final canStart = !busy && validation == null;
+    final recordingPath = _webRemoteRecordingPath;
+    return Card(
+      elevation: 1,
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              "Remote URL (Web)",
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              "Direct http:// and https:// URLs run through the async APIs. Recordings stay in browser memory until you download them. Video renders in the FFplay tab.",
+              style: TextStyle(fontSize: 12),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              key: const ValueKey<String>('web.remote.url'),
+              controller: _webRemoteUrlController,
+              enabled: !busy,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                labelText: "Direct media URL",
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              style: const TextStyle(fontSize: 14),
+            ),
+            if (validation != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                validation,
+                key: const ValueKey<String>('web.remote.validation'),
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: Colors.orangeAccent,
+                ),
+              ),
+            ],
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              children: [
+                _webRemoteButton(
+                  "Probe",
+                  Icons.info_outline,
+                  canStart ? _runWebRemoteProbe : null,
+                  'web.remote.probe',
+                ),
+                _webRemoteButton(
+                  "Play",
+                  Icons.play_circle_outline,
+                  canStart ? _runWebRemotePlay : null,
+                  'web.remote.play',
+                ),
+                _webRemoteButton(
+                  "Record 15 s",
+                  Icons.fiber_manual_record,
+                  canStart ? _runWebRemoteRecord : null,
+                  'web.remote.record',
+                ),
+                _webRemoteButton(
+                  "Stop",
+                  Icons.stop,
+                  busy && !_webRemoteCancelRequested ? _cancelWebRemote : null,
+                  'web.remote.cancel',
+                ),
+                _webRemoteButton(
+                  "Probe Recording",
+                  Icons.search,
+                  !busy && recordingPath != null
+                      ? () => _runWebRemoteFFprobe(
+                          '-hide_banner -v error -show_format -show_streams -of json "$recordingPath"',
+                          "Probing $recordingPath",
+                        )
+                      : null,
+                  'web.remote.probe-recording',
+                ),
+                _webRemoteButton(
+                  "Download Recording",
+                  Icons.download,
+                  !busy && recordingPath != null
+                      ? () => _downloadWebFile(recordingPath)
+                      : null,
+                  'web.remote.download',
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              "State: $_webRemoteState",
+              key: const ValueKey<String>('web.remote.state'),
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+            if (_webRemoteDetail.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              // Plain Text keeps the detail in the accessibility tree, where the
+              // acceptance harness reads it. SelectableText does not.
+              Text(
+                _webRemoteDetail,
+                key: const ValueKey<String>('web.remote.detail'),
+                style: const TextStyle(fontSize: 12),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildRemoteRecordingScenarioSection() {
     return Card(
       elevation: 1,
@@ -1949,6 +3021,7 @@ class _HomePageState extends State<HomePage>
             ),
             const SizedBox(height: 12),
             TextField(
+              key: const ValueKey<String>('stream.url.input'),
               controller: _remoteStreamUrlController,
               decoration: const InputDecoration(
                 labelText: "Remote stream URL",
@@ -1968,6 +3041,7 @@ class _HomePageState extends State<HomePage>
                   },
                   Icons.cloud_download,
                   "Record Stream",
+                  key: const ValueKey<String>('stream.record'),
                 ),
               ],
             ),
@@ -2005,6 +3079,7 @@ class _HomePageState extends State<HomePage>
                   ),
                 ),
                 IconButton(
+                  key: const ValueKey<String>('stream.refresh'),
                   icon: const Icon(Icons.refresh, size: 20),
                   onPressed: () {
                     final sessions = FFmpegKitExtended.listSessions();
@@ -2074,6 +3149,9 @@ class _HomePageState extends State<HomePage>
                         ),
                         const SizedBox(width: 12),
                         ElevatedButton.icon(
+                          key: ValueKey<String>(
+                            'stream.cancel.${job.sessionId ?? session.getSessionId()}',
+                          ),
                           onPressed: isRunning
                               ? () {
                                   job.requestedCancel = true;
@@ -2100,8 +3178,14 @@ class _HomePageState extends State<HomePage>
     );
   }
 
-  Widget _demoButton(VoidCallback onPressed, IconData icon, String label) {
+  Widget _demoButton(
+    VoidCallback onPressed,
+    IconData icon,
+    String label, {
+    Key? key,
+  }) {
     return ElevatedButton.icon(
+      key: key,
       onPressed: onPressed,
       icon: Icon(icon, size: 18),
       label: Text(label),
@@ -2114,8 +3198,12 @@ class _HomePageState extends State<HomePage>
   Widget _buildCustomCommandSection(
     TextEditingController controller,
     VoidCallback onRun,
-    String hint,
-  ) {
+    String hint, {
+    Key? inputKey,
+    Key? runKey,
+    VoidCallback? onPickFile,
+    Key? pickKey,
+  }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2128,6 +3216,7 @@ class _HomePageState extends State<HomePage>
           children: [
             Expanded(
               child: TextField(
+                key: inputKey,
                 controller: controller,
                 decoration: InputDecoration(
                   hintText: hint,
@@ -2138,7 +3227,16 @@ class _HomePageState extends State<HomePage>
               ),
             ),
             const SizedBox(width: 8),
-            _demoButton(onRun, Icons.play_arrow, "Run"),
+            if (onPickFile != null) ...[
+              _demoButton(
+                onPickFile,
+                Icons.file_open,
+                "Pick File",
+                key: pickKey,
+              ),
+              const SizedBox(width: 8),
+            ],
+            _demoButton(onRun, Icons.play_arrow, "Run", key: runKey),
           ],
         ),
       ],

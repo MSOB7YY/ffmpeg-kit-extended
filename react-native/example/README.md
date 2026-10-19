@@ -3,12 +3,20 @@
 This is the runnable Android/iOS/Apple tvOS/macOS/Windows example application for `ffmpeg-kit-extended`.
 Its UI and scenarios are based on `flutter/example/lib/main.dart`.
 
+For the local interactive test contract and evidence requirements, see
+[`../../docs/interactive-testing.md`](../../docs/interactive-testing.md) and
+[`../TEST.md`](../TEST.md). The platform agent guides are
+[`.maestro/`](.maestro/),
+[the Windows Android MCP guide](interactive-tests/android/mcp-android-emulator.md),
+[`interactive-tests/appium/`](interactive-tests/appium/), and
+[`interactive-tests/windows/`](interactive-tests/windows/).
+
 ## Covered scenarios
 
 - FFmpeg test video/audio generation.
 - FFmpeg version/help/custom commands.
 - FFmpegKit build, bundle, license, component, and log-level introspection.
-- Remote HLS/network stream recording with concurrent session tracking and cancellation.
+- Remote HLS/network stream recording with concurrent session tracking and cancellation on supported native targets. Web/Wasm builds do not support network stream recording, including RTMP/RTMPE.
 - FFprobe version/custom commands and media-information inspection.
 - Native document picking with a durable app-local copy before handing the path to FFmpeg/FFprobe.
 - FFplay execution, pause/resume/stop/seek/position/duration/volume controls.
@@ -23,6 +31,26 @@ Its UI and scenarios are based on `flutter/example/lib/main.dart`.
 - `src/ExampleApp.tsx` contains the shared behavior.
 
 The binding package has native integration for Android, iOS, Apple tvOS, macOS, and Windows.
+
+## Run Web
+
+From this directory:
+
+```sh
+npm install
+npm run web
+```
+
+The `web` and `web:build` scripts invoke the package-owned `prepare-web` build hook. It resolves the configured runtime, stages it in `public/ffmpeg-kit-extended/wasm/`, and copies the package Web bridge beside it. The checked-in configuration uses the Web-compatible `base` bundle because the pre-built Web/Wasm debug artifact for FFmpegKit binary `0.11.2` is not browser-compatible. To use a custom build, set `web` (or `wasm`) in `ffmpeg-kit-extended.config.json` to a local runtime directory, local ZIP, or HTTP(S) bundle URL before building. A custom Wasm ZIP must contain exactly one runtime directory containing both `ffmpegkit.mjs` and `ffmpegkit.wasm`. Remote bundles are downloaded during the build hook; at runtime the browser loads the staged files from the application origin. For local-only use, start Vite directly after staging local assets or use an explicit local override with `FFMPEG_KIT_EXTENDED_LOCAL_ONLY=true`. The Web example README documents the filesystem contract, fail-closed behavior when `FS` is missing, and current local browser evidence.
+
+The Web server must send these headers for cross-origin isolation and pthread Wasm:
+
+```http
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+The included `web/vite.config.js` uses the standard React Native Web alias and these development headers. Configure the same headers on the production host. If the staged runtime is served below a different URL, pass that directory to `FFmpegKitExtended.initialize({assetBaseUrl})`.
 
 ## FFplay rendering
 

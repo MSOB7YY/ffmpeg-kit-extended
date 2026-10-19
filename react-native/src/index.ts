@@ -7,7 +7,7 @@
  * ```ts
  * import {FFmpegKitExtended, FFmpegKit} from 'ffmpeg-kit-extended';
  *
- * FFmpegKitExtended.initialize();
+ * await FFmpegKitExtended.initialize();
  * const session = await FFmpegKit.executeAsync('-version');
  * ```
  *
@@ -15,8 +15,16 @@
  * `FFplayKit`, `FFplayView`, and session classes. `NativeFFmpegKitExtended` is
  * exported for advanced integration and diagnostics, but its JSON/scalar API
  * is lower level and does not provide the lifecycle safeguards of the wrappers.
+ * Its type-only `NativeFFmpegKitExtendedSpec` contract is native-only; the Web
+ * entry point intentionally has no native module value.
  */
+import './platform/backend.native.register';
+
 export {default as NativeFFmpegKitExtended} from './NativeFFmpegKitExtended';
+export type {
+  NativeFFmpegKitExtendedLogEvent,
+  NativeFFmpegKitExtendedSpec,
+} from './NativeFFmpegKitExtended';
 export * from './arguments';
 export * from './ffmpeg-kit';
 export * from './ffmpeg-kit-config';
@@ -27,4 +35,5 @@ export * from './media-information';
 export * from './session';
 export * from './session-queue-manager';
 export * from './types';
+export type {FFmpegKitInitializeOptions} from './platform/backend-registry';
 export * from './ffplay-view';

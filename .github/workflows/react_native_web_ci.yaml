@@ -2,22 +2,6 @@ name: React Native Web checks
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - "react-native/**"
-      - ".github/workflows/react_native_web_ci.yaml"
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
-    paths:
-      - "react-native/**"
-      - ".github/workflows/react_native_web_ci.yaml"
 
 permissions:
   contents: read
@@ -53,6 +37,10 @@ jobs:
         working-directory: react-native/example
         run: npm ci
 
+      - name: Install Playwright Chromium
+        working-directory: react-native
+        run: npx playwright install --with-deps chromium
+
       - name: Run package checks
         working-directory: react-native
         run: npm run check
@@ -61,14 +49,75 @@ jobs:
         working-directory: react-native
         run: npm run prepare
 
+      - name: Validate packed TypeScript consumer
+        working-directory: react-native
+        run: npm run test:pack-types
+
+      - name: Validate packed Web consumer
+        working-directory: react-native
+        run: npm run test:pack-web
+
       - name: Validate package contents
         working-directory: react-native
         run: npm pack --dry-run
 
-      - name: Build Web example
+      - name: Build Web example and resolve its runtime
         working-directory: react-native/example
         run: npm run web:build
 
-      # The real Wasm smoke command is run with a locally staged builder output
-      # because this repository intentionally does not publish the large runtime
-      # binary as an npm package or browser download.
+      - name: Run the headless WebAssembly smoke test with package-owned staging
+        working-directory: react-native
+        run: npm run test:web
+
+  react-native-web-windows-staging:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    name: React Native Web Windows staging
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+
+      - name: Create nested Web runtime ZIP fixture
+        shell: python
+        run: |
+          import json
+          import os
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          fixture = Path(tempfile.mkdtemp(prefix="ffmpeg-kit-web-staging-", dir=os.environ["RUNNER_TEMP"]))
+          with zipfile.ZipFile(fixture / "runtime.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+              archive.writestr("nested/ffmpegkit.mjs", "export default {};\n")
+              archive.writestr("nested/ffmpegkit.wasm", b"\x00asm\x01\x00\x00\x00")
+          (fixture / "ffmpeg-kit-extended.config.json").write_text(
+              json.dumps({"type": "base", "web": "runtime.zip"}) + "\n",
+              encoding="utf-8",
+          )
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env:
+              env.write(f"FFMPEG_KIT_WEB_FIXTURE={fixture}\n")
+
+      - name: Stage Web runtime through Windows ZIP extraction
+        shell: pwsh
+        run: |
+          node react-native/scripts/prepare-web.js --app-root "$env:FFMPEG_KIT_WEB_FIXTURE" --quiet true
+          $target = Join-Path $env:FFMPEG_KIT_WEB_FIXTURE "public/ffmpeg-kit-extended/wasm"
+          $required = @(
+            "ffmpegkit.mjs",
+            "ffmpegkit.wasm",
+            "ffmpegkit_bridge.mjs",
+            "ffmpegkit_loader.mjs",
+            "ffmpegkit_callback_runtime.mjs"
+          )
+          foreach ($name in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $target $name))) {
+              throw "Missing staged Web runtime file: $name"
+            }
+          }

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:code_assets/code_assets.dart';
 import 'package:crypto/crypto.dart';
@@ -8,11 +9,21 @@ import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 import 'package:yaml/yaml.dart';
 
+import 'apple.dart';
+import 'config.dart';
+import 'native_artifact.dart';
+
 const String _baseUrlTemplate =
     "https://github.com/akashskypatel/ffmpeg-kit-builders/releases/download";
 const _validTypes = ['debug', 'base', 'full', 'audio', 'video', 'video_hw'];
-const String version = "0.11.1";
+// This version is pinned per release. Changing this version manually may cause runtime failures. DO NOT CHANGE from official pinned version.
+const String version = "0.11.2";
 const String _extractMarkerFileName = '.extract_complete';
+const String _wasmPlatformName = 'wasm';
+const String _wasmArchitectureName = 'wasm32';
+const Duration _cacheLockPollInterval = Duration(milliseconds: 25);
+const Duration _cacheLockStaleAfter = Duration(minutes: 30);
+final Random _cacheTempRandom = Random();
 
 void _log(String message) => stderr.writeln('FFmpegKit [Build Hook]: $message');
 Exception _exception(Object e) => Exception('FFmpegKit [Build Hook]: $e');
@@ -20,26 +31,83 @@ Exception _exception(Object e) => Exception('FFmpegKit [Build Hook]: $e');
 late final OS targetOS;
 late final Architecture targetArch;
 
-class ConfigResult {
-  final dynamic config;
-  final String baseDir;
-  ConfigResult(this.config, this.baseDir);
-}
-
 void main(List<String> args) async {
   await build(args, (input, output) async {
-    if (!input.config.buildCodeAssets) return;
+    // Flutter Web builds do not expose a CodeAsset target. Resolve the
+    // selected Wasm runtime and stage it into the consuming Web app instead.
+    _log('Build Hook for ${input.packageName}');
+    if (input.userDefines['wasm'] != null || input.userDefines['web'] != null) {
+      _log(
+        'FFmpegKitExtended User Defines (wasm): ${input.userDefines['wasm'] ?? input.userDefines['web']}',
+      );
+    }
+    if (input.userDefines['windows'] != null) {
+      _log(
+        'FFmpegKitExtended User Defines (windows): ${input.userDefines['windows']}',
+      );
+    }
+    if (input.userDefines['linux'] != null) {
+      _log(
+        'FFmpegKitExtended User Defines (linux): ${input.userDefines['linux']}',
+      );
+    }
+    if (input.userDefines['macos'] != null) {
+      _log(
+        'FFmpegKitExtended User Defines (macos): ${input.userDefines['macos']}',
+      );
+    }
+    if (input.userDefines['ios'] != null) {
+      _log('FFmpegKitExtended User Defines (ios): ${input.userDefines['ios']}');
+    }
+    if (input.userDefines['android'] != null) {
+      _log(
+        'FFmpegKitExtended User Defines (android): ${input.userDefines['android']}',
+      );
+    }
+    if (input.userDefines['type'] != null) {
+      _log(
+        'FFmpegKitExtended User Defines (type): ${input.userDefines['type']}',
+      );
+    }
+    if (input.userDefines['gpl'] != null) {
+      _log('FFmpegKitExtended User Defines (gpl): ${input.userDefines['gpl']}');
+    }
+    if (input.userDefines['small'] != null) {
+      _log(
+        'FFmpegKitExtended User Defines (small): ${input.userDefines['small']}',
+      );
+    }
+    if (!input.config.buildCodeAssets && input.config.buildAssetTypes.isEmpty) {
+      _log('Target: Web/WASM');
+      await _buildWasmAssets(input, output);
+      return;
+    }
+    if (!input.config.buildCodeAssets) {
+      // Flutter can invoke a package hook for a host build with no requested
+      // asset types. There is no Web/Wasm target to stage in that invocation;
+      // selecting the shared web override here would make a macOS/iOS build
+      // depend on a host-specific Web artifact that is intentionally absent.
+      return;
+    }
     final packageName = input.packageName;
     targetOS = input.config.code.targetOS;
     targetArch = input.config.code.targetArchitecture;
 
     _log('Build Hook for $packageName on ${targetOS.name}-${targetArch.name}');
-
-    // 1. Load Configuration
-    final configResult = _loadConfig(input);
-
-    // 2. Resolve Artifact
-    final artifact = await _resolveArtifact(configResult, input);
+    _log(
+      'Target: ${targetOS.name}-${targetArch.name}; '
+      'SDK: ${_buildHookSdk(input)}',
+    );
+    // Validate before loading configuration so unsupported targets cannot
+    // trigger override selection, downloads, extraction, or staging.
+    final artifact = await resolveAfterTargetArchitectureValidation(
+      targetOS: targetOS,
+      targetArch: targetArch,
+      resolve: () {
+        final configResult = _loadConfig(input, output);
+        return _resolveArtifact(configResult, input, output.dependencies.add);
+      },
+    );
     if (artifact == null) {
       throw _exception(
         'Failed to resolve artifact for ${targetOS.name}-${targetArch.name}',
@@ -51,60 +119,444 @@ void main(List<String> args) async {
   });
 }
 
-ConfigResult _loadConfig(BuildInput input) {
-  final packageRoot = p.normalize(input.packageRoot.toFilePath());
-  final packageConfig = Platform.packageConfig;
-
-  _log('input.packageRoot: $packageRoot');
-  _log('Platform.packageConfig: $packageConfig');
-
-  // 1. Prefer consuming app config via Platform.packageConfig anchor
-  if (packageConfig != null) {
-    // packageConfig is a file:/// URI pointing to .dart_tool/package_config.json
-    final packageConfigPath = p.normalize(
-      File.fromUri(Uri.parse(packageConfig)).path,
-    );
-    // appRoot is two levels up from .dart_tool/package_config.json
-    final appRoot = p.dirname(p.dirname(packageConfigPath));
-    final appPubspec = File(p.join(appRoot, 'pubspec.yaml'));
-
-    if (appPubspec.existsSync()) {
-      final config = _parsePubspec(appPubspec);
-      if (config != null) {
-        _log('Using app configuration from ${appPubspec.path}');
-        return ConfigResult(config, appRoot);
-      }
-      _log('Found app pubspec at $appRoot but no ffmpeg_kit_extended_config');
-    }
-  }
-
-  // 2. Fallback to package root only if we are building the package itself
-  // (e.g. during local tests or examples within the same repo)
-  final pkgPubspec = File(p.join(packageRoot, 'pubspec.yaml'));
-  if (pkgPubspec.existsSync()) {
-    final config = _parsePubspec(pkgPubspec);
-    if (config != null) {
-      _log('Using package-local configuration from ${pkgPubspec.path}');
-      return ConfigResult(config, packageRoot);
-    }
-  }
-
-  // 3. Last Resort: Default Configuration
-  stderr.writeln(
-    'FFmpegKit [Build Hook]: No configuration found. Using default "base" lgpl small build.',
-  );
-  return ConfigResult({
-    'type': 'base',
-    'gpl': false,
-    'small': true,
-  }, packageRoot);
+@visibleForTesting
+Future<T> resolveAfterTargetArchitectureValidation<T>({
+  required OS targetOS,
+  required Architecture targetArch,
+  required Future<T> Function() resolve,
+}) async {
+  validateTargetArchitecture(targetOS, targetArch);
+  return resolve();
 }
 
-dynamic _parsePubspec(File file) {
+Future<void> _buildWasmAssets(
+  BuildInput input,
+  BuildOutputBuilder output,
+) async {
+  final configResult = _loadConfig(input, output);
+  validateWebBundleSelection(configResult.config);
+
+  final source = await _resolveWebArtifact(
+    configResult,
+    input,
+    output.dependencies.add,
+  );
+  final runtimeDir = selectWebRuntimeDirectory(source.searchRoot);
+  if (runtimeDir == null) {
+    throw _exception(
+      'WASM bundle must contain exactly one directory with both '
+      'ffmpegkit.mjs and ffmpegkit.wasm under ${source.searchRoot.path}',
+    );
+  }
+
+  for (final dependency in source.dependencies) {
+    output.dependencies.add(dependency);
+  }
+
+  final packageRoot = p.normalize(input.packageRoot.toFilePath());
+  final stagingBaseDirs = resolveWebStagingBaseDirs(
+    packageName: input.packageName,
+    packageRoot: packageRoot,
+    packageConfig: Platform.packageConfig,
+    configBaseDir: configResult.configBaseDir,
+    outputFile: input.outputFile.toFilePath(),
+    addDependency: output.dependencies.add,
+    log: _log,
+  );
+
+  final bridgeSource = File(
+    p.fromUri(input.packageRoot.resolve('web/ffmpegkit_bridge.mjs')),
+  );
+  final callbackRuntimeSource = File(
+    p.fromUri(input.packageRoot.resolve('web/ffmpegkit_callback_runtime.mjs')),
+  );
+  final heapRuntimeSource = File(
+    p.fromUri(input.packageRoot.resolve('web/ffmpegkit_heap_runtime.mjs')),
+  );
+  final loaderSource = File(
+    p.fromUri(input.packageRoot.resolve('web/ffmpegkit_loader.mjs')),
+  );
+
+  final runtimeFiles = <String, File>{
+    'ffmpegkit.mjs': File(p.join(runtimeDir.path, 'ffmpegkit.mjs')),
+    'ffmpegkit.wasm': File(p.join(runtimeDir.path, 'ffmpegkit.wasm')),
+    'ffmpegkit_bridge.mjs': bridgeSource,
+    'ffmpegkit_callback_runtime.mjs': callbackRuntimeSource,
+    'ffmpegkit_heap_runtime.mjs': heapRuntimeSource,
+    'ffmpegkit_loader.mjs': loaderSource,
+  };
+
+  for (final entry in runtimeFiles.entries) {
+    if (!entry.value.existsSync()) {
+      throw _exception(
+        'Missing Web runtime file ${entry.key}: ${entry.value.path}',
+      );
+    }
+  }
+
+  output.dependencies.add(bridgeSource.uri);
+  output.dependencies.add(callbackRuntimeSource.uri);
+  output.dependencies.add(heapRuntimeSource.uri);
+  output.dependencies.add(loaderSource.uri);
+
+  await stageWebRuntimeFiles(
+    files: runtimeFiles,
+    stagingBaseDirs: stagingBaseDirs,
+    packageName: input.packageName,
+  );
+
+  _log(
+    'Staged selected Flutter Web runtime from ${source.searchRoot.path} '
+    'for ${input.packageName} '
+    'under assets/packages/${input.packageName}/wasm/ in '
+    '${stagingBaseDirs.join(', ')}. Dart DataAssets are not required.',
+  );
+}
+
+@visibleForTesting
+List<Directory> webRuntimeStagingDirectories({
+  required String stagingBaseDir,
+  required String packageName,
+}) => <Directory>[
+  Directory(
+    p.join(
+      stagingBaseDir,
+      'build',
+      'web',
+      'assets',
+      'packages',
+      packageName,
+      'wasm',
+    ),
+  ),
+  Directory(
+    p.join(stagingBaseDir, 'web', 'assets', 'packages', packageName, 'wasm'),
+  ),
+];
+
+@visibleForTesting
+Future<void> stageWebRuntimeFiles({
+  required Map<String, File> files,
+  required Iterable<String> stagingBaseDirs,
+  required String packageName,
+}) async {
+  final sourceHashes = <String, String?>{};
+  for (final entry in files.entries) {
+    if (!entry.value.existsSync()) {
+      throw _exception(
+        'Missing Web runtime file ${entry.key}: ${entry.value.path}',
+      );
+    }
+    sourceHashes[entry.key] = await _computeFileSha256(entry.value);
+  }
+
+  for (final stagingBaseDir in stagingBaseDirs) {
+    for (final webAssetDir in webRuntimeStagingDirectories(
+      stagingBaseDir: stagingBaseDir,
+      packageName: packageName,
+    )) {
+      webAssetDir.createSync(recursive: true);
+      for (final entry in files.entries) {
+        final destination = File(p.join(webAssetDir.path, entry.key));
+        final destinationHash = destination.existsSync()
+            ? await _computeFileSha256(destination)
+            : null;
+        if (destinationHash != sourceHashes[entry.key]) {
+          entry.value.copySync(destination.path);
+        }
+      }
+    }
+  }
+}
+
+/// Rejects the known-invalid automatic Web debug artifact before any
+/// download, cache, extraction, or staging work can begin.
+@visibleForTesting
+void validateWebBundleSelection(dynamic config) {
+  if (artifactOverrideFor(config, 'web') != null) return;
+  final type = config['type']?.toString() ?? 'base';
+  if (type == 'debug') {
+    throw _exception(
+      'The automatic prebuilt Flutter Web debug artifact is unsupported '
+      'because the published artifact is browser-incompatible. For Web '
+      'debug/custom development, provide an explicit web/wasm override '
+      'containing one coherent ffmpegkit.mjs + ffmpegkit.wasm pair.',
+    );
+  }
+}
+
+@visibleForTesting
+Directory? selectWebRuntimeDirectory(Directory extractedDir) {
+  if (!extractedDir.existsSync()) return null;
+
+  final candidateDirectories = <String, Directory>{};
+  final pendingDirectories = <Directory>[extractedDir];
+  while (pendingDirectories.isNotEmpty) {
+    final directory = pendingDirectories.removeLast();
+    List<FileSystemEntity> entities;
+    try {
+      entities = directory.listSync(followLinks: false);
+    } on FileSystemException {
+      // A malformed or inaccessible archive subtree cannot be a valid runtime
+      // candidate. Continue scanning so another complete pair can still be
+      // selected, then fail closed if no unique pair remains.
+      continue;
+    }
+
+    for (final entity in entities) {
+      if (entity is Directory) {
+        pendingDirectories.add(entity);
+        continue;
+      }
+      if (entity is! File) continue;
+      final name = p.basename(entity.path);
+      if (name == 'ffmpegkit.mjs' || name == 'ffmpegkit.wasm') {
+        final parent = entity.parent;
+        candidateDirectories[p.normalize(parent.path)] = parent;
+      }
+    }
+  }
+
+  final completeDirectories = candidateDirectories.values
+      .where(
+        (directory) =>
+            File(p.join(directory.path, 'ffmpegkit.mjs')).existsSync() &&
+            File(p.join(directory.path, 'ffmpegkit.wasm')).existsSync(),
+      )
+      .toList();
+  return completeDirectories.length == 1 ? completeDirectories.single : null;
+}
+
+@visibleForTesting
+String resolveLocalOverridePath({
+  required String overridePath,
+  required String configBaseDir,
+  bool? runningOnLinux,
+}) {
+  final isLinux = runningOnLinux ?? Platform.isLinux;
+  const wslManyLinuxPrefix = '\\\\wsl.localhost\\ManyLinux\\';
+  if (isLinux &&
+      overridePath.toLowerCase().startsWith(wslManyLinuxPrefix.toLowerCase())) {
+    final linuxPath = overridePath
+        .substring(wslManyLinuxPrefix.length)
+        .replaceAll('\\', '/');
+    return '/$linuxPath';
+  }
+
+  // A Windows UNC path is already rooted even when this helper is exercised
+  // by a non-Windows host (for example, in a cross-platform unit test). Do
+  // not reinterpret it as a relative path under the current package root.
+  if (overridePath.startsWith(r'\\')) return overridePath;
+
+  return p.isAbsolute(overridePath)
+      ? overridePath
+      : p.join(configBaseDir, overridePath);
+}
+
+@visibleForTesting
+WebRuntimeSource? resolveLocalWebDirectory({
+  required String overridePath,
+  required String configBaseDir,
+}) {
+  final localPath = resolveLocalOverridePath(
+    overridePath: overridePath,
+    configBaseDir: configBaseDir,
+  );
+  if (FileSystemEntity.typeSync(localPath, followLinks: false) !=
+      FileSystemEntityType.directory) {
+    return null;
+  }
+
+  final searchRoot = Directory(localPath);
+  final runtimeDir = selectWebRuntimeDirectory(searchRoot);
+  if (runtimeDir == null) {
+    throw _exception(
+      'Local Web override directory must contain exactly one directory '
+      'with both ffmpegkit.mjs and ffmpegkit.wasm: $localPath',
+    );
+  }
+  return WebRuntimeSource(
+    searchRoot: searchRoot,
+    dependencies: [
+      File(p.join(runtimeDir.path, 'ffmpegkit.mjs')).uri,
+      File(p.join(runtimeDir.path, 'ffmpegkit.wasm')).uri,
+    ],
+  );
+}
+
+Future<WebRuntimeSource> _resolveWebArtifact(
+  ConfigResult configResult,
+  BuildInput input,
+  void Function(Uri uri) addDependency,
+) async {
+  final config = configResult.config;
+  final overrideUrl = artifactOverrideFor(config, 'web');
+  final cacheDir = Directory(
+    p.fromUri(input.outputDirectoryShared.resolve('ffmpeg_kit_cache/wasm/')),
+  )..createSync(recursive: true);
+
+  String filename;
+  String url;
+  if (overrideUrl != null) {
+    _log('Artifact: override $overrideUrl');
+    final overrideUri = parseRemoteOverride(overrideUrl);
+    if (overrideUri == null) {
+      final localPath = resolveLocalOverridePath(
+        overridePath: overrideUrl,
+        configBaseDir: configResult.configBaseDir,
+      );
+      final localType = FileSystemEntity.typeSync(
+        localPath,
+        followLinks: false,
+      );
+      final localDirectory = resolveLocalWebDirectory(
+        overridePath: overrideUrl,
+        configBaseDir: configResult.configBaseDir,
+      );
+      if (localDirectory != null) return localDirectory;
+      if (localType != FileSystemEntityType.file &&
+          localType != FileSystemEntityType.notFound) {
+        throw _exception(
+          'Local Web override must be a file or directory: $localPath',
+        );
+      }
+      final target = await resolveLocalOverrideToCache(
+        overridePath: overrideUrl,
+        configBaseDir: configResult.configBaseDir,
+        cacheDir: cacheDir,
+        addDependency: addDependency,
+      );
+      final artifact = await _handleDownloadedFile(
+        target,
+        cacheDir,
+        input,
+        useExtractionRoot: true,
+      );
+      return _webRuntimeSourceFromArtifact(artifact);
+    }
+    final target = await resolveRemoteOverrideToCache(
+      overrideUrl: overrideUri.toString(),
+      cacheDir: cacheDir,
+    );
+    final artifact = await _handleDownloadedFile(
+      target,
+      cacheDir,
+      input,
+      useExtractionRoot: true,
+    );
+    return _webRuntimeSourceFromArtifact(artifact);
+  } else {
+    var type = config['type']?.toString() ?? 'base';
+    if (type == 'streaming') type = 'video';
+    if (!_validTypes.contains(type)) {
+      throw _exception('Invalid bundle type: $type');
+    }
+    final gpl = config['gpl'] == true;
+    final small = config['small'] == true;
+    final currentType = type == 'debug' ? 'base' : type;
+    final parts = [
+      'bundle',
+      currentType,
+      _wasmPlatformName,
+      _wasmArchitectureName,
+      'static',
+    ];
+    if (type == 'debug') {
+      parts.add('debug');
+    }
+    if (small) {
+      parts.add('small');
+    }
+    parts.add(gpl ? 'gpl' : 'lgpl');
+    filename = '${parts.join('-')}.zip';
+    url = '$_baseUrlTemplate/v$version-wasm/$filename';
+  }
+
+  final targetFile = File(p.join(cacheDir.path, filename));
+  if (!targetFile.existsSync()) {
+    _log('Downloading $url...');
+    if (!await _downloadFile(url, targetFile)) {
+      throw _exception('Failed to download WASM bundle from $url');
+    }
+  }
+  _log('Verifying SHA256 hash from $url');
+  final expectedHash = await _fetchSha256Hash(
+    url,
+    platformName: _wasmPlatformName,
+  );
+  if (expectedHash == null) {
+    _log('No SHA256 hash found for $url; skipping verification');
+  } else {
+    final actualHash = await _computeFileSha256(targetFile);
+    if (actualHash == null) {
+      _log(
+        'Failed to compute SHA256 hash for $targetFile; skipping verification',
+      );
+    } else if (actualHash != expectedHash) {
+      deleteCorruptArtifact(targetFile, log: _log);
+      throw _exception(
+        'SHA256 hash mismatch: expected $expectedHash, got $actualHash',
+      );
+    }
+    _log('SHA256 verification passed');
+  }
+  final artifact = await _handleDownloadedFile(
+    targetFile,
+    cacheDir,
+    input,
+    useExtractionRoot: true,
+  );
+  return _webRuntimeSourceFromArtifact(artifact);
+}
+
+WebRuntimeSource _webRuntimeSourceFromArtifact(FFmpegArtifact artifact) {
+  final searchRoot = artifact.extractedDir;
+  if (searchRoot == null || !searchRoot.existsSync()) {
+    throw _exception('Could not find extracted WASM bundle for web build');
+  }
+  return WebRuntimeSource(searchRoot: searchRoot);
+}
+
+ConfigResult _loadConfig(BuildInput input, BuildOutputBuilder output) {
+  final packageRoot = p.normalize(input.packageRoot.toFilePath());
+  _log('input.packageRoot: $packageRoot');
+  _log('Platform.packageConfig: ${Platform.packageConfig}');
+
+  final userDefinesResult = resolveUserDefines(
+    read: (key) => input.userDefines[key],
+    readPath: (key) => input.userDefines.path(key),
+    readBase: (key) => input.userDefines.baseUri([key]),
+    packageRoot: packageRoot,
+    addDependency: output.dependencies.add,
+    log: _log,
+    targetPlatform: input.config.buildCodeAssets
+        ? input.config.code.targetOS.name
+        : 'web',
+  );
+  final result = selectConfigSource(
+    userDefines: userDefinesResult,
+    legacy: () => resolveConfig(
+      packageName: input.packageName,
+      packageRoot: packageRoot,
+      packageConfig: Platform.packageConfig,
+      readPubspec: _readPubspec,
+      log: _log,
+      addDependency: output.dependencies.add,
+    ),
+  );
+  _log('Configuration source: ${result.source}');
+  return result;
+}
+
+PubspecData? _readPubspec(File file) {
   try {
     final content = file.readAsStringSync();
     final doc = loadYaml(content);
-    return doc['ffmpeg_kit_extended_config'];
+    if (doc is! YamlMap) return null;
+    return PubspecData(
+      config: doc['ffmpeg_kit_extended_config'],
+      isWorkspace: doc.containsKey('workspace'),
+    );
   } catch (e) {
     return null;
   }
@@ -118,6 +570,16 @@ class FFmpegArtifact {
   FFmpegArtifact({required this.file, this.extractedDir, this.isAar = false});
 }
 
+class WebRuntimeSource {
+  final Directory searchRoot;
+  final List<Uri> dependencies;
+
+  const WebRuntimeSource({
+    required this.searchRoot,
+    this.dependencies = const <Uri>[],
+  });
+}
+
 class AppleRuntimeLayout {
   final File frameworkBinary;
   final List<File> companionLibraries;
@@ -129,7 +591,91 @@ class AppleRuntimeLayout {
 }
 
 @visibleForTesting
-File tempDownloadFileFor(File target) => File('${target.path}.downloading');
+File tempDownloadFileFor(File target) =>
+    _uniqueSiblingFile(target, 'downloading');
+
+String _cacheTempToken() =>
+    '${pid}_${DateTime.now().microsecondsSinceEpoch}_${_cacheTempRandom.nextInt(1 << 32)}';
+
+File _uniqueSiblingFile(File target, String purpose) =>
+    File('${target.path}.$purpose.${_cacheTempToken()}');
+
+Directory _uniqueSiblingDirectory(Directory target, String purpose) =>
+    Directory('${target.path}.$purpose.${_cacheTempToken()}');
+
+Future<bool> _isStaleCacheLock(Directory lock) async {
+  try {
+    final modified = (await lock.stat()).modified;
+    return DateTime.now().difference(modified) > _cacheLockStaleAfter;
+  } on FileSystemException {
+    return false;
+  }
+}
+
+Future<T> _withCacheLock<T>(
+  String targetPath,
+  Future<T> Function() action,
+) async {
+  final lock = Directory('$targetPath.lock');
+  lock.parent.createSync(recursive: true);
+  final ownerToken = _cacheTempToken();
+  final claim = _uniqueSiblingDirectory(lock, 'claiming');
+  var acquired = false;
+
+  try {
+    claim.createSync();
+    File(p.join(claim.path, 'owner')).writeAsStringSync(ownerToken);
+    while (!acquired) {
+      try {
+        // Directory.create is idempotent. Publishing a nonempty claim by
+        // rename instead provides exclusive acquisition across processes.
+        claim.renameSync(lock.path);
+        acquired = true;
+      } on FileSystemException {
+        if (!claim.existsSync()) rethrow;
+        if (!lock.existsSync()) continue;
+        if (await _isStaleCacheLock(lock)) {
+          deleteIfExists(lock);
+          continue;
+        }
+        await Future<void>.delayed(_cacheLockPollInterval);
+      }
+    }
+
+    return await action();
+  } finally {
+    if (acquired) {
+      final owner = File(p.join(lock.path, 'owner'));
+      if (owner.existsSync() && owner.readAsStringSync() == ownerToken) {
+        deleteIfExists(lock);
+      }
+    }
+    deleteIfExists(claim);
+  }
+}
+
+Future<void> _publishFile(File temporary, File destination) async {
+  destination.parent.createSync(recursive: true);
+  if (Platform.isWindows && destination.existsSync()) {
+    // Dart's Windows rename can report an error after replacing the target.
+    // Delete it first while the caller holds the destination lock so the
+    // subsequent rename has one well-defined outcome.
+    destination.deleteSync();
+  }
+  try {
+    temporary.renameSync(destination.path);
+  } on FileSystemException {
+    // Windows may not replace an existing file with rename. The caller holds
+    // the destination lock, so this fallback cannot expose a partial file to
+    // another hook invocation that participates in the cache protocol.
+    if (destination.existsSync()) {
+      destination.deleteSync();
+      temporary.renameSync(destination.path);
+    } else {
+      rethrow;
+    }
+  }
+}
 
 @visibleForTesting
 Directory extractRootFor(File file, Directory cacheDir) =>
@@ -138,15 +684,6 @@ Directory extractRootFor(File file, Directory cacheDir) =>
 @visibleForTesting
 File extractCompletionMarkerFor(Directory extractRoot) =>
     File(p.join(extractRoot.path, _extractMarkerFileName));
-
-@visibleForTesting
-void cleanupStaleDownload(File target, {void Function(String message)? log}) {
-  final tempTarget = tempDownloadFileFor(target);
-  if (tempTarget.existsSync()) {
-    log?.call('Removing stale partial download ${tempTarget.path}');
-    tempTarget.deleteSync();
-  }
-}
 
 @visibleForTesting
 void deleteIfExists(FileSystemEntity entity) {
@@ -173,68 +710,59 @@ Future<Directory> prepareExtractedArtifact(
   Future<bool> Function(File zipFile, String destPath) extractFile,
 ) async {
   final extractRoot = extractRootFor(file, cacheDir);
-  final marker = extractCompletionMarkerFor(extractRoot);
-  final hasPayload =
-      extractRoot.existsSync() &&
-      extractRoot.listSync().any(
-        (entity) => p.basename(entity.path) != _extractMarkerFileName,
-      );
-
-  final hasCompletedExtract =
-      extractRoot.existsSync() && marker.existsSync() && hasPayload;
-  if (hasCompletedExtract) {
-    return extractRoot;
+  final archiveHash = await _computeFileSha256(file);
+  if (archiveHash == null) {
+    throw _exception('Unable to hash archive before extraction: ${file.path}');
   }
 
-  if (extractRoot.existsSync()) {
-    deleteIfExists(extractRoot);
-  }
-
-  final tempExtractRoot = Directory('${extractRoot.path}.extracting');
-  deleteIfExists(tempExtractRoot);
-  tempExtractRoot.createSync(recursive: true);
-
-  try {
-    final extracted = await extractFile(file, tempExtractRoot.path);
-    if (!extracted) {
-      throw _exception('Failed to extract ${file.path}');
+  return _withCacheLock(extractRoot.path, () async {
+    final marker = extractCompletionMarkerFor(extractRoot);
+    final hasPayload =
+        extractRoot.existsSync() &&
+        extractRoot.listSync().any(
+          (entity) => p.basename(entity.path) != _extractMarkerFileName,
+        );
+    final hasCompletedExtract =
+        extractRoot.existsSync() &&
+        marker.existsSync() &&
+        hasPayload &&
+        marker.readAsStringSync().trim() == archiveHash;
+    if (hasCompletedExtract) {
+      return extractRoot;
     }
 
-    File(p.join(tempExtractRoot.path, _extractMarkerFileName)).createSync();
-    tempExtractRoot.renameSync(extractRoot.path);
-    return extractRoot;
-  } catch (_) {
-    deleteIfExists(tempExtractRoot);
-    rethrow;
-  }
+    if (extractRoot.existsSync()) {
+      deleteIfExists(extractRoot);
+    }
+
+    final tempExtractRoot = _uniqueSiblingDirectory(extractRoot, 'extracting');
+    tempExtractRoot.createSync(recursive: true);
+    try {
+      final extracted = await extractFile(file, tempExtractRoot.path);
+      if (!extracted) {
+        throw _exception('Failed to extract ${file.path}');
+      }
+
+      File(
+        p.join(tempExtractRoot.path, _extractMarkerFileName),
+      ).writeAsStringSync(archiveHash);
+      tempExtractRoot.renameSync(extractRoot.path);
+      return extractRoot;
+    } catch (_) {
+      deleteIfExists(tempExtractRoot);
+      rethrow;
+    }
+  });
 }
 
 Future<FFmpegArtifact?> _resolveArtifact(
   ConfigResult configResult,
   BuildInput input,
+  void Function(Uri uri) addDependency,
 ) async {
   final config = configResult.config;
-  String type = config['type']?.toString() ?? "base";
-  if (type == "streaming") type = "video";
-  if (type == "full") {
-    _log(
-      "Full bundle is a heavyweight package and may increase your app size significantly. "
-      "Please review all included libraries to make sure you need all bundled features. "
-      "Bundle content: https://github.com/akashskypatel/ffmpeg-kit-extended#supported-external-libraries "
-      "If you don't need all the libraries included in full bundle, consider using other bundles for smaller app sizes.",
-    );
-  }
-  if (!_validTypes.contains(type)) {
-    _log(
-      'Invalid bundle type: $type. Valid types are: ${_validTypes.join(', ')}',
-    );
-    exit(1);
-  }
-
-  final bool gpl = config['gpl'] == true;
-  final bool small = config['small'] == true;
   final platformName = targetOS.name; // Use .name for stable keys
-  final overrideUrl = config[platformName]?.toString();
+  final overrideUrl = artifactOverrideFor(config, platformName);
 
   final cacheDir = Directory(
     p.fromUri(
@@ -242,40 +770,60 @@ Future<FFmpegArtifact?> _resolveArtifact(
     ),
   );
   if (!cacheDir.existsSync()) cacheDir.createSync(recursive: true);
+  _log('Artifact cache: ${cacheDir.path}');
 
   String filename = '';
   String url = '';
 
   if (overrideUrl != null) {
-    if (_isUri(overrideUrl)) {
-      _log('Using remote override URL: $overrideUrl');
-      url = overrideUrl;
-      filename = p.basename(Uri.parse(url).path);
-      final targetFile = File(p.join(cacheDir.path, filename));
-      if (!await _downloadFile(url, targetFile)) {
-        throw _exception('Failed to download from $url.');
-      }
-      return await _handleDownloadedFile(targetFile, cacheDir, input);
+    final overrideUri = parseRemoteOverride(overrideUrl);
+    if (overrideUri != null) {
+      _log('Artifact: remote override $overrideUrl');
+      final targetFile = await resolveRemoteOverrideToCache(
+        overrideUrl: overrideUri.toString(),
+        cacheDir: cacheDir,
+      );
+      return await _handleDownloadedFile(
+        targetFile,
+        cacheDir,
+        input,
+        requireAppleFramework: targetOS == OS.iOS || targetOS == OS.macOS,
+      );
     } else {
-      _log('Using local override path: $overrideUrl');
-      final localFile = p.isAbsolute(overrideUrl)
-          ? File(overrideUrl)
-          : File(p.join(configResult.baseDir, overrideUrl));
-
-      if (localFile.existsSync()) {
-        filename = p.basename(localFile.path);
-        final cacheFile = File(p.join(cacheDir.path, filename));
-        if (!cacheFile.existsSync() ||
-            cacheFile.lengthSync() != localFile.lengthSync()) {
-          localFile.copySync(cacheFile.path);
-        }
-        return await _handleDownloadedFile(cacheFile, cacheDir, input);
-      }
-      throw _exception(
-        'Local override not found: $overrideUrl (resolved from ${configResult.baseDir})',
+      _log('Artifact: local override $overrideUrl');
+      final cacheFile = await resolveLocalOverrideToCache(
+        overridePath: overrideUrl,
+        configBaseDir: configResult.configBaseDir,
+        cacheDir: cacheDir,
+        addDependency: addDependency,
+      );
+      return await _handleDownloadedFile(
+        cacheFile,
+        cacheDir,
+        input,
+        requireAppleFramework: targetOS == OS.iOS || targetOS == OS.macOS,
       );
     }
   } else {
+    String type = config['type']?.toString() ?? 'base';
+    if (type == 'streaming') type = 'video';
+    if (!_validTypes.contains(type)) {
+      _log(
+        'Invalid bundle type: $type. Valid types are: ${_validTypes.join(', ')}',
+      );
+      exit(1);
+    }
+    if (type == 'full') {
+      _log(
+        'Full bundle is a heavyweight package and may increase your app size significantly. '
+        'Please review all included libraries to make sure you need all bundled features. '
+        'Bundle content: https://github.com/akashskypatel/ffmpeg-kit-extended#supported-external-libraries '
+        "If you don't need all the libraries included in full bundle, consider using other bundles for smaller app sizes.",
+      );
+    }
+    final gpl = config['gpl'] == true;
+    final small = config['small'] == true;
+    _log('Bundle: ${configDiagnosticSummary(config)}');
     final license = gpl ? 'gpl' : 'lgpl';
     final currentType = type == 'debug' ? 'base' : type;
 
@@ -304,9 +852,9 @@ Future<FFmpegArtifact?> _resolveArtifact(
       url = "$_baseUrlTemplate/$tag/$filename";
     } else {
       // Windows, Linux
-      final archStr = targetArch == Architecture.x64
-          ? 'x86_64'
-          : (targetArch == Architecture.arm64 ? 'arm64' : 'x86_64');
+      final archStr = targetOS == OS.windows
+          ? windowsArtifactArchitecture(targetArch)
+          : linuxArtifactArchitecture(targetArch);
       final parts = ['bundle', currentType, platformName, archStr, 'shared'];
       if (type == 'debug') {
         parts.add('debug');
@@ -320,6 +868,7 @@ Future<FFmpegArtifact?> _resolveArtifact(
     }
   }
 
+  _log('Artifact: $url');
   final targetFile = File(p.join(cacheDir.path, filename));
   if (!targetFile.existsSync()) {
     _log('Downloading $url...');
@@ -350,14 +899,21 @@ Future<FFmpegArtifact?> _resolveArtifact(
     _log('SHA256 verification passed');
   }
 
-  return _handleDownloadedFile(targetFile, cacheDir, input);
+  return _handleDownloadedFile(
+    targetFile,
+    cacheDir,
+    input,
+    requireAppleFramework: targetOS == OS.iOS || targetOS == OS.macOS,
+  );
 }
 
 Future<FFmpegArtifact> _handleDownloadedFile(
   File file,
   Directory cacheDir,
-  BuildInput input,
-) async {
+  BuildInput input, {
+  bool useExtractionRoot = false,
+  bool requireAppleFramework = false,
+}) async {
   if (file.path.endsWith('.aar')) {
     return FFmpegArtifact(file: file, isAar: true);
   }
@@ -367,17 +923,27 @@ Future<FFmpegArtifact> _handleDownloadedFile(
     cacheDir,
     _extractFile,
   );
-  // Auto-detect the xcframework directory inside
-  final finalExtractedDir = extractRoot
+  final extractedDirectories = extractRoot
       .listSync()
       .whereType<Directory>()
-      .firstWhere(
-        (d) => p.basename(d.path).endsWith('.xcframework'),
-        orElse: () => Directory(
-          p.join(extractRoot.path, p.basename(extractRoot.path)),
-        ), // flat zip fallback
-      );
-  return FFmpegArtifact(file: file, extractedDir: finalExtractedDir);
+      .toList();
+  final finalExtractedDir = requireAppleFramework
+      ? selectAppleXcframeworkRoot(extractRoot)
+      : extractedDirectories.firstWhere(
+          (d) => p.basename(d.path).endsWith('.xcframework'),
+          orElse: () => extractedDirectories.length == 1
+              ? extractedDirectories.single
+              : Directory(
+                  p.join(
+                    extractRoot.path,
+                    p.basenameWithoutExtension(file.path),
+                  ),
+                ), // flat zip fallback
+        );
+  return FFmpegArtifact(
+    file: file,
+    extractedDir: useExtractionRoot ? extractRoot : finalExtractedDir,
+  );
 }
 
 Future<void> _emitAssets(
@@ -423,9 +989,10 @@ Future<void> _emitAssets(
           ..sort((a, b) => a.path.compareTo(b.path));
 
     // Identify the main ffmpegkit library and companion libraries
-    final mainLibrary = soFiles.firstWhere(
-      (file) => p.basename(file.path) == 'libffmpegkit.so',
-      orElse: () => soFiles.first,
+    final mainLibrary = selectExactMainLibrary(
+      soFiles,
+      expectedBasename: 'libffmpegkit.so',
+      platform: 'Android ABI $abi',
     );
 
     // Add the main library
@@ -525,32 +1092,23 @@ Future<void> _emitAssets(
     final uniqueLibFiles = libFiles.toSet().toList()
       ..sort((a, b) => a.path.compareTo(b.path));
 
-    if (uniqueLibFiles.isEmpty) {
-      _log('No library files found in ${libDir.path}');
-      return;
-    }
-
-    // Identify the main ffmpegkit library and companion libraries
-    File mainLibrary;
-    try {
-      mainLibrary = uniqueLibFiles.firstWhere(
-        (file) => p.basename(file.path).toLowerCase().contains('ffmpegkit'),
-      );
-    } catch (e) {
-      // If no ffmpegkit library found, use the first library
-      mainLibrary = uniqueLibFiles.first;
-      _log(
-        'No ffmpegkit library found, using ${p.basename(mainLibrary.path)} as main library',
-      );
-    }
+    final expectedMainName = targetOS == OS.windows
+        ? 'libffmpegkit.dll'
+        : 'libffmpegkit.so';
+    final mainLibrary = selectExactMainLibrary(
+      uniqueLibFiles,
+      expectedBasename: expectedMainName,
+      platform: targetOS == OS.windows ? 'Windows' : 'Linux',
+    );
 
     // Add the main library
-    var mainName = p.basenameWithoutExtension(mainLibrary.path);
-    if (targetOS == OS.linux) mainName = mainName.replaceFirst('lib', '');
     output.assets.code.add(
       CodeAsset(
         package: packageName,
-        name: mainName,
+        // Keep this stable across physical filenames such as
+        // libffmpegkit.dll/libffmpegkit.so. It must match DefaultAsset in the
+        // generated Dart bindings and ffigen.yaml.
+        name: 'ffmpegkit',
         linkMode: DynamicLoadingBundled(),
         file: Uri.file(mainLibrary.path),
       ),
@@ -588,7 +1146,6 @@ Future<AppleRuntimeLayout> _buildAppleRuntimeFramework({
 }) async {
   final libDir = artifact.extractedDir!;
   final archStr = _getAppleArch();
-  final slicePrefix = targetOS == OS.iOS ? 'ios-' : 'macos-';
 
   // Determine if we need a simulator or device slice.
   // For iOS, check the target SDK to disambiguate between
@@ -597,37 +1154,40 @@ Future<AppleRuntimeLayout> _buildAppleRuntimeFramework({
       targetOS == OS.iOS &&
       input.config.code.iOS.targetSdk == IOSSdk.iPhoneSimulator;
 
-  final sliceDirs = libDir
-      .listSync(followLinks: false)
-      .whereType<Directory>()
-      .map((d) => d.path)
-      .where((path) => p.basename(path).startsWith(slicePrefix))
-      .toList();
+  final request = AppleSliceRequest(
+    platform: targetOS == OS.iOS ? 'ios' : 'macos',
+    variant: wantsSimulator ? 'simulator' : null,
+    architecture: archStr,
+  );
+  final xcframeworkInfoPlist = File(p.join(libDir.path, 'Info.plist'));
+  final candidates = xcframeworkInfoPlist.existsSync()
+      ? readAppleSliceCandidates(xcframeworkInfoPlist)
+      : filenameAppleSliceCandidates(
+          libDir,
+          platform: request.platform,
+          variant: request.variant,
+        );
+  final selectedSlice = selectAppleSlice(candidates, request);
 
-  String? selectedSliceDir;
-  if (targetOS == OS.iOS) {
-    // iOS: disambiguate by -simulator suffix
-    selectedSliceDir = sliceDirs.cast<String?>().firstWhere((path) {
-      final basename = p.basename(path!);
-      return wantsSimulator
-          ? basename.endsWith('-simulator')
-          : !basename.endsWith('-simulator');
-    }, orElse: () => null);
-  } else {
-    // macOS: only one slice expected
-    selectedSliceDir = sliceDirs.isNotEmpty ? sliceDirs.first : null;
-  }
-
-  if (selectedSliceDir == null) {
+  if (selectedSlice == null) {
     throw _exception(
-      'Could not find Apple slice${targetOS == OS.iOS ? ' (${wantsSimulator ? 'simulator' : 'device'})' : ''} starting with $slicePrefix in ${libDir.path}',
+      appleSliceSelectionFailureMessage(
+        request: request,
+        root: libDir.path,
+        candidates: candidates,
+      ),
     );
   }
-
-  final sliceDir = Directory(selectedSliceDir);
-  final sourceFrameworkBinary = File(
-    p.join(sliceDir.path, 'ffmpegkit.framework', 'ffmpegkit'),
+  final sliceDir = Directory(p.join(libDir.path, selectedSlice.identifier));
+  _log(
+    'XCFramework slice: ${selectedSlice.identifier} '
+    '(${selectedSlice.architectures.toList()..sort()})',
   );
+  final libraryEntry = File(p.join(sliceDir.path, selectedSlice.libraryPath));
+  final libraryRoot = Directory(libraryEntry.path);
+  final sourceFrameworkBinary = libraryRoot.existsSync()
+      ? File(p.join(libraryRoot.path, 'ffmpegkit'))
+      : libraryEntry;
 
   final sourceDylibs =
       sliceDir
@@ -676,33 +1236,58 @@ Future<AppleRuntimeLayout> _buildAppleRuntimeFramework({
   }
   companionDir.createSync(recursive: true);
 
-  await _thinOrCopyAppleBinary(
+  final frameworkVerification = await _thinOrCopyAppleBinary(
     source: sourceMainDylib,
     destination: frameworkBinary,
     archStr: archStr,
+    diagnosticContext: _appleDiagnosticContext(input),
+  );
+  _log(
+    'Source architectures: '
+    '${frameworkVerification.sourceArchitectures.toList()..sort()}; '
+    'Output architecture: '
+    '${frameworkVerification.outputArchitectures.toList()..sort()}',
   );
 
   final companionLibraries = <File>[];
   for (final dylib in sourceDylibs) {
     if (dylib.path == sourceMainDylib.path) continue;
+    // Companion libraries may support fewer architectures than libffmpegkit.
+    final architectures = await inspectAppleBinaryArchitectures(dylib);
+    if (!architectures.contains(archStr)) {
+      _log(
+        'Skipping companion ${p.basename(dylib.path)} for $archStr '
+        '(available architectures: ${architectures.toList()..sort()})',
+      );
+      continue;
+    }
     final destination = File(p.join(companionDir.path, p.basename(dylib.path)));
-    await _thinOrCopyAppleBinary(
+    final companionVerification = await _thinOrCopyAppleBinary(
       source: dylib,
       destination: destination,
       archStr: archStr,
+      diagnosticContext: _appleDiagnosticContext(input),
+    );
+    _log(
+      'Companion ${p.basename(dylib.path)} source architectures: '
+      '${companionVerification.sourceArchitectures.toList()..sort()}; '
+      'output architecture: '
+      '${companionVerification.outputArchitectures.toList()..sort()}',
     );
     companionLibraries.add(destination);
   }
 
   final sourceHeadersDir = sourceFrameworkBinary.existsSync()
-      ? Directory(p.join(sliceDir.path, 'ffmpegkit.framework', 'Headers'))
+      ? Directory(p.join(libraryRoot.path, 'Headers'))
       : Directory(p.join(sliceDir.path, 'Headers'));
   if (sourceHeadersDir.existsSync()) {
     await _copyDirectory(sourceHeadersDir, headersDir);
   }
 
   final infoPlist = File(p.join(resourcesDir.path, 'Info.plist'));
-  infoPlist.writeAsStringSync(_appleFrameworkInfoPlist());
+  infoPlist.writeAsStringSync(
+    _appleFrameworkInfoPlist(simulator: wantsSimulator),
+  );
 
   if (targetOS == OS.macOS) {
     _createFrameworkSymlink(
@@ -729,25 +1314,20 @@ Future<AppleRuntimeLayout> _buildAppleRuntimeFramework({
   );
 }
 
-Future<void> _thinOrCopyAppleBinary({
+Future<AppleBinaryVerification> _thinOrCopyAppleBinary({
   required File source,
   required File destination,
   required String archStr,
+  required String diagnosticContext,
 }) async {
   destination.parent.createSync(recursive: true);
-  _log('Thinning ${p.basename(source.path)} to $archStr...');
-
-  final lipoRes = await Process.run('lipo', [
-    source.path,
-    '-thin',
-    archStr,
-    '-output',
-    destination.path,
-  ]);
-
-  if (lipoRes.exitCode != 0) {
-    source.copySync(destination.path);
-  }
+  _log('Preparing ${p.basename(source.path)} for $archStr...');
+  return materializeAppleBinary(
+    source: source,
+    destination: destination,
+    architecture: archStr,
+    diagnosticContext: diagnosticContext,
+  );
 }
 
 Future<void> _copyDirectory(Directory source, Directory destination) async {
@@ -779,8 +1359,11 @@ void _createFrameworkSymlink(
   link.createSync(target);
 }
 
-String _appleFrameworkInfoPlist() {
-  final platform = targetOS == OS.macOS ? 'MacOSX' : 'iPhoneOS';
+String _appleFrameworkInfoPlist({required bool simulator}) {
+  final platform = appleFrameworkSupportedPlatform(
+    macOS: targetOS == OS.macOS,
+    simulator: simulator,
+  );
   return '''
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -811,30 +1394,32 @@ String _appleFrameworkInfoPlist() {
 ''';
 }
 
-String _getAndroidAbi() {
-  if (targetArch == Architecture.arm) return 'armeabi-v7a';
-  if (targetArch == Architecture.arm64) return 'arm64-v8a';
-  if (targetArch == Architecture.ia32) return 'x86';
-  if (targetArch == Architecture.x64) return 'x86_64';
-  return 'arm64-v8a';
+String _getAndroidAbi() => androidAbiForArchitecture(targetArch);
+
+String _getAppleArch() => targetOS == OS.iOS
+    ? iosArtifactArchitecture(targetArch)
+    : macosArtifactArchitecture(targetArch);
+
+String _appleDiagnosticContext(BuildInput input) {
+  final sdk = targetOS == OS.iOS
+      ? input.config.code.iOS.targetSdk.type
+      : 'macOS';
+  return 'Target: ${targetOS.name}-${targetArch.name}; SDK: $sdk';
 }
 
-String _getAppleArch() {
-  if (targetArch == Architecture.arm64) return 'arm64';
-  if (targetArch == Architecture.x64) return 'x86_64';
-  return 'arm64';
-}
+String _buildHookSdk(BuildInput input) =>
+    targetOS == OS.iOS ? input.config.code.iOS.targetSdk.type : targetOS.name;
 
 Future<bool> _downloadFile(String url, File target) async {
   final client = HttpClient();
-  cleanupStaleDownload(target, log: _log);
   final tempTarget = tempDownloadFileFor(target);
   try {
+    tempTarget.parent.createSync(recursive: true);
     final request = await client.getUrl(Uri.parse(url));
     final response = await request.close();
     if (response.statusCode == 200) {
       await response.pipe(tempTarget.openWrite());
-      tempTarget.renameSync(target.path);
+      await _withCacheLock(target.path, () => _publishFile(tempTarget, target));
       return true;
     }
     await response.drain<void>();
@@ -844,9 +1429,43 @@ Future<bool> _downloadFile(String url, File target) async {
     if (tempTarget.existsSync()) tempTarget.deleteSync();
     rethrow;
   } finally {
+    if (tempTarget.existsSync()) tempTarget.deleteSync();
     client.close();
   }
 }
+
+const String windowsArchiveExtractionScript = r'''
+$ErrorActionPreference = 'Stop'
+Expand-Archive -LiteralPath $env:FFMPEG_KIT_ARCHIVE -DestinationPath $env:FFMPEG_KIT_DESTINATION -Force
+''';
+
+@visibleForTesting
+class WindowsArchiveExtractionInvocation {
+  final List<String> arguments;
+  final Map<String, String> environment;
+
+  WindowsArchiveExtractionInvocation({
+    required this.arguments,
+    required Map<String, String> environment,
+  }) : environment = Map.unmodifiable(environment);
+}
+
+@visibleForTesting
+WindowsArchiveExtractionInvocation buildWindowsArchiveExtractionInvocation(
+  String archivePath,
+  String destinationPath,
+) => WindowsArchiveExtractionInvocation(
+  arguments: const [
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    windowsArchiveExtractionScript,
+  ],
+  environment: {
+    'FFMPEG_KIT_ARCHIVE': archivePath,
+    'FFMPEG_KIT_DESTINATION': destinationPath,
+  },
+);
 
 Future<bool> _extractFile(File zipFile, String destPath) async {
   File? tempZipFile;
@@ -860,15 +1479,21 @@ Future<bool> _extractFile(File zipFile, String destPath) async {
         );
         zipFile = tempZipFile;
       }
-      final res = await Process.run('powershell', [
-        '-command',
-        'Expand-Archive -Path "${zipFile.path}" -DestinationPath "$destPath" -Force',
-      ]);
+      final invocation = buildWindowsArchiveExtractionInvocation(
+        zipFile.path,
+        destPath,
+      );
+      final res = await Process.run(
+        'powershell',
+        invocation.arguments,
+        environment: invocation.environment,
+        includeParentEnvironment: true,
+      );
       if (res.exitCode != 0) {
         _log(
-          'Command: Expand-Archive -Path "${zipFile.path}" -DestinationPath "$destPath" -Force',
+          'PowerShell Expand-Archive failed for ${zipFile.path} '
+          'to $destPath',
         );
-        _log('Failed to extract ${zipFile.path}');
         _log('Error: ${res.stderr}');
       }
       return res.exitCode == 0;
@@ -902,25 +1527,111 @@ Future<bool> _extractFile(File zipFile, String destPath) async {
   }
 }
 
-bool _isUri(String path) {
+@visibleForTesting
+Uri? parseRemoteOverride(String value) {
+  if (!isUriLikeOverride(value)) return null;
+
+  final uri = Uri.tryParse(value);
+  if (uri == null || !uri.hasScheme) {
+    throw _exception('Invalid remote override URI: $value');
+  }
+  final scheme = uri.scheme.toLowerCase();
+  if (scheme != 'http' && scheme != 'https') {
+    throw _exception(
+      'Unsupported remote override scheme "$scheme"; '
+      'only http:// and https:// are supported',
+    );
+  }
+  if (uri.host.isEmpty) {
+    throw _exception('Remote override URI must include a host: $value');
+  }
+  return uri;
+}
+
+String _remoteCacheIdentity(Uri uri) =>
+    sha256.convert(utf8.encode(uri.toString())).toString().substring(0, 16);
+
+@visibleForTesting
+File remoteCacheFileFor(Uri uri, Directory cacheDir) {
+  var basename = p.posix.basename(uri.path);
+  if (basename.isEmpty || basename == '.' || basename == '..') {
+    basename = 'artifact';
+  }
+  basename = basename.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
+  return File(p.join(cacheDir.path, '${_remoteCacheIdentity(uri)}-$basename'));
+}
+
+typedef RemoteOverrideDownloader = Future<bool> Function(Uri uri, File target);
+
+@visibleForTesting
+Future<bool> syncRemoteOverrideToCache({
+  required Uri uri,
+  required File cacheFile,
+  required Directory cacheDir,
+  RemoteOverrideDownloader? download,
+}) async {
+  cacheDir.createSync(recursive: true);
+  final tempFile = _uniqueSiblingFile(cacheFile, 'refreshing');
   try {
-    if (path.contains("\\\\wsl.")) return false;
-    final uri = Uri.parse(path);
-    return uri.hasScheme &&
-        (uri.scheme == 'http' || uri.scheme == 'https' || uri.scheme == 'ftp');
-  } catch (e) {
-    return false;
+    final downloaded = await (download ?? _downloadRemoteOverride)(
+      uri,
+      tempFile,
+    );
+    if (!downloaded) {
+      throw _exception('Failed to download remote override from $uri');
+    }
+
+    final downloadedHash = await _computeFileSha256(tempFile);
+    if (downloadedHash == null) {
+      throw _exception('Unable to hash downloaded remote override from $uri');
+    }
+
+    return await _withCacheLock(cacheFile.path, () async {
+      final cachedHash = cacheFile.existsSync()
+          ? await _computeFileSha256(cacheFile)
+          : null;
+      if (downloadedHash == cachedHash) return false;
+
+      await _publishFile(tempFile, cacheFile);
+      deleteIfExists(extractRootFor(cacheFile, cacheDir));
+      return true;
+    });
+  } finally {
+    deleteIfExists(tempFile);
   }
 }
 
-Future<String?> _fetchSha256Hash(String url) async {
+Future<bool> _downloadRemoteOverride(Uri uri, File target) =>
+    _downloadFile(uri.toString(), target);
+
+@visibleForTesting
+Future<File> resolveRemoteOverrideToCache({
+  required String overrideUrl,
+  required Directory cacheDir,
+  RemoteOverrideDownloader? download,
+}) async {
+  final uri = parseRemoteOverride(overrideUrl);
+  if (uri == null) {
+    throw _exception('Expected an HTTP(S) remote override: $overrideUrl');
+  }
+  final cacheFile = remoteCacheFileFor(uri, cacheDir);
+  await syncRemoteOverrideToCache(
+    uri: uri,
+    cacheFile: cacheFile,
+    cacheDir: cacheDir,
+    download: download,
+  );
+  return cacheFile;
+}
+
+Future<String?> _fetchSha256Hash(String url, {String? platformName}) async {
   final client = HttpClient();
   try {
     // if github, use github api to get the file hash
     // https://api.github.com/repos/akashskypatel/ffmpeg-kit-builders/releases/${id}
     // https://api.github.com/repos/akashskypatel/ffmpeg-kit-builders/releases/${id}
     // https://api.github.com/repos/akashskypatel/ffmpeg-kit-builders/releases/tags/${tag}
-    final tag = "v$version-${targetOS.name}";
+    final tag = "v$version-${platformName ?? targetOS.name}";
     final releaseName = p.basename(url);
     final request = await client.getUrl(
       Uri.parse(
@@ -966,4 +1677,80 @@ Future<String?> _computeFileSha256(File file) async {
   } catch (e) {
     return null;
   }
+}
+
+String _localOverrideCacheFileName(File source) {
+  final absolutePath = p.normalize(source.absolute.path);
+  final identity = Platform.isWindows
+      ? absolutePath.toLowerCase()
+      : absolutePath;
+  final pathDigest = sha256
+      .convert(utf8.encode(identity))
+      .toString()
+      .substring(0, 16);
+  return '$pathDigest-${p.basename(source.path)}';
+}
+
+@visibleForTesting
+Future<bool> syncLocalOverride(
+  File source,
+  File destination, {
+  Directory? cacheDir,
+}) async {
+  final sourceHash = await _computeFileSha256(source);
+  if (sourceHash == null) {
+    throw _exception('Unable to read local override: ${source.path}');
+  }
+
+  destination.parent.createSync(recursive: true);
+  return _withCacheLock(destination.path, () async {
+    final destinationHash = destination.existsSync()
+        ? await _computeFileSha256(destination)
+        : null;
+    if (sourceHash == destinationHash) return false;
+
+    final temporary = _uniqueSiblingFile(destination, 'copying');
+    try {
+      destination.parent.createSync(recursive: true);
+      await source.copy(temporary.path);
+      final copiedHash = await _computeFileSha256(temporary);
+      if (copiedHash != sourceHash) {
+        throw _exception(
+          'Local override changed while copying: ${source.path}',
+        );
+      }
+      await _publishFile(temporary, destination);
+      if (cacheDir != null) {
+        deleteIfExists(extractRootFor(destination, cacheDir));
+      }
+      return true;
+    } finally {
+      deleteIfExists(temporary);
+    }
+  });
+}
+
+@visibleForTesting
+Future<File> resolveLocalOverrideToCache({
+  required String overridePath,
+  required String configBaseDir,
+  required Directory cacheDir,
+  required void Function(Uri uri) addDependency,
+}) async {
+  final localFile = File(
+    resolveLocalOverridePath(
+      overridePath: overridePath,
+      configBaseDir: configBaseDir,
+    ),
+  );
+  if (!localFile.existsSync()) {
+    throw _exception('Local override not found: ${localFile.path}');
+  }
+
+  addDependency(localFile.uri);
+  final cacheFile = File(
+    p.join(cacheDir.path, _localOverrideCacheFileName(localFile)),
+  );
+  await syncLocalOverride(localFile, cacheFile, cacheDir: cacheDir);
+  return cacheFile;
 }

@@ -1,4 +1,10 @@
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   ActivityIndicator,
   PanResponder,
@@ -27,7 +33,11 @@ import {
 } from 'ffmpeg-kit-extended';
 
 export type ExamplePlatformName =
-  'Android' | 'iOS' | 'macOS' | 'Apple tvOS' | 'Windows';
+  | 'Android'
+  | 'iOS'
+  | 'macOS'
+  | 'Apple tvOS'
+  | 'Windows';
 
 export type ExamplePlatformServices = {
   exampleDir: string;
@@ -56,6 +66,13 @@ type RemoteRecordingJob = {
 };
 
 const TABS: TabName[] = ['FFmpeg', 'Stream', 'FFprobe', 'FFplay', 'Transcode'];
+const TAB_TEST_IDS: Record<TabName, string> = {
+  FFmpeg: 'tab.ffmpeg',
+  Stream: 'tab.stream',
+  FFprobe: 'tab.ffprobe',
+  FFplay: 'tab.ffplay',
+  Transcode: 'tab.transcode',
+};
 const TAB_SYMBOLS: Record<TabName, string> = {
   FFmpeg: '▣',
   Stream: '≋',
@@ -70,6 +87,21 @@ const MAX_RENDERED_LOG_CHARS = 50_000;
 const LOG_FLUSH_INTERVAL_MS = 250;
 const PLAYBACK_STATUS_INTERVAL_MS = 500;
 const FFPLAY_MONITOR_INTERVAL_MS = 250;
+const TEST_VIDEO_FRAME_WIDTH = 512;
+const TEST_VIDEO_FRAME_HEIGHT = 512;
+const TEST_VIDEO_SOURCE =
+  `color=c=red:size=${TEST_VIDEO_FRAME_WIDTH}x${TEST_VIDEO_FRAME_HEIGHT}:rate=30:duration=2[red];` +
+  `color=c=green:size=${TEST_VIDEO_FRAME_WIDTH}x${TEST_VIDEO_FRAME_HEIGHT}:rate=30:duration=2[green];` +
+  `color=c=blue:size=${TEST_VIDEO_FRAME_WIDTH}x${TEST_VIDEO_FRAME_HEIGHT}:rate=30:duration=2[blue];` +
+  `color=c=white:size=${TEST_VIDEO_FRAME_WIDTH}x${TEST_VIDEO_FRAME_HEIGHT}:rate=30:duration=2[white];` +
+  '[red][green][blue][white]concat=n=4:v=1:a=0';
+const TEST_VIDEO_FRAME_SAMPLES = [
+  {name: 'red phase', atSeconds: 0.5, yuv: [81, 90, 240]},
+  {name: 'green phase', atSeconds: 2.5, yuv: [81, 91, 81]},
+  {name: 'blue phase', atSeconds: 4.5, yuv: [41, 240, 110]},
+  {name: 'white phase', atSeconds: 6.5, yuv: [235, 128, 128]},
+] as const;
+const TEST_VIDEO_FRAME_SAMPLE_TOLERANCE = 12;
 
 const LOG_LEVELS = [
   LogLevel.Stderr,
@@ -113,7 +145,7 @@ export function ExampleApp({
   platformName: ExamplePlatformName;
   platformServices: ExamplePlatformServices;
 }): React.JSX.Element {
-  const {width, height} = useWindowDimensions();
+  const { width, height } = useWindowDimensions();
   const isMobile = width < 600;
   const EXAMPLE_DIR = platformServices.exampleDir;
   const TEST_VIDEO_PATH = `${EXAMPLE_DIR}/test_video.mp4`;
@@ -145,18 +177,21 @@ export function ExampleApp({
   const [transcodeOutputPath, setTranscodeOutputPath] = useState<string>();
   const [transcodeProgress, setTranscodeProgress] = useState(0);
   const [transcodeStatus, setTranscodeStatus] = useState('');
+  const [generatedVideoVerification, setGeneratedVideoVerification] =
+    useState('');
   const [isTranscoding, setIsTranscoding] = useState(false);
   const [playbackSession, setPlaybackSession] = useState<FFplaySession>();
   const [playbackPosition, setPlaybackPosition] = useState(0);
   const [playbackDuration, setPlaybackDuration] = useState(0);
   const [playbackState, setPlaybackState] = useState('Stopped');
-  const [videoSize, setVideoSize] = useState({width: 0, height: 0});
+  const [videoSize, setVideoSize] = useState({ width: 0, height: 0 });
   const [volume, setVolume] = useState(0.5);
   const [logPaneHeight, setLogPaneHeight] = useState(() =>
     Math.max(96, Math.min(180, height * 0.18)),
   );
   const videoSurfaceReadyRef = useRef(false);
   const logResizeStartRef = useRef(logPaneHeight);
+  const contentScrollRef = useRef<ScrollView>(null);
   const logScrollRef = useRef<ScrollView>(null);
   const pendingLogsRef = useRef('');
   const logFlushTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -191,7 +226,9 @@ export function ExampleApp({
         },
         onPanResponderMove: (_, gestureState) => {
           const nextHeight = logResizeStartRef.current - gestureState.dy;
-          setLogPaneHeight(Math.max(96, Math.min(maxLogPaneHeight, nextHeight)));
+          setLogPaneHeight(
+            Math.max(96, Math.min(maxLogPaneHeight, nextHeight)),
+          );
         },
       }),
     [logPaneHeight, maxLogPaneHeight],
@@ -296,14 +333,14 @@ export function ExampleApp({
           setVideoSize(current =>
             current.width === videoWidth && current.height === videoHeight
               ? current
-              : {width: videoWidth, height: videoHeight},
+              : { width: videoWidth, height: videoHeight },
           );
         }
         const nextPlaybackState = playbackSession.isPlaying()
           ? 'Playing'
           : playbackSession.isPaused()
-            ? 'Paused'
-            : 'Stopped';
+          ? 'Paused'
+          : 'Stopped';
         setPlaybackState(current =>
           current === nextPlaybackState ? current : nextPlaybackState,
         );
@@ -315,30 +352,122 @@ export function ExampleApp({
   }, [activeTab, playbackSession]);
 
   useEffect(() => {
+    contentScrollRef.current?.scrollTo({ y: 0, animated: false });
+  }, [activeTab, playbackSession]);
+
+  useEffect(() => {
     setLogPaneHeight(current =>
       Math.max(96, Math.min(maxLogPaneHeight, current)),
     );
   }, [maxLogPaneHeight]);
 
   useEffect(() => {
-    logScrollRef.current?.scrollToEnd({animated: false});
+    logScrollRef.current?.scrollToEnd({ animated: false });
   }, [logs]);
 
   const generateTestVideo = useCallback(async () => {
+    setGeneratedVideoVerification('Generating test video...');
     appendLog(`--- Generating Test Video with Audio: ${TEST_VIDEO_PATH} ---`);
     const command =
-      '-hide_banner -loglevel error -f lavfi -i testsrc=duration=5:size=512x512:rate=30 ' +
-      '-f lavfi -i sine=frequency=1000:duration=5 -c:v mpeg2video -c:a aac -shortest -y ' +
+      `-hide_banner -loglevel error -f lavfi -i ${quote(TEST_VIDEO_SOURCE)} ` +
+      '-f lavfi -i sine=frequency=1000:duration=8 -c:v mpeg2video -c:a aac -shortest -y ' +
       quote(TEST_VIDEO_PATH);
     const session = await FFmpegKit.executeAsync(command, {
       logCallback: log => appendLog(log.message),
     });
-    appendLog(
-      session.getReturnCode() === ReturnCode.Success
-        ? 'Video with audio generated successfully.'
-        : `Generation failed. Code: ${session.getReturnCode()}`,
-    );
-  }, [appendLog]);
+    if (session.getReturnCode() !== ReturnCode.Success) {
+      throw new Error(`Generation failed. Code: ${session.getReturnCode()}`);
+    }
+
+    appendLog('--- Verifying changing decoded video frames against original input ---');
+    setGeneratedVideoVerification('Verifying changing video frames...');
+    const readFrameYuv = async (
+      inputArguments: string,
+      sample: (typeof TEST_VIDEO_FRAME_SAMPLES)[number],
+      label: string,
+    ): Promise<number[]> => {
+      const verification = await FFmpegKit.executeAsync(
+        `-hide_banner -loglevel info ${inputArguments} ` +
+          '-vf "signalstats,metadata=print:direct=1" ' +
+          '-frames:v 1 -an -f null -',
+        {logCallback: log => appendLog(log.message)},
+      );
+      if (verification.getReturnCode() !== ReturnCode.Success) {
+        throw new Error(
+          `Could not decode ${sample.name} from ${label}. ` +
+            `Code: ${verification.getReturnCode()}`,
+        );
+      }
+      const verificationOutput = `${verification.getOutput()}\n${verification.getLogsAsString()}`;
+      const actual = (['YAVG', 'UAVG', 'VAVG'] as const).map(channel =>
+        signalStat(verificationOutput, channel),
+      );
+      if (actual.some(value => value === undefined)) {
+        throw new Error(
+          `Missing YUV signal statistics for ${label} ${sample.name}`,
+        );
+      }
+      return actual.map(value => value as number);
+    };
+
+    const originalSignatures: string[] = [];
+    const outputSignatures: string[] = [];
+    for (const sample of TEST_VIDEO_FRAME_SAMPLES) {
+      const originalYuv = await readFrameYuv(
+        `-f lavfi -i ${quote(TEST_VIDEO_SOURCE)} -ss ${sample.atSeconds}`,
+        sample,
+        'original input',
+      );
+      if (
+        originalYuv.some(
+          (value, index) =>
+            Math.abs(value - sample.yuv[index]) >
+            TEST_VIDEO_FRAME_SAMPLE_TOLERANCE,
+        )
+      ) {
+        throw new Error(
+          `Original input pixel mismatch for ${sample.name}: ` +
+            `expected YUV=${sample.yuv.join(',')}, ` +
+            `actual=${originalYuv.join(',')}`,
+        );
+      }
+      originalSignatures.push(originalYuv.join(','));
+
+      const outputYuv = await readFrameYuv(
+        `-ss ${sample.atSeconds} -i ${quote(TEST_VIDEO_PATH)}`,
+        sample,
+        `final output ${TEST_VIDEO_PATH}`,
+      );
+      if (
+        outputYuv.some(
+          (value, index) =>
+            Math.abs(value - originalYuv[index]) >
+            TEST_VIDEO_FRAME_SAMPLE_TOLERANCE,
+        )
+      ) {
+        throw new Error(
+          `Final output frame differs from original input for ${sample.name}: ` +
+            `original YUV=${originalYuv.join(',')}, ` +
+            `final YUV=${outputYuv.join(',')}`,
+        );
+      }
+      outputSignatures.push(outputYuv.join(','));
+      appendLog(
+        `Verified ${sample.name} at ${sample.atSeconds}s: ` +
+          `original YUV=${originalYuv.join(',')}, final YUV=${outputYuv.join(',')}`,
+      );
+    }
+    if (
+      new Set(originalSignatures).size !== TEST_VIDEO_FRAME_SAMPLES.length ||
+      new Set(outputSignatures).size !== TEST_VIDEO_FRAME_SAMPLES.length
+    ) {
+      throw new Error(
+        'Generated video did not change pixel values across all four playback phases',
+      );
+    }
+    setGeneratedVideoVerification('Verified 4 changing video frames');
+    appendLog('Video with audio generated successfully.');
+  }, [TEST_VIDEO_PATH, appendLog]);
 
   const generateTestAudio = useCallback(async () => {
     appendLog(`--- Generating Test Audio: ${TEST_AUDIO_PATH} ---`);
@@ -365,7 +494,9 @@ export function ExampleApp({
 
   const runFfmpegAwaited = useCallback(async () => {
     appendLog('--- Running FFmpeg -version (awaited execute()) ---');
-    appendLog('React Native execute() is Promise-based and does not block the JS runtime.');
+    appendLog(
+      'React Native execute() is Promise-based and does not block the JS runtime.',
+    );
     const session = await FFmpegKit.execute('-version');
     appendLog(session.getOutput() || 'No output captured.');
     appendLog(`Return code: ${session.getReturnCode()}`);
@@ -386,80 +517,135 @@ export function ExampleApp({
     });
   }, [appendLog]);
 
-  const logSystemInfo = useCallback((kind: string) => {
-    try {
-      switch (kind) {
-        case 'basic':
-          appendLog('--- System & Config Information ---');
-          appendLog(`FFmpeg Version: ${FFmpegKitExtended.getFFmpegVersion()}`);
-          appendLog(`FFmpegKit Version: ${FFmpegKitExtended.getVersion()}`);
-          appendLog(`Build Date: ${FFmpegKitExtended.getBuildDate()}`);
-          appendLog(`Package Name: ${FFmpegKitExtended.getPackageName()}`);
-          appendLog(
-            `Log Level: ${FFmpegKitConfig.logLevelToString(FFmpegKitConfig.getLogLevel())}`,
-          );
-          return;
-        case 'ffmpeg-version':
-          appendLog(`FFmpeg Version: ${FFmpegKitExtended.getFFmpegVersion()}`);
-          return;
-        case 'architecture':
-          appendLog(`FFmpeg Architecture: ${FFmpegKitExtended.getFFmpegArchitecture()}`);
-          return;
-        case 'ffmpegkit-version':
-          appendLog(`FFmpegKit Version: ${FFmpegKitExtended.getVersion()}`);
-          return;
-        case 'package-name':
-          appendLog(`Package Name: ${FFmpegKitExtended.getPackageName()}`);
-          return;
-        case 'bundle':
-          appendLog(`Bundle Type: ${FFmpegKitExtended.getBundleType()}`);
-          return;
-        case 'gpl':
-          appendLog(`GPL: ${FFmpegKitExtended.isGpl() ? 'enabled' : 'disabled'}`);
-          return;
-        case 'nonfree':
-          appendLog(`Non-free: ${FFmpegKitExtended.isNonfree() ? 'enabled' : 'disabled'}`);
-          return;
-        case 'libraries':
-          appendLog(`External Libraries:\n${FFmpegKitExtended.getExternalLibraries() || 'None'}`);
-          return;
-        case 'codecs':
-          appendLog(`Registered Codecs:\n${FFmpegKitExtended.getRegisteredCodecs() || 'None'}`);
-          return;
-        case 'encoders':
-          appendLog(`Registered Encoders:\n${FFmpegKitExtended.getRegisteredEncoders() || 'None'}`);
-          return;
-        case 'decoders':
-          appendLog(`Registered Decoders:\n${FFmpegKitExtended.getRegisteredDecoders() || 'None'}`);
-          return;
-        case 'muxers':
-          appendLog(`Registered Muxers:\n${FFmpegKitExtended.getRegisteredMuxers() || 'None'}`);
-          return;
-        case 'demuxers':
-          appendLog(`Registered Demuxers:\n${FFmpegKitExtended.getRegisteredDemuxers() || 'None'}`);
-          return;
-        case 'filters':
-          appendLog(`Registered Filters:\n${FFmpegKitExtended.getRegisteredFilters() || 'None'}`);
-          return;
-        case 'protocols':
-          appendLog(`Registered Protocols:\n${FFmpegKitExtended.getRegisteredProtocols() || 'None'}`);
-          return;
-        case 'bsfs':
-          appendLog(
-            `Registered Bitstream Filters:\n${FFmpegKitExtended.getRegisteredBitstreamFilters() || 'None'}`,
-          );
-          return;
-        case 'build':
-          appendLog(`Build Configuration:\n${FFmpegKitExtended.getBuildConfiguration() || 'None'}`);
-          return;
-        case 'build-date':
-          appendLog(`Build Date: ${FFmpegKitExtended.getBuildDate()}`);
-          return;
+  const logSystemInfo = useCallback(
+    (kind: string) => {
+      try {
+        switch (kind) {
+          case 'basic':
+            appendLog('--- System & Config Information ---');
+            appendLog(
+              `FFmpeg Version: ${FFmpegKitExtended.getFFmpegVersion()}`,
+            );
+            appendLog(`FFmpegKit Version: ${FFmpegKitExtended.getVersion()}`);
+            appendLog(`Build Date: ${FFmpegKitExtended.getBuildDate()}`);
+            appendLog(`Package Name: ${FFmpegKitExtended.getPackageName()}`);
+            appendLog(
+              `Log Level: ${FFmpegKitConfig.logLevelToString(
+                FFmpegKitConfig.getLogLevel(),
+              )}`,
+            );
+            return;
+          case 'ffmpeg-version':
+            appendLog(
+              `FFmpeg Version: ${FFmpegKitExtended.getFFmpegVersion()}`,
+            );
+            return;
+          case 'architecture':
+            appendLog(
+              `FFmpeg Architecture: ${FFmpegKitExtended.getFFmpegArchitecture()}`,
+            );
+            return;
+          case 'ffmpegkit-version':
+            appendLog(`FFmpegKit Version: ${FFmpegKitExtended.getVersion()}`);
+            return;
+          case 'package-name':
+            appendLog(`Package Name: ${FFmpegKitExtended.getPackageName()}`);
+            return;
+          case 'bundle':
+            appendLog(`Bundle Type: ${FFmpegKitExtended.getBundleType()}`);
+            return;
+          case 'gpl':
+            appendLog(
+              `GPL: ${FFmpegKitExtended.isGpl() ? 'enabled' : 'disabled'}`,
+            );
+            return;
+          case 'nonfree':
+            appendLog(
+              `Non-free: ${
+                FFmpegKitExtended.isNonfree() ? 'enabled' : 'disabled'
+              }`,
+            );
+            return;
+          case 'libraries':
+            appendLog(
+              `External Libraries:\n${
+                FFmpegKitExtended.getExternalLibraries() || 'None'
+              }`,
+            );
+            return;
+          case 'codecs':
+            appendLog(
+              `Registered Codecs:\n${
+                FFmpegKitExtended.getRegisteredCodecs() || 'None'
+              }`,
+            );
+            return;
+          case 'encoders':
+            appendLog(
+              `Registered Encoders:\n${
+                FFmpegKitExtended.getRegisteredEncoders() || 'None'
+              }`,
+            );
+            return;
+          case 'decoders':
+            appendLog(
+              `Registered Decoders:\n${
+                FFmpegKitExtended.getRegisteredDecoders() || 'None'
+              }`,
+            );
+            return;
+          case 'muxers':
+            appendLog(
+              `Registered Muxers:\n${
+                FFmpegKitExtended.getRegisteredMuxers() || 'None'
+              }`,
+            );
+            return;
+          case 'demuxers':
+            appendLog(
+              `Registered Demuxers:\n${
+                FFmpegKitExtended.getRegisteredDemuxers() || 'None'
+              }`,
+            );
+            return;
+          case 'filters':
+            appendLog(
+              `Registered Filters:\n${
+                FFmpegKitExtended.getRegisteredFilters() || 'None'
+              }`,
+            );
+            return;
+          case 'protocols':
+            appendLog(
+              `Registered Protocols:\n${
+                FFmpegKitExtended.getRegisteredProtocols() || 'None'
+              }`,
+            );
+            return;
+          case 'bsfs':
+            appendLog(
+              `Registered Bitstream Filters:\n${
+                FFmpegKitExtended.getRegisteredBitstreamFilters() || 'None'
+              }`,
+            );
+            return;
+          case 'build':
+            appendLog(
+              `Build Configuration:\n${
+                FFmpegKitExtended.getBuildConfiguration() || 'None'
+              }`,
+            );
+            return;
+          case 'build-date':
+            appendLog(`Build Date: ${FFmpegKitExtended.getBuildDate()}`);
+            return;
+        }
+      } catch (error) {
+        appendLog(`System information failed: ${String(error)}`);
       }
-    } catch (error) {
-      appendLog(`System information failed: ${String(error)}`);
-    }
-  }, [appendLog]);
+    },
+    [appendLog],
+  );
 
   const setLogLevel = useCallback(
     (level: LogLevel) => {
@@ -529,7 +715,10 @@ export function ExampleApp({
       appendLog(message);
       if (platformServices.canWriteTextFiles) {
         try {
-          await platformServices.appendTextFile(REMOTE_LOG_PATH, `${message}\n`);
+          await platformServices.appendTextFile(
+            REMOTE_LOG_PATH,
+            `${message}\n`,
+          );
         } catch {
           // UI logging remains useful if file logging fails.
         }
@@ -539,7 +728,9 @@ export function ExampleApp({
     void session
       .executeAsync({
         logCallback: log => {
-          void appendScenarioLog(`[${label}][log][session=${log.sessionId}] ${log.message}`);
+          void appendScenarioLog(
+            `[${label}][log][session=${log.sessionId}] ${log.message}`,
+          );
         },
         statisticsCallback: statistics => {
           void appendScenarioLog(formatRemoteStatistics(label, statistics));
@@ -547,7 +738,7 @@ export function ExampleApp({
             setRemoteJobs(previous =>
               previous.map(item =>
                 item.sessionId === session.getSessionId()
-                  ? {...item, startedWriting: true}
+                  ? { ...item, startedWriting: true }
                   : item,
               ),
             );
@@ -574,7 +765,7 @@ export function ExampleApp({
         setRemoteJobs(previous =>
           previous.map(item =>
             item.sessionId === session.getSessionId()
-              ? {...item, completed: true}
+              ? { ...item, completed: true }
               : item,
           ),
         );
@@ -598,7 +789,9 @@ export function ExampleApp({
       job.session.cancel();
       setRemoteJobs(previous =>
         previous.map(item =>
-          item.sessionId === sessionId ? {...item, requestedCancel: true} : item,
+          item.sessionId === sessionId
+            ? { ...item, requestedCancel: true }
+            : item,
         ),
       );
       appendLog(`Requested cancel for session ${sessionId}.`);
@@ -608,8 +801,12 @@ export function ExampleApp({
 
   const refreshSessions = useCallback(() => {
     const sessions = FFmpegKitExtended.getSessions();
-    const running = sessions.filter(session => session.getState() === SessionState.Running);
-    appendLog(`Session history: ${sessions.length}; currently running: ${running.length}.`);
+    const running = sessions.filter(
+      session => session.getState() === SessionState.Running,
+    );
+    appendLog(
+      `Session history: ${sessions.length}; currently running: ${running.length}.`,
+    );
     setRemoteJobs(previous =>
       previous.map(job => ({
         ...job,
@@ -649,7 +846,9 @@ export function ExampleApp({
 
   const runMediaInformation = useCallback(async () => {
     const localTestExists = await platformServices.fileExists(TEST_VIDEO_PATH);
-    const probePath = selectedProbePath ?? (localTestExists ? TEST_VIDEO_PATH : MEDIA_INFO_FALLBACK);
+    const probePath =
+      selectedProbePath ??
+      (localTestExists ? TEST_VIDEO_PATH : MEDIA_INFO_FALLBACK);
     appendLog(`--- Getting Media Information for ${probePath} ---`);
     const session = await FFprobeKit.getMediaInformation(probePath);
     const info = session.getMediaInformation();
@@ -665,7 +864,9 @@ export function ExampleApp({
     appendLog(`Media Information: ${info.allPropertiesJson ?? '{}'}`);
     info.streams.forEach((stream, index) => {
       appendLog(
-        ` Stream #${index}: ${stream.type ?? '?'} (${stream.codec ?? '?'}) - ${stream.width ?? 0}x${stream.height ?? 0}`,
+        ` Stream #${index}: ${stream.type ?? '?'} (${stream.codec ?? '?'}) - ${
+          stream.width ?? 0
+        }x${stream.height ?? 0}`,
       );
     });
   }, [TEST_VIDEO_PATH, appendLog, platformServices, selectedProbePath]);
@@ -688,7 +889,9 @@ export function ExampleApp({
     }
 
     if (!videoSurfaceReadyRef.current) {
-      throw new Error('FFplay video surface is not ready. Open the FFplay tab and try again.');
+      throw new Error(
+        'FFplay video surface is not ready. Open the FFplay tab and try again.',
+      );
     }
 
     // Let the native view finish binding its platform video target/frame callback
@@ -715,7 +918,7 @@ export function ExampleApp({
       setPlaybackPosition(0);
       setPlaybackDuration(0);
       setPlaybackState('Starting');
-      setVideoSize({width: 0, height: 0});
+      setVideoSize({ width: 0, height: 0 });
       const initialVolume = session.getVolume();
       if (initialVolume >= 0) {
         setVolume(initialVolume);
@@ -725,10 +928,14 @@ export function ExampleApp({
           pollIntervalMs: FFPLAY_MONITOR_INTERVAL_MS,
           logCallback: log => appendLog(log.message),
           completeCallback: completed => {
-            appendLog(`FFplay finished. Return code: ${completed.getReturnCode()}`);
+            appendLog(
+              `FFplay finished. Return code: ${completed.getReturnCode()}`,
+            );
             setPlaybackState('Stopped');
             setPlaybackSession(current =>
-              current?.getSessionId() === completed.getSessionId() ? undefined : current,
+              current?.getSessionId() === completed.getSessionId()
+                ? undefined
+                : current,
             );
           },
         })
@@ -811,16 +1018,22 @@ export function ExampleApp({
     const mediaSession = await FFprobeKit.getMediaInformation(inputPath);
     const durationMs = Math.max(
       0,
-      (Number.parseFloat(mediaSession.getMediaInformation()?.duration ?? '0') || 0) * 1000,
+      (Number.parseFloat(mediaSession.getMediaInformation()?.duration ?? '0') ||
+        0) * 1000,
     );
     const session = FFmpegKit.createSession(
-      `-hide_banner -i ${quote(inputPath)} -c:v mpeg4 -c:a aac -b:v 2M -y ${quote(outputPath ?? `${EXAMPLE_DIR}/output.avi`)}`,
+      `-hide_banner -i ${quote(
+        inputPath,
+      )} -c:v mpeg4 -c:a aac -b:v 2M -y ${quote(
+        outputPath ?? `${EXAMPLE_DIR}/output.avi`,
+      )}`,
     );
     try {
       await session.executeAsync({
         logCallback: log => appendLog(log.message),
         statisticsCallback: statistics => {
-          const progress = durationMs > 0 ? Math.min(1, statistics.time / durationMs) : 0;
+          const progress =
+            durationMs > 0 ? Math.min(1, statistics.time / durationMs) : 0;
           setTranscodeProgress(progress);
           const message =
             `Time: ${(statistics.time / 1000).toFixed(1)}s | ` +
@@ -867,17 +1080,52 @@ export function ExampleApp({
         return (
           <View style={styles.section}>
             <ButtonGrid>
-              <DemoButton label="Gen Video" onPress={() => void runGuarded('Generate video', generateTestVideo)} />
-              <DemoButton label="Gen Audio" onPress={() => void runGuarded('Generate audio', generateTestAudio)} />
-              <DemoButton label="Async Version" onPress={() => void runGuarded('FFmpeg version', runFfmpegVersion)} />
-              <DemoButton label="Sync Version" onPress={() => void runGuarded('FFmpeg execute', runFfmpegAwaited)} />
-              <DemoButton label="Help" onPress={() => void runGuarded('FFmpeg help', runHelp)} />
+              <DemoButton
+                testID="ffmpeg.generate-video"
+                label="Gen Video"
+                onPress={() =>
+                  void runGuarded('Generate video', generateTestVideo)
+                }
+              />
+              <DemoButton
+                testID="ffmpeg.generate-audio"
+                label="Gen Audio"
+                onPress={() =>
+                  void runGuarded('Generate audio', generateTestAudio)
+                }
+              />
+              <DemoButton
+                testID="ffmpeg.version.async"
+                label="Async Version"
+                onPress={() =>
+                  void runGuarded('FFmpeg version', runFfmpegVersion)
+                }
+              />
+              <DemoButton
+                testID="ffmpeg.version.awaited"
+                label="Sync Version"
+                onPress={() =>
+                  void runGuarded('FFmpeg execute', runFfmpegAwaited)
+                }
+              />
+              <DemoButton
+                testID="ffmpeg.help"
+                label="Help"
+                onPress={() => void runGuarded('FFmpeg help', runHelp)}
+              />
             </ButtonGrid>
+            {generatedVideoVerification ? (
+              <Text testID="ffmpeg.generated-video-verification">
+                {generatedVideoVerification}
+              </Text>
+            ) : null}
             <CommandSection
               label="Enter FFmpeg command"
               value={ffmpegCommand}
               onChange={setFfmpegCommand}
               onRun={() => void runGuarded('Custom FFmpeg', runCustomFfmpeg)}
+              inputTestID="ffmpeg.command.input"
+              runTestID="ffmpeg.command.run"
             />
           </View>
         );
@@ -886,20 +1134,37 @@ export function ExampleApp({
           <View style={styles.section}>
             <Card>
               <Text style={styles.subheading}>Remote Stream Recording</Text>
-              <Text style={styles.help}>Stream a remote URL and record it to an MPEG-TS file in the app cache.</Text>
+              <Text style={styles.help}>
+                Stream a remote URL and record it to an MPEG-TS file in the app
+                cache.
+              </Text>
               <TextInput
+                testID="stream.url.input"
                 style={styles.input}
                 value={remoteStreamUrl}
                 onChangeText={setRemoteStreamUrl}
                 autoCapitalize="none"
                 autoCorrect={false}
               />
-              <DemoButton label="Record Stream" onPress={() => void runGuarded('Remote recording', runRemoteRecording)} />
+              <DemoButton
+                testID="stream.record"
+                label="Record Stream"
+                onPress={() =>
+                  void runGuarded('Remote recording', runRemoteRecording)
+                }
+              />
             </Card>
             <Card>
               <View style={styles.rowBetween}>
-                <Text style={styles.subheading}>Currently Running Sessions</Text>
-                <DemoButton label="Refresh" onPress={refreshSessions} compact />
+                <Text style={styles.subheading}>
+                  Currently Running Sessions
+                </Text>
+                <DemoButton
+                  testID="stream.refresh"
+                  label="Refresh"
+                  onPress={refreshSessions}
+                  compact
+                />
               </View>
               <Text style={styles.help}>Sessions: {activeJobs.length}</Text>
               {activeJobs.length === 0 ? (
@@ -909,12 +1174,24 @@ export function ExampleApp({
                   <View key={job.sessionId} style={styles.jobRow}>
                     <View style={styles.flexOne}>
                       <Text style={styles.bodyStrong}>
-                        Session {job.sessionId} · {job.requestedCancel ? 'cancelling' : 'running'}
+                        Session {job.sessionId} ·{' '}
+                        {job.requestedCancel ? 'cancelling' : 'running'}
                       </Text>
-                      <Text style={styles.help} numberOfLines={2}>{job.session.getCommand()}</Text>
-                      <Text style={styles.help}>{job.startedWriting ? 'Output started' : 'Waiting for output'}</Text>
+                      <Text style={styles.help} numberOfLines={2}>
+                        {job.session.getCommand()}
+                      </Text>
+                      <Text style={styles.help}>
+                        {job.startedWriting
+                          ? 'Output started'
+                          : 'Waiting for output'}
+                      </Text>
                     </View>
-                    <DemoButton label="Cancel" onPress={() => cancelRemoteJob(job.sessionId)} compact />
+                    <DemoButton
+                      testID={`stream.cancel.${job.sessionId}`}
+                      label="Cancel"
+                      onPress={() => cancelRemoteJob(job.sessionId)}
+                      compact
+                    />
                   </View>
                 ))
               )}
@@ -924,22 +1201,49 @@ export function ExampleApp({
       case 'FFprobe':
         return (
           <View style={styles.section}>
-            {selectedProbePath ? <Text style={styles.help}>Selected: {platformServices.basename(selectedProbePath)}</Text> : null}
+            {selectedProbePath ? (
+              <Text style={styles.help}>
+                Selected: {platformServices.basename(selectedProbePath)}
+              </Text>
+            ) : null}
             <ButtonGrid>
               <DemoButton
+                testID="ffprobe.pick-file"
                 label="Pick File"
                 disabled={!platformServices.canPickFiles}
-                onPress={() => void runGuarded('Pick probe file', pickProbeFile)}
+                onPress={() =>
+                  void runGuarded('Pick probe file', pickProbeFile)
+                }
               />
-              <DemoButton label="Get Media Info" onPress={() => void runGuarded('Media information', runMediaInformation)} />
-              <DemoButton label="Async Version" onPress={() => void runGuarded('FFprobe version', runFfprobeVersion)} />
-              <DemoButton label="Sync Version" onPress={() => void runGuarded('FFprobe execute', runFfprobeAwaited)} />
+              <DemoButton
+                testID="ffprobe.media-info"
+                label="Get Media Info"
+                onPress={() =>
+                  void runGuarded('Media information', runMediaInformation)
+                }
+              />
+              <DemoButton
+                testID="ffprobe.version.async"
+                label="Async Version"
+                onPress={() =>
+                  void runGuarded('FFprobe version', runFfprobeVersion)
+                }
+              />
+              <DemoButton
+                testID="ffprobe.version.awaited"
+                label="Sync Version"
+                onPress={() =>
+                  void runGuarded('FFprobe execute', runFfprobeAwaited)
+                }
+              />
             </ButtonGrid>
             <CommandSection
               label="Enter FFprobe command"
               value={ffprobeCommand}
               onChange={setFfprobeCommand}
               onRun={() => void runGuarded('Custom FFprobe', runCustomFfprobe)}
+              inputTestID="ffprobe.command.input"
+              runTestID="ffprobe.command.run"
             />
           </View>
         );
@@ -955,8 +1259,10 @@ export function ExampleApp({
                       width: videoDisplaySize.width,
                       height: videoDisplaySize.height,
                     },
-                  ]}>
+                  ]}
+                >
                   <FFplayView
+                    testID="ffplay.video-surface"
                     style={styles.ffplayView}
                     onLayout={() => {
                       videoSurfaceReadyRef.current = true;
@@ -975,30 +1281,87 @@ export function ExampleApp({
               value={ffplayCommand}
               onChange={setFfplayCommand}
               onRun={() => void runGuarded('Custom FFplay', runCustomFfplay)}
+              inputTestID="ffplay.command.input"
+              runTestID="ffplay.command.run"
             />
             <Text style={styles.subheading}>1. Generate Media:</Text>
             <ButtonGrid>
-              <DemoButton label="Gen Video" onPress={() => void runGuarded('Generate video', generateTestVideo)} />
-              <DemoButton label="Gen Audio" onPress={() => void runGuarded('Generate audio', generateTestAudio)} />
+              <DemoButton
+                testID="ffplay.generate-video"
+                label="Gen Video"
+                onPress={() =>
+                  void runGuarded('Generate video', generateTestVideo)
+                }
+              />
+              <DemoButton
+                testID="ffplay.generate-audio"
+                label="Gen Audio"
+                onPress={() =>
+                  void runGuarded('Generate audio', generateTestAudio)
+                }
+              />
             </ButtonGrid>
             <Text style={styles.subheading}>2. Play Generated:</Text>
             <ButtonGrid>
-              <DemoButton label="Play Video" onPress={() => void runGuarded('Play video', () => playGenerated(TEST_VIDEO_PATH, true))} />
-              <DemoButton label="Play Audio" onPress={() => void runGuarded('Play audio', () => playGenerated(TEST_AUDIO_PATH, false))} />
+              <DemoButton
+                testID="ffplay.play-video"
+                label="Play Video"
+                onPress={() =>
+                  void runGuarded('Play video', () =>
+                    playGenerated(TEST_VIDEO_PATH, true),
+                  )
+                }
+              />
+              <DemoButton
+                testID="ffplay.play-audio"
+                label="Play Audio"
+                onPress={() =>
+                  void runGuarded('Play audio', () =>
+                    playGenerated(TEST_AUDIO_PATH, false),
+                  )
+                }
+              />
             </ButtonGrid>
             <Text style={styles.subheading}>Controls:</Text>
             <ButtonGrid>
-              <DemoButton label="Pause" onPress={() => playbackSession?.pause()} compact />
-              <DemoButton label="Resume" onPress={() => playbackSession?.resume()} compact />
-              <DemoButton label="Stop" onPress={() => playbackSession?.stop()} compact />
-              <DemoButton label="-1s" onPress={() => seekPlayback(-1)} compact />
-              <DemoButton label="+1s" onPress={() => seekPlayback(1)} compact />
+              <DemoButton
+                testID="ffplay.pause"
+                label="Pause"
+                onPress={() => playbackSession?.pause()}
+                compact
+              />
+              <DemoButton
+                testID="ffplay.resume"
+                label="Resume"
+                onPress={() => playbackSession?.resume()}
+                compact
+              />
+              <DemoButton
+                testID="ffplay.stop"
+                label="Stop"
+                onPress={() => playbackSession?.stop()}
+                compact
+              />
+              <DemoButton
+                testID="ffplay.seek-back"
+                label="-1s"
+                onPress={() => seekPlayback(-1)}
+                compact
+              />
+              <DemoButton
+                testID="ffplay.seek-forward"
+                label="+1s"
+                onPress={() => seekPlayback(1)}
+                compact
+              />
             </ButtonGrid>
             <Text style={styles.bodyStrong}>State: {playbackState}</Text>
             <Text style={styles.help}>
-              Position: {playbackPosition.toFixed(1)}s / {playbackDuration.toFixed(1)}s
+              Position: {playbackPosition.toFixed(1)}s /{' '}
+              {playbackDuration.toFixed(1)}s
             </Text>
             <CoreSlider
+              testID="ffplay.position"
               minimumValue={0}
               maximumValue={Math.max(1, playbackDuration)}
               value={Math.min(playbackPosition, Math.max(1, playbackDuration))}
@@ -1008,8 +1371,11 @@ export function ExampleApp({
                 setPlaybackPosition(value);
               }}
             />
-            <Text style={styles.bodyStrong}>Volume: {Math.round(volume * 100)}%</Text>
+            <Text style={styles.bodyStrong}>
+              Volume: {Math.round(volume * 100)}%
+            </Text>
             <CoreSlider
+              testID="ffplay.volume"
               minimumValue={0}
               maximumValue={1}
               step={0.05}
@@ -1026,7 +1392,10 @@ export function ExampleApp({
         return (
           <View style={styles.section}>
             <Text style={styles.heading}>Video Transcode (MP4 → AVI)</Text>
-            <Text style={styles.help}>Converts a video to MPEG-4 video + AAC audio in an AVI container and tracks FFmpeg statistics.</Text>
+            <Text style={styles.help}>
+              Converts a video to MPEG-4 video + AAC audio in an AVI container
+              and tracks FFmpeg statistics.
+            </Text>
             <Card>
               <Text style={styles.subheading}>Input File</Text>
               <Text style={styles.help}>
@@ -1034,15 +1403,23 @@ export function ExampleApp({
                   ? platformServices.basename(transcodeInputPath)
                   : 'No file selected; the generated test video will be used.'}
               </Text>
-              {transcodeOutputPath ? <Text style={styles.help}>Output: {platformServices.basename(transcodeOutputPath)}</Text> : null}
+              {transcodeOutputPath ? (
+                <Text style={styles.help}>
+                  Output: {platformServices.basename(transcodeOutputPath)}
+                </Text>
+              ) : null}
               <ButtonGrid>
                 <DemoButton
+                  testID="transcode.pick-input"
                   label="Pick Video File"
                   disabled={isTranscoding || !platformServices.canPickFiles}
-                  onPress={() => void runGuarded('Pick transcode file', pickTranscodeFile)}
+                  onPress={() =>
+                    void runGuarded('Pick transcode file', pickTranscodeFile)
+                  }
                 />
                 {transcodeInputPath ? (
                   <DemoButton
+                    testID="transcode.clear-input"
                     label="Clear Selection"
                     disabled={isTranscoding}
                     onPress={() => {
@@ -1053,28 +1430,45 @@ export function ExampleApp({
                 ) : null}
               </ButtonGrid>
             </Card>
-            {(isTranscoding || transcodeProgress > 0) ? (
+            {isTranscoding || transcodeProgress > 0 ? (
               <Card>
                 <View style={styles.rowBetween}>
-                  <Text style={styles.bodyStrong}>{isTranscoding ? 'Transcoding...' : 'Complete'}</Text>
-                  <Text style={styles.bodyStrong}>{(transcodeProgress * 100).toFixed(1)}%</Text>
+                  <Text testID="transcode.status" style={styles.bodyStrong}>
+                    {isTranscoding ? 'Transcoding...' : 'Complete'}
+                  </Text>
+                  <Text style={styles.bodyStrong}>
+                    {(transcodeProgress * 100).toFixed(1)}%
+                  </Text>
                 </View>
-                <View style={styles.progressTrack}>
-                  <View style={[styles.progressValue, {width: `${Math.min(100, transcodeProgress * 100)}%`}]} />
+                <View testID="transcode.progress" style={styles.progressTrack}>
+                  <View
+                    style={[
+                      styles.progressValue,
+                      { width: `${Math.min(100, transcodeProgress * 100)}%` },
+                    ]}
+                  />
                 </View>
                 <Text style={styles.monoSmall}>{transcodeStatus}</Text>
               </Card>
             ) : null}
             <DemoButton
+              testID="transcode.run"
               label={isTranscoding ? 'Transcoding...' : 'Transcode MP4 → AVI'}
               disabled={isTranscoding}
               onPress={() => void runGuarded('Transcode', transcodeVideo)}
             />
             <Card>
               <Text style={styles.subheading}>About Transcoding</Text>
-              <Text style={styles.help}>• Default input: generated test_video.mp4</Text>
-              <Text style={styles.help}>• Output: app cache as [input]_transcoded.avi</Text>
-              <Text style={styles.help}>• Progress: derived from FFmpeg statistics time versus FFprobe duration</Text>
+              <Text style={styles.help}>
+                • Default input: generated test_video.mp4
+              </Text>
+              <Text style={styles.help}>
+                • Output: app cache as [input]_transcoded.avi
+              </Text>
+              <Text style={styles.help}>
+                • Progress: derived from FFmpeg statistics time versus FFprobe
+                duration
+              </Text>
               <Text style={styles.help}>
                 {platformServices.canPickFiles
                   ? '• Optional: import a video using the native document picker'
@@ -1087,18 +1481,35 @@ export function ExampleApp({
   })();
 
   return (
-    <View style={styles.root} accessibilityLabel={status}>
+    <View testID="app.root" style={styles.root} accessibilityLabel={status}>
       {platformName !== 'macOS' ? (
         <StatusBar barStyle="light-content" backgroundColor="#24212b" />
       ) : null}
 
       <View style={styles.appBar}>
-        <Text style={styles.title}>{isMobile ? 'FFmpeg Kit' : 'FFmpeg Kit Extended'}</Text>
+        <Text style={styles.title}>
+          {isMobile ? 'FFmpeg Kit' : 'FFmpeg Kit Extended'}
+        </Text>
         <View style={styles.appBarActions}>
           {!initialized ? <ActivityIndicator size="small" /> : null}
-          <IconButton symbol="☷" label="Log Level" onPress={() => setLogLevelMenuVisible(true)} />
-          <IconButton symbol="⚙" label="System Info" onPress={() => setSystemInfoMenuVisible(true)} />
-          <IconButton symbol="⌫" label="Clear Logs" onPress={clearLogs} />
+          <IconButton
+            testID="toolbar.log-level"
+            symbol="☷"
+            label="Log Level"
+            onPress={() => setLogLevelMenuVisible(true)}
+          />
+          <IconButton
+            testID="toolbar.system-info"
+            symbol="⚙"
+            label="System Info"
+            onPress={() => setSystemInfoMenuVisible(true)}
+          />
+          <IconButton
+            testID="toolbar.clear-logs"
+            symbol="⌫"
+            label="Clear Logs"
+            onPress={clearLogs}
+          />
         </View>
       </View>
 
@@ -1106,6 +1517,7 @@ export function ExampleApp({
         {TABS.map(tab => (
           <TabButton
             key={tab}
+            testID={TAB_TEST_IDS[tab]}
             tab={tab}
             active={activeTab === tab}
             showLabel={!isMobile}
@@ -1115,9 +1527,11 @@ export function ExampleApp({
       </View>
 
       <ScrollView
+        ref={contentScrollRef}
         style={styles.content}
         contentContainerStyle={styles.contentContainer}
-        keyboardShouldPersistTaps="handled">
+        keyboardShouldPersistTaps="handled"
+      >
         {content}
       </ScrollView>
 
@@ -1125,17 +1539,28 @@ export function ExampleApp({
         accessibilityLabel="Resize log output"
         accessibilityRole="adjustable"
         style={styles.logResizeHandle}
-        {...logResizePanResponder.panHandlers}>
+        {...logResizePanResponder.panHandlers}
+      >
         <View style={styles.logResizeGrip} />
       </View>
 
-      <View style={[styles.logPane, {height: logPaneHeight}]}>
-        <ScrollView ref={logScrollRef} style={styles.logScroll} contentContainerStyle={styles.logScrollContent}>
-          <Text selectable style={styles.logText}>{logs}</Text>
+      <View style={[styles.logPane, { height: logPaneHeight }]}>
+        <ScrollView
+          ref={logScrollRef}
+          style={styles.logScroll}
+          contentContainerStyle={styles.logScrollContent}
+        >
+          <Text testID="logs.output" selectable style={styles.logText}>
+            {logs}
+          </Text>
         </ScrollView>
       </View>
 
-      <PopupMenu visible={logLevelMenuVisible} onClose={() => setLogLevelMenuVisible(false)} width={220}>
+      <PopupMenu
+        visible={logLevelMenuVisible}
+        onClose={() => setLogLevelMenuVisible(false)}
+        width={220}
+      >
         {LOG_LEVELS.map(level => {
           const selected = currentLogLevel === level;
           return (
@@ -1152,10 +1577,16 @@ export function ExampleApp({
         })}
       </PopupMenu>
 
-      <PopupMenu visible={systemInfoMenuVisible} onClose={() => setSystemInfoMenuVisible(false)} width={300} scrollable>
+      <PopupMenu
+        visible={systemInfoMenuVisible}
+        onClose={() => setSystemInfoMenuVisible(false)}
+        width={300}
+        scrollable
+      >
         {SYSTEM_INFO_ITEMS.map(([label, kind, leading]) => (
           <MenuRow
             key={kind}
+            testID={`system-info.${kind}`}
             leading={leading}
             label={label}
             onPress={() => {
@@ -1170,6 +1601,7 @@ export function ExampleApp({
 }
 
 function CoreSlider({
+  testID,
   minimumValue = 0,
   maximumValue = 1,
   step,
@@ -1178,6 +1610,7 @@ function CoreSlider({
   onValueChange,
   onSlidingComplete,
 }: {
+  testID?: string;
   minimumValue?: number;
   maximumValue?: number;
   step?: number;
@@ -1206,7 +1639,10 @@ function CoreSlider({
       if (disabled) {
         return;
       }
-      const fraction = Math.max(0, Math.min(1, x / Math.max(1, widthRef.current)));
+      const fraction = Math.max(
+        0,
+        Math.min(1, x / Math.max(1, widthRef.current)),
+      );
       let next = minimumValue + fraction * range;
       if (step && step > 0) {
         next = minimumValue + Math.round((next - minimumValue) / step) * step;
@@ -1248,26 +1684,30 @@ function CoreSlider({
 
   return (
     <View
+      testID={testID}
       accessibilityRole="adjustable"
-      accessibilityState={{disabled}}
+      accessibilityState={{ disabled }}
       style={[styles.coreSlider, disabled && styles.coreSliderDisabled]}
       onLayout={event => {
         widthRef.current = Math.max(1, event.nativeEvent.layout.width);
       }}
-      {...panResponder.panHandlers}>
+      {...panResponder.panHandlers}
+    >
       <View style={styles.coreSliderTrack} />
-      <View style={[styles.coreSliderFill, {width: `${fraction * 100}%`}]} />
-      <View style={[styles.coreSliderThumb, {left: `${fraction * 100}%`}]} />
+      <View style={[styles.coreSliderFill, { width: `${fraction * 100}%` }]} />
+      <View style={[styles.coreSliderThumb, { left: `${fraction * 100}%` }]} />
     </View>
   );
 }
 
 function TabButton({
+  testID,
   tab,
   active,
   showLabel,
   onPress,
 }: {
+  testID: string;
   tab: TabName;
   active: boolean;
   showLabel: boolean;
@@ -1277,18 +1717,26 @@ function TabButton({
 
   return (
     <Pressable
+      testID={testID}
       accessibilityRole="tab"
-      accessibilityState={{selected: active}}
+      accessibilityLabel={tab}
+      accessibilityState={{ selected: active }}
       onFocus={() => setFocused(true)}
       onBlur={() => setFocused(false)}
       onPress={onPress}
-      style={[styles.tab, active && styles.tabActive, focused && styles.tabFocused]}>
+      style={[
+        styles.tab,
+        active && styles.tabActive,
+        focused && styles.tabFocused,
+      ]}
+    >
       <Text
         style={[
           styles.tabIcon,
           active && styles.tabTextActive,
           focused && styles.tabTextFocused,
-        ]}>
+        ]}
+      >
         {TAB_SYMBOLS[tab]}
       </Text>
       {showLabel ? (
@@ -1297,7 +1745,8 @@ function TabButton({
             styles.tabText,
             active && styles.tabTextActive,
             focused && styles.tabTextFocused,
-          ]}>
+          ]}
+        >
           {tab}
         </Text>
       ) : null}
@@ -1305,20 +1754,26 @@ function TabButton({
   );
 }
 
-function ButtonGrid({children}: {children: React.ReactNode}): React.JSX.Element {
+function ButtonGrid({
+  children,
+}: {
+  children: React.ReactNode;
+}): React.JSX.Element {
   return <View style={styles.buttonGrid}>{children}</View>;
 }
 
-function Card({children}: {children: React.ReactNode}): React.JSX.Element {
+function Card({ children }: { children: React.ReactNode }): React.JSX.Element {
   return <View style={styles.card}>{children}</View>;
 }
 
 function DemoButton({
+  testID,
   label,
   onPress,
   compact = false,
   disabled = false,
 }: {
+  testID?: string;
   label: string;
   onPress: () => void;
   compact?: boolean;
@@ -1328,29 +1783,35 @@ function DemoButton({
 
   return (
     <Pressable
+      testID={testID}
+      accessibilityRole="button"
+      accessibilityLabel={label}
       disabled={disabled}
       onFocus={() => setFocused(true)}
       onBlur={() => setFocused(false)}
       onPress={onPress}
-      style={({pressed}) => [
+      style={({ pressed }) => [
         styles.demoButton,
         compact && styles.demoButtonCompact,
         disabled && styles.demoButtonDisabled,
         focused && !disabled && styles.demoButtonFocused,
         pressed && !disabled && styles.demoButtonPressed,
-      ]}>
+      ]}
+    >
       <Text
         style={[
           styles.demoButtonIcon,
           focused && !disabled && styles.demoButtonTextFocused,
-        ]}>
+        ]}
+      >
         {buttonSymbol(label)}
       </Text>
       <Text
         style={[
           styles.demoButtonText,
           focused && !disabled && styles.demoButtonTextFocused,
-        ]}>
+        ]}
+      >
         {label}
       </Text>
     </Pressable>
@@ -1358,10 +1819,12 @@ function DemoButton({
 }
 
 function IconButton({
+  testID,
   symbol,
   label,
   onPress,
 }: {
+  testID?: string;
   symbol: string;
   label: string;
   onPress: () => void;
@@ -1370,18 +1833,22 @@ function IconButton({
 
   return (
     <Pressable
+      testID={testID}
       accessibilityRole="button"
       accessibilityLabel={label}
       hitSlop={8}
       onFocus={() => setFocused(true)}
       onBlur={() => setFocused(false)}
       onPress={onPress}
-      style={({pressed}) => [
+      style={({ pressed }) => [
         styles.iconButton,
         focused && styles.iconButtonFocused,
         pressed && styles.iconButtonPressed,
-      ]}>
-      <Text style={[styles.iconButtonText, focused && styles.iconButtonTextFocused]}>
+      ]}
+    >
+      <Text
+        style={[styles.iconButtonText, focused && styles.iconButtonTextFocused]}
+      >
         {symbol}
       </Text>
     </Pressable>
@@ -1405,11 +1872,12 @@ function PopupMenu({
     return null;
   }
 
-  const menu = <View style={[styles.popupMenu, {width}]}>{children}</View>;
+  const menu = <View style={[styles.popupMenu, { width }]}>{children}</View>;
 
   return (
     <View style={styles.popupOverlay} pointerEvents="box-none">
       <Pressable
+        testID="popup.close"
         accessibilityRole="button"
         accessibilityLabel="Close popup menu"
         style={styles.popupBackdrop}
@@ -1419,7 +1887,8 @@ function PopupMenu({
         {scrollable ? (
           <ScrollView
             style={styles.popupScroll}
-            contentContainerStyle={styles.popupScrollContent}>
+            contentContainerStyle={styles.popupScrollContent}
+          >
             {menu}
           </ScrollView>
         ) : (
@@ -1431,10 +1900,12 @@ function PopupMenu({
 }
 
 function MenuRow({
+  testID,
   leading,
   label,
   onPress,
 }: {
+  testID?: string;
   leading: string;
   label: string;
   onPress: () => void;
@@ -1443,15 +1914,19 @@ function MenuRow({
 
   return (
     <Pressable
+      testID={testID}
       onFocus={() => setFocused(true)}
       onBlur={() => setFocused(false)}
       onPress={onPress}
-      style={({pressed}) => [
+      style={({ pressed }) => [
         styles.menuRow,
         focused && styles.menuRowFocused,
         pressed && styles.menuRowPressed,
-      ]}>
-      <Text style={[styles.menuRowLeading, focused && styles.menuRowTextFocused]}>
+      ]}
+    >
+      <Text
+        style={[styles.menuRowLeading, focused && styles.menuRowTextFocused]}
+      >
         {leading}
       </Text>
       <Text style={[styles.menuRowText, focused && styles.menuRowTextFocused]}>
@@ -1462,11 +1937,15 @@ function MenuRow({
 }
 
 function CommandSection({
+  inputTestID,
+  runTestID,
   label,
   value,
   onChange,
   onRun,
 }: {
+  inputTestID?: string;
+  runTestID?: string;
   label: string;
   value: string;
   onChange: (value: string) => void;
@@ -1477,6 +1956,7 @@ function CommandSection({
       <Text style={styles.commandLabel}>Custom Command:</Text>
       <View style={styles.commandRow}>
         <TextInput
+          testID={inputTestID}
           style={[styles.input, styles.commandInput]}
           value={value}
           placeholder={label}
@@ -1485,7 +1965,7 @@ function CommandSection({
           autoCapitalize="none"
           autoCorrect={false}
         />
-        <DemoButton label="Run" onPress={onRun} compact />
+        <DemoButton testID={runTestID} label="Run" onPress={onRun} compact />
       </View>
     </View>
   );
@@ -1543,6 +2023,12 @@ function quote(value: string): string {
   return `"${value.replace(/(["\\])/g, '\\$1')}"`;
 }
 
+function signalStat(output: string, name: string): number | undefined {
+  const match = output.match(
+    new RegExp(`lavfi\\.signalstats\\.${name}=([0-9]+(?:\\.[0-9]+)?)`),
+  );
+  return match ? Number.parseFloat(match[1]) : undefined;
+}
 
 function formatRemoteStatistics(label: string, statistics: Statistics): string {
   return (
@@ -1588,7 +2074,7 @@ const styles = StyleSheet.create({
   },
   iconButtonFocused: {
     backgroundColor: '#d0a7ff',
-    transform: [{scale: 1.12}],
+    transform: [{ scale: 1.12 }],
   },
   iconButtonPressed: {
     backgroundColor: '#3b3544',
@@ -1718,7 +2204,7 @@ const styles = StyleSheet.create({
   demoButtonFocused: {
     borderColor: '#ffffff',
     backgroundColor: '#d0a7ff',
-    transform: [{scale: 1.08}],
+    transform: [{ scale: 1.08 }],
   },
   demoButtonPressed: {
     backgroundColor: '#463755',
@@ -1905,7 +2391,7 @@ const styles = StyleSheet.create({
     shadowColor: '#000000',
     shadowOpacity: 0.4,
     shadowRadius: 12,
-    shadowOffset: {width: 0, height: 6},
+    shadowOffset: { width: 0, height: 6 },
     elevation: 12,
   },
   menuRow: {

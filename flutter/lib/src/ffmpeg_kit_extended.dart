@@ -19,38 +19,37 @@
 
 import 'dart:convert';
 import 'dart:developer';
-import 'dart:ffi';
-
-import 'package:ffi/ffi.dart';
 
 import 'callback_manager.dart' as callback_manager;
-import 'ffmpeg_kit_extended_flutter_loader.dart';
 import 'ffmpeg_session.dart';
 import 'ffplay_session.dart';
 import 'ffprobe_session.dart';
-import 'generated/ffmpeg_kit_bindings.dart' as ffmpeg;
 import 'log.dart';
 import 'media_information_session.dart';
+import 'platform/backend.dart';
+import 'platform/backend_selector.dart';
 import 'session.dart';
+import 'session_history_index.dart';
 import 'session_queue_manager.dart';
 import 'signal.dart';
+
+enum _ExpectedSessionKind { any, ffmpeg, ffprobe, ffplay, mediaInformation }
 
 /// The main entry point for the FFmpegKit Extended plugin.
 ///
 /// All methods are static.  Use this class to create and manage FFmpeg
 /// sessions, configure global settings, and retrieve version information.
 class FFmpegKitExtended {
+  static final _sessionHistoryIndex = SessionHistoryIndex();
+
+  /// Test-only access to the identity index; it does not expose ownership.
+  static SessionHistoryIndex get sessionHistoryIndex => _sessionHistoryIndex;
+
   /// Throws [StateError] if [FFmpegKitExtended.initialize] has not been called.
   ///
   /// Call this at the top of every method that reaches the native layer.
   static void requireInitialized() {
-    if (!isFFmpegKitInitialized) {
-      throw StateError(
-        'FFmpegKitExtended has not been initialized. '
-        'Call await FFmpegKitExtended.initialize() from main() '
-        'before using the plugin.',
-      );
-    }
+    ffmpegKitBackend.requireInitialized();
   }
 
   /// Initializes the plugin by loading the native FFmpegKit library.
@@ -66,11 +65,13 @@ class FFmpegKitExtended {
   /// }
   /// ```
   ///
-  /// Calling this more than once is safe (subsequent calls are no-ops).
-  static Future<void> initialize() => initializeFFmpegKit();
+  /// Calling this more than once is safe: concurrent calls share one attempt,
+  /// successful initialization is idempotent, and a failed Web attempt can be
+  /// retried by calling this method again.
+  static Future<void> initialize() => ffmpegKitBackend.initialize();
 
   /// Returns `true` if [initialize] has been called successfully.
-  static bool get initialized => isFFmpegKitInitialized;
+  static bool get initialized => ffmpegKitBackend.initialized;
 
   // ---------------------------------------------------------------------------
   // Session factories
@@ -87,12 +88,13 @@ class FFmpegKitExtended {
   }) {
     requireInitialized();
     _requireNonBlank(command, 'command');
-    return FFmpegSession(
+    final session = FFmpegSession(
       command,
       completeCallback: completeCallback,
       logCallback: logCallback,
       statisticsCallback: statisticsCallback,
     );
+    return session;
   }
 
   /// Creates a new [FFprobeSession] for [command].
@@ -104,7 +106,8 @@ class FFmpegKitExtended {
   }) {
     requireInitialized();
     _requireNonBlank(command, 'command');
-    return FFprobeSession(command, completeCallback: completeCallback);
+    final session = FFprobeSession(command, completeCallback: completeCallback);
+    return session;
   }
 
   /// Creates a new [FFplaySession] for [command].
@@ -117,11 +120,12 @@ class FFmpegKitExtended {
   }) {
     requireInitialized();
     _requireNonBlank(command, 'command');
-    return FFplaySession(
+    final session = FFplaySession(
       command,
       timeout: timeout,
       completeCallback: completeCallback,
     );
+    return session;
   }
 
   /// Creates a new [MediaInformationSession] for [command].
@@ -137,11 +141,12 @@ class FFmpegKitExtended {
   }) {
     requireInitialized();
     _requireNonBlank(command, 'command');
-    return MediaInformationSession(
+    final session = MediaInformationSession(
       command,
       timeout: timeout,
       completeCallback: completeCallback,
     );
+    return session;
   }
 
   // ---------------------------------------------------------------------------
@@ -149,9 +154,17 @@ class FFmpegKitExtended {
   // ---------------------------------------------------------------------------
 
   /// Cancels the session identified by [sessionId].
-  /// IMPORTANT: passing a 0 will cancel all sessions.
+  ///
+  /// Passing `0` cancels all active and queued sessions managed by
+  /// [SessionQueueManager], using the same all-attempts/first-error behavior
+  /// as [cancelAllSessions]. A nonzero ID uses the current Dart object/history
+  /// lookup and requests cancellation only when that session is available.
   static void cancelSession(int sessionId) {
     requireInitialized();
+    if (sessionId == 0) {
+      cancelAllSessions();
+      return;
+    }
     getSession(sessionId)?.cancel();
   }
 
@@ -164,6 +177,9 @@ class FFmpegKitExtended {
   }
 
   /// Cancels all active and queued sessions managed by [SessionQueueManager].
+  ///
+  /// Every active session is attempted. If one or more cancellations fail, the
+  /// first error is rethrown after all active sessions have been attempted.
   static void cancelAllSessions() {
     requireInitialized();
     SessionQueueManager().cancelAll();
@@ -176,63 +192,30 @@ class FFmpegKitExtended {
   /// Sets the global log level for FFmpeg output.
   static void setLogLevel(LogLevel level) {
     requireInitialized();
-    try {
-      ffmpeg.ffmpeg_kit_config_set_log_level(
-        ffmpeg.FFmpegKitLogLevel.fromValue(level.value),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_set_log_level",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    ffmpegKitBackend.setLogLevel(level.value);
   }
 
   /// Returns the current global log level.
   static LogLevel getLogLevel() {
     requireInitialized();
-    try {
-      return LogLevel.fromValue(ffmpeg.ffmpeg_kit_config_get_log_level().value);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_get_log_level",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return LogLevel.fromValue(ffmpegKitBackend.getLogLevel());
   }
 
-  /// Enables redirection of FFmpeg logs to the system console.
+  /// Enables process-wide redirection of FFmpeg logs to the system console.
+  ///
+  /// Callback bridge demand does not call this method implicitly.
   static void enableRedirection() {
     requireInitialized();
-    try {
-      ffmpeg.ffmpeg_kit_config_enable_redirection();
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_enable_redirection",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    ffmpegKitBackend.enableRedirection();
   }
 
-  /// Disables redirection of FFmpeg logs to the system console.
+  /// Disables process-wide redirection of FFmpeg logs to the system console.
+  ///
+  /// This setting remains authoritative while optional log or statistics
+  /// consumers are active, and completion remains independent of them.
   static void disableRedirection() {
     requireInitialized();
-    try {
-      ffmpeg.ffmpeg_kit_config_disable_redirection();
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_disable_redirection",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    ffmpegKitBackend.disableRedirection();
   }
 
   // ---------------------------------------------------------------------------
@@ -242,59 +225,19 @@ class FFmpegKitExtended {
   /// Sets the font directory and optional name [mapping] JSON.
   static void setFontDirectory(String path, {String? mapping}) {
     requireInitialized();
-    final pathPtr = path.toNativeUtf8();
-    final mappingPtr = mapping?.toNativeUtf8() ?? nullptr;
-    try {
-      ffmpeg.ffmpeg_kit_config_set_font_directory(
-        pathPtr.cast(),
-        mappingPtr.cast(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_set_font_directory",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    } finally {
-      malloc.free(pathPtr);
-      if (mappingPtr != nullptr) malloc.free(mappingPtr);
-    }
+    ffmpegKitBackend.setFontDirectory(path, mapping: mapping);
   }
 
   /// Sets [deviceName] as the audio output device.
   static void setAudioOutputDevice(String deviceName) {
     requireInitialized();
-    final ptr = deviceName.toNativeUtf8();
-    try {
-      ffmpeg.ffmpeg_kit_config_set_audio_output_device(ptr.cast());
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_set_audio_output_device",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    } finally {
-      malloc.free(ptr);
-    }
+    ffmpegKitBackend.setAudioOutputDevice(deviceName);
   }
 
   /// Returns a semicolon-separated list of available audio output devices.
   static String listAudioOutputDevices() {
     requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_config_list_audio_output_devices(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_list_audio_output_devices",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return ffmpegKitBackend.listAudioOutputDevices();
   }
 
   // ---------------------------------------------------------------------------
@@ -304,41 +247,13 @@ class FFmpegKitExtended {
   /// Sets the environment variable [name] to [value].
   static void setEnvironmentVariable(String name, String value) {
     requireInitialized();
-    final namePtr = name.toNativeUtf8();
-    final valuePtr = value.toNativeUtf8();
-    try {
-      ffmpeg.ffmpeg_kit_config_set_environment_variable(
-        namePtr.cast(),
-        valuePtr.cast(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_set_environment_variable",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    } finally {
-      malloc.free(namePtr);
-      malloc.free(valuePtr);
-    }
+    ffmpegKitBackend.setEnvironmentVariable(name, value);
   }
 
   /// Configures FFmpegKit to ignore [signal].
   static void ignoreSignal(Signal signal) {
     requireInitialized();
-    try {
-      ffmpeg.ffmpeg_kit_config_ignore_signal(
-        ffmpeg.FFmpegKitSignal.fromValue(signal.value),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_ignore_signal",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    ffmpegKitBackend.ignoreSignal(signal.value);
   }
 
   // ---------------------------------------------------------------------------
@@ -346,300 +261,71 @@ class FFmpegKitExtended {
   // ---------------------------------------------------------------------------
 
   /// Returns the bundled FFmpeg version string.
-  static String getFFmpegVersion() {
+  static PackageInformationSnapshot _packageInformation() {
     requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_config_get_ffmpeg_version(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_get_ffmpeg_version",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return ffmpegKitBackend.getPackageInformation();
   }
+
+  static String getFFmpegVersion() => _packageInformation().ffmpegVersion;
 
   /// Returns the CPU architecture of the bundled FFmpeg binary.
-  static String getFFmpegArchitecture() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_config_get_ffmpeg_architecture(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_get_ffmpeg_architecture",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getFFmpegArchitecture() => _packageInformation().architecture;
 
   /// Returns the FFmpegKit library version string.
-  static String getVersion() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(ffmpeg.ffmpeg_kit_config_get_version());
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_get_version",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getVersion() => _packageInformation().version;
 
   /// Returns the package name of this FFmpegKit build.
-  static String getPackageName() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_package_name(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_package_name",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getPackageName() => _packageInformation().packageName;
 
   /// Returns the external libraries bundled with this FFmpegKit build.
-  static String getExternalLibraries() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_external_libraries(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_external_libraries",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getExternalLibraries() =>
+      _packageInformation().externalLibraries;
 
   /// Returns the FFmpegKit bundle type.
-  static String getBundleType() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(ffmpeg.ffmpeg_kit_packages_get_bundle_type());
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_bundle_type",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getBundleType() => _packageInformation().bundleType;
 
   /// Returns whether this FFmpegKit build has GPL enabled.
-  static bool isGpl() {
-    requireInitialized();
-    try {
-      return ffmpeg.ffmpeg_kit_packages_get_is_gpl();
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_is_gpl",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static bool isGpl() => _packageInformation().isGpl;
 
   /// Returns whether this FFmpegKit build has non-free libraries enabled.
-  static bool isNonfree() {
-    requireInitialized();
-    try {
-      return ffmpeg.ffmpeg_kit_packages_get_is_nonfree();
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_is_nonfree",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static bool isNonfree() => _packageInformation().isNonfree;
 
   /// Returns a comma-separated list of all registered codecs.
-  static String getRegisteredCodecs() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_registered_codecs(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_registered_codecs",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getRegisteredCodecs() => _packageInformation().registeredCodecs;
 
   /// Returns a comma-separated list of all registered encoders.
-  static String getRegisteredEncoders() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_registered_encoders(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_registered_encoders",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getRegisteredEncoders() =>
+      _packageInformation().registeredEncoders;
 
   /// Returns a comma-separated list of all registered decoders.
-  static String getRegisteredDecoders() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_registered_decoders(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_registered_decoders",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getRegisteredDecoders() =>
+      _packageInformation().registeredDecoders;
 
   /// Returns a comma-separated list of all registered muxers.
-  static String getRegisteredMuxers() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_registered_muxers(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_registered_muxers",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getRegisteredMuxers() => _packageInformation().registeredMuxers;
 
   /// Returns a comma-separated list of all registered demuxers.
-  static String getRegisteredDemuxers() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_registered_demuxers(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_registered_demuxers",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getRegisteredDemuxers() =>
+      _packageInformation().registeredDemuxers;
 
   /// Returns a comma-separated list of all registered filters.
-  static String getRegisteredFilters() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_registered_filters(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_registered_filters",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getRegisteredFilters() =>
+      _packageInformation().registeredFilters;
 
   /// Returns a comma-separated list of all registered protocols.
-  static String getRegisteredProtocols() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_registered_protocols(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_registered_protocols",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getRegisteredProtocols() =>
+      _packageInformation().registeredProtocols;
 
   /// Returns a comma-separated list of all registered bitstream filters.
-  static String getRegisteredBitstreamFilters() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_registered_bitstream_filters(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_registered_bitstream_filters",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getRegisteredBitstreamFilters() =>
+      _packageInformation().registeredBitstreamFilters;
 
   /// Returns the FFmpeg build configuration string.
-  static String getBuildConfiguration() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_packages_get_build_configuration(),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_packages_get_build_configuration",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getBuildConfiguration() =>
+      _packageInformation().buildConfiguration;
 
   /// Returns the library build date.
-  static String getBuildDate() {
-    requireInitialized();
-    try {
-      return _nativeStringOrEmpty(ffmpeg.ffmpeg_kit_config_get_build_date());
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_get_build_date",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-  }
+  static String getBuildDate() => _packageInformation().buildDate;
 
   // ---------------------------------------------------------------------------
   // Session history
@@ -648,118 +334,52 @@ class FFmpegKitExtended {
   /// Sets the maximum number of sessions to retain in native-layer history.
   static void setSessionHistorySize(int size) {
     requireInitialized();
-    try {
-      ffmpeg.ffmpeg_kit_set_session_history_size(size);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_set_session_history_size",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    ffmpegKitBackend.setSessionHistorySize(size);
+    _pruneTerminalHistory(size);
   }
 
   /// Returns the current native-layer session history size.
   static int getSessionHistorySize() {
     requireInitialized();
-    try {
-      return ffmpeg.ffmpeg_kit_get_session_history_size();
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_session_history_size",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return ffmpegKitBackend.getSessionHistorySize();
   }
 
   /// Returns all sessions in native-layer history, correctly typed.
   static List<Session> getSessions() {
     requireInitialized();
-    try {
-      return _collectSessions(ffmpeg.ffmpeg_kit_get_sessions(), _wrapSession);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_sessions",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return _projectHistory<Session>();
   }
 
   /// Returns all FFmpeg sessions in native-layer history.
   static List<FFmpegSession> getFFmpegSessions() {
     requireInitialized();
-    try {
-      return _collectTypedSessions<FFmpegSession>(
-        ffmpeg.ffmpeg_kit_get_ffmpeg_sessions(),
-        FFmpegSession.fromHandle,
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_ffmpeg_sessions",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return _projectHistory<FFmpegSession>(
+      expectedKind: _ExpectedSessionKind.ffmpeg,
+    );
   }
 
   /// Returns all FFprobe sessions in native-layer history.
   static List<FFprobeSession> getFFprobeSessions() {
     requireInitialized();
-    try {
-      return _collectTypedSessions<FFprobeSession>(
-        ffmpeg.ffmpeg_kit_get_ffprobe_sessions(),
-        FFprobeSession.fromHandle,
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_ffprobe_sessions",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return _projectHistory<FFprobeSession>(
+      expectedKind: _ExpectedSessionKind.ffprobe,
+    );
   }
 
   /// Returns all FFplay sessions in native-layer history.
   static List<FFplaySession> getFFplaySessions() {
     requireInitialized();
-    try {
-      return _collectTypedSessions<FFplaySession>(
-        ffmpeg.ffmpeg_kit_get_ffplay_sessions(),
-        FFplaySession.fromHandle,
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_ffplay_sessions",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return _projectHistory<FFplaySession>(
+      expectedKind: _ExpectedSessionKind.ffplay,
+    );
   }
 
   /// Returns all MediaInformation sessions in native-layer history.
   static List<MediaInformationSession> getMediaInformationSessions() {
     requireInitialized();
-    try {
-      return _collectTypedSessions<MediaInformationSession>(
-        ffmpeg.ffmpeg_kit_get_media_information_sessions(),
-        MediaInformationSession.fromHandle,
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_media_information_sessions",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return _projectHistory<MediaInformationSession>(
+      expectedKind: _ExpectedSessionKind.mediaInformation,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -769,131 +389,117 @@ class FFmpegKitExtended {
   /// Returns the session with [sessionId], or `null` if not found.
   static Session? getSession(int sessionId) {
     requireInitialized();
+    _synchronizeLiveSessions();
+    final entry = _sessionHistoryIndex[sessionId];
+    if (entry == null || !entry.visible) return null;
+    return _resolveHistoryEntry(entry);
+  }
+
+  /// Returns whether a Created identity was explicitly abandoned before
+  /// execution and must not be reconstructed from native history.
+  static bool isSessionAbandoned(int sessionId) =>
+      _sessionHistoryIndex.isAbandoned(sessionId);
+
+  /// Returns whether cancellation intent is authoritative for [sessionId].
+  static bool isCancellationRequested(int sessionId) =>
+      _sessionHistoryIndex.isCancellationRequested(sessionId);
+
+  /// Records cancellation intent before any fallible state classification.
+  static void recordCancellationIntent(int sessionId) {
+    _sessionHistoryIndex.recordCancellationIntent(sessionId);
+  }
+
+  /// Clears cancellation intent after terminal observation or history clear.
+  static void clearCancellationIntent(int sessionId) {
+    _sessionHistoryIndex.clearCancellationIntent(sessionId);
+  }
+
+  /// Records ID-scoped pre-execution abandonment without retaining a wrapper.
+  static void abandonCreatedSession(int sessionId) {
+    if (_sessionHistoryIndex.abandon(sessionId)) {
+      _reconcileAbandonedCreatedSession(sessionId);
+    }
+  }
+
+  /// Reconciles only tombstones whose native identity is definitively gone.
+  ///
+  /// The direct backend lookup intentionally bypasses the public history gate.
+  /// A non-null handle is released as a temporary observation and keeps the
+  /// tombstone because the frozen ABI retains Created identities in history.
+  /// Errors keep the fail-closed tombstone in place.
+  static void _reconcileAbandonedCreatedSession(int sessionId) {
     try {
-      return _wrapSession(ffmpeg.ffmpeg_kit_get_session(sessionId));
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
+      final handle = ffmpegKitBackend.getSessionById(sessionId);
+      if (handle == null) {
+        _sessionHistoryIndex.removeAbandoned(sessionId);
+      } else {
+        ffmpegKitBackend.releaseSession(handle);
+      }
+    } catch (_) {
+      // Preserve the fail-closed tombstone when the direct oracle is unavailable.
     }
   }
 
   /// Returns the most recently created session, or `null`.
   static Session? getLastSession() {
     requireInitialized();
-    try {
-      return _wrapSession(ffmpeg.ffmpeg_kit_get_last_session());
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_last_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    final sessions = _projectHistory<Session>();
+    return sessions.isEmpty ? null : sessions.last;
   }
 
   /// Returns the most recently created [FFmpegSession], or `null`.
   static FFmpegSession? getLastFFmpegSession() {
     requireInitialized();
-    try {
-      final h = ffmpeg.ffmpeg_kit_get_last_ffmpeg_session();
-      if (h == nullptr) return null;
-      final session = FFmpegSession.fromHandle(h, _getSessionCommand(h));
-      // Release is handled by the NativeFinalizer attached inside fromHandle.
-      return session;
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_last_ffmpeg_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    final sessions = _projectHistory<FFmpegSession>(
+      expectedKind: _ExpectedSessionKind.ffmpeg,
+    );
+    return sessions.isEmpty ? null : sessions.last;
   }
 
   /// Returns the most recently created [FFprobeSession], or `null`.
   static FFprobeSession? getLastFFprobeSession() {
     requireInitialized();
-    try {
-      final h = ffmpeg.ffmpeg_kit_get_last_ffprobe_session();
-      if (h == nullptr) return null;
-      return FFprobeSession.fromHandle(h, _getSessionCommand(h));
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_last_ffprobe_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    final sessions = _projectHistory<FFprobeSession>(
+      expectedKind: _ExpectedSessionKind.ffprobe,
+    );
+    return sessions.isEmpty ? null : sessions.last;
   }
 
   /// Returns the most recently created [FFplaySession], or `null`.
   static FFplaySession? getLastFFplaySession() {
     requireInitialized();
-    try {
-      final h = ffmpeg.ffmpeg_kit_get_last_ffplay_session();
-      if (h == nullptr) return null;
-      return FFplaySession.fromHandle(h, _getSessionCommand(h));
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_last_ffplay_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    final sessions = _projectHistory<FFplaySession>(
+      expectedKind: _ExpectedSessionKind.ffplay,
+    );
+    return sessions.isEmpty ? null : sessions.last;
   }
 
   /// Returns the most recently created [MediaInformationSession], or `null`.
   static MediaInformationSession? getLastMediaInformationSession() {
     requireInitialized();
-    try {
-      final h = ffmpeg.ffmpeg_kit_get_last_media_information_session();
-      if (h == nullptr) return null;
-      return MediaInformationSession.fromHandle(h, _getSessionCommand(h));
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_last_media_information_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    final sessions = _projectHistory<MediaInformationSession>(
+      expectedKind: _ExpectedSessionKind.mediaInformation,
+    );
+    return sessions.isEmpty ? null : sessions.last;
   }
 
   /// Returns the most recently completed session, or `null`.
   static Session? getLastCompletedSession() {
     requireInitialized();
-    try {
-      return _wrapSession(ffmpeg.ffmpeg_kit_get_last_completed_session());
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_get_last_completed_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    final sessions = _projectHistory<Session>().where((session) {
+      final state = session.getState();
+      return state == SessionState.completed || state == SessionState.failed;
+    }).toList();
+    return sessions.isEmpty ? null : sessions.last;
   }
 
   /// Gets the session ID for a given session handle.
-  static int getSessionId(Pointer<Void> handle) {
+  static int getSessionId(Object handle) {
     requireInitialized();
-    try {
-      return ffmpeg.ffmpeg_kit_session_get_session_id(handle);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_session_get_session_id",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    final sessionHandle = handle is SessionHandle
+        ? handle
+        : SessionHandle(handle);
+    return ffmpegKitBackend.getSessionId(sessionHandle);
   }
 
   /// Clears all sessions from the native layer's history store.
@@ -904,15 +510,53 @@ class FFmpegKitExtended {
   /// their completion callbacks fire.
   static void clearSessions() {
     requireInitialized();
+    ffmpegKitBackend.clearSessions();
+    _sessionHistoryIndex.clearAbandoned();
+    _sessionHistoryIndex.clearCancellationIntents();
+    _synchronizeLiveSessions();
+    for (final entry in _sessionHistoryIndex.entries.toList()) {
+      final live = _liveSession(entry.sessionId);
+      if (live == null) {
+        _sessionHistoryIndex.remove(entry.sessionId);
+      } else {
+        entry.visible = false;
+      }
+    }
+  }
+
+  /// Records terminal execution and reconciles terminal metadata immediately.
+  ///
+  /// This is called from the queue settlement boundary rather than from a
+  /// history getter, so long-running applications cannot accumulate completed
+  /// identities between reads.
+  static void reconcileCompletedSession(Session session) {
+    final entry = _sessionHistoryIndex[session.sessionId];
+    if (entry == null) return;
+    if (entry.terminal) return;
+    if (_sessionHistoryIndex.removeHidden(session.sessionId)) {
+      return;
+    }
     try {
-      ffmpeg.ffmpeg_kit_clear_sessions();
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_clear_sessions",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
+      final state = session.getState();
+      if (state != SessionState.completed && state != SessionState.failed) {
+        return;
+      }
+    } catch (_) {
+      return;
+    }
+    _sessionHistoryIndex.markTerminal(session.sessionId);
+    try {
+      _pruneTerminalHistory(ffmpegKitBackend.getSessionHistorySize());
+    } catch (_) {
+      // Capacity reconciliation must never replace the execution result.
+    }
+  }
+
+  /// Removes an identity whose wrapper no longer owns a live execution.
+  static void removeNonTerminalSession(Session session) {
+    final entry = _sessionHistoryIndex[session.sessionId];
+    if (entry != null && (!entry.terminal || !entry.visible)) {
+      _sessionHistoryIndex.remove(session.sessionId);
     }
   }
 
@@ -927,10 +571,10 @@ class FFmpegKitExtended {
   ]) {
     requireInitialized();
     try {
-      callback_manager.CallbackManager().globalLogCallback = logCallback;
-      ffmpeg.ffmpeg_kit_config_enable_log_callback(
-        callback_manager.nativeFFmpegLog.nativeFunction,
-        nullptr,
+      callback_manager.CallbackManager().setGlobalLogCallback(
+        logCallback,
+        install: ffmpegKitBackend.configureLogCallback,
+        uninstall: ffmpegKitBackend.disableLogCallback,
       );
     } catch (e, stack) {
       log(
@@ -949,11 +593,10 @@ class FFmpegKitExtended {
   ]) {
     requireInitialized();
     try {
-      callback_manager.CallbackManager().globalStatisticsCallback =
-          statisticsCallback;
-      ffmpeg.ffmpeg_kit_config_enable_statistics_callback(
-        callback_manager.nativeFFmpegStatistics.nativeFunction,
-        nullptr,
+      callback_manager.CallbackManager().setGlobalStatisticsCallback(
+        statisticsCallback,
+        install: ffmpegKitBackend.configureStatisticsCallback,
+        uninstall: ffmpegKitBackend.disableStatisticsCallback,
       );
     } catch (e, stack) {
       log(
@@ -971,11 +614,10 @@ class FFmpegKitExtended {
   ]) {
     requireInitialized();
     try {
-      callback_manager.CallbackManager().globalFFmpegSessionCompleteCallback =
-          completeCallback;
-      ffmpeg.ffmpeg_kit_config_enable_ffmpeg_session_complete_callback(
-        callback_manager.nativeFFmpegComplete.nativeFunction,
-        nullptr,
+      callback_manager.CallbackManager().setGlobalFFmpegSessionCompleteCallback(
+        completeCallback,
+        install: ffmpegKitBackend.configureFFmpegSessionCompleteCallback,
+        uninstall: ffmpegKitBackend.disableFFmpegSessionCompleteCallback,
       );
     } catch (e, stack) {
       log(
@@ -993,12 +635,12 @@ class FFmpegKitExtended {
   ]) {
     requireInitialized();
     try {
-      callback_manager.CallbackManager().globalFFprobeSessionCompleteCallback =
-          completeCallback;
-      ffmpeg.ffmpeg_kit_config_enable_ffprobe_session_complete_callback(
-        callback_manager.nativeFFprobeComplete.nativeFunction,
-        nullptr,
-      );
+      callback_manager.CallbackManager()
+          .setGlobalFFprobeSessionCompleteCallback(
+            completeCallback,
+            install: ffmpegKitBackend.configureFFprobeSessionCompleteCallback,
+            uninstall: ffmpegKitBackend.disableFFprobeSessionCompleteCallback,
+          );
     } catch (e, stack) {
       log(
         "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_enable_ffprobe_session_complete_callback",
@@ -1015,11 +657,10 @@ class FFmpegKitExtended {
   ]) {
     requireInitialized();
     try {
-      callback_manager.CallbackManager().globalFFplaySessionCompleteCallback =
-          completeCallback;
-      ffmpeg.ffmpeg_kit_config_enable_ffplay_session_complete_callback(
-        callback_manager.nativeFFplayComplete.nativeFunction,
-        nullptr,
+      callback_manager.CallbackManager().setGlobalFFplaySessionCompleteCallback(
+        completeCallback,
+        install: ffmpegKitBackend.configureFFplaySessionCompleteCallback,
+        uninstall: ffmpegKitBackend.disableFFplaySessionCompleteCallback,
       );
     } catch (e, stack) {
       log(
@@ -1039,12 +680,12 @@ class FFmpegKitExtended {
     requireInitialized();
     try {
       callback_manager.CallbackManager()
-              .globalMediaInformationSessionCompleteCallback =
-          completeCallback;
-      ffmpeg
-          .ffmpeg_kit_config_enable_media_information_session_complete_callback(
-            callback_manager.nativeMediaInfoComplete.nativeFunction,
-            nullptr,
+          .setGlobalMediaInformationSessionCompleteCallback(
+            completeCallback,
+            install: ffmpegKitBackend
+                .configureMediaInformationSessionCompleteCallback,
+            uninstall:
+                ffmpegKitBackend.disableMediaInformationSessionCompleteCallback,
           );
     } catch (e, stack) {
       log(
@@ -1064,40 +705,13 @@ class FFmpegKitExtended {
   /// failure.
   static String? registerNewFFmpegPipe() {
     requireInitialized();
-    try {
-      final ptr = ffmpeg.ffmpeg_kit_config_register_new_ffmpeg_pipe();
-      if (ptr == nullptr) return null;
-      final result = ptr.cast<Utf8>().toDartString();
-      ffmpeg.ffmpeg_kit_free(ptr.cast());
-      return result;
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_register_new_ffmpeg_pipe",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return ffmpegKitBackend.registerNewFFmpegPipe();
   }
 
   /// Closes the FFmpeg pipe at [pipePath].
   static void closeFFmpegPipe(String pipePath) {
     requireInitialized();
-    try {
-      final ptr = pipePath.toNativeUtf8();
-      try {
-        ffmpeg.ffmpeg_kit_config_close_ffmpeg_pipe(ptr.cast());
-      } finally {
-        malloc.free(ptr);
-      }
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_close_ffmpeg_pipe",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    ffmpegKitBackend.closeFFmpegPipe(pipePath);
   }
 
   // ---------------------------------------------------------------------------
@@ -1110,47 +724,12 @@ class FFmpegKitExtended {
     Map<String, String>? fontMappings,
   ]) {
     requireInitialized();
-    final count = fontDirectoryList.length;
-
-    // Allocate everything upfront so the single outer finally block can free
-    // all native memory unconditionally.
-    final listPtr = malloc<Pointer<Char>>(count);
-    final strings = <Pointer<Utf8>>[];
-    Pointer<Char> mappingsPtr = nullptr;
-
-    try {
-      // Build the null-terminated (not required by C but defensive) string
-      // pointer array.
-      for (int i = 0; i < count; i++) {
-        final s = fontDirectoryList[i].toNativeUtf8();
-        strings.add(s);
-        listPtr[i] = s.cast();
-      }
-
-      if (fontMappings != null) {
-        mappingsPtr = jsonEncode(fontMappings).toNativeUtf8().cast();
-      }
-
-      ffmpeg.ffmpeg_kit_config_set_font_directory_list(
-        listPtr.cast(),
-        count,
-        mappingsPtr,
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_set_font_directory_list",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    } finally {
-      // Free in reverse allocation order.
-      if (mappingsPtr != nullptr) malloc.free(mappingsPtr);
-      for (final s in strings) {
-        malloc.free(s);
-      }
-      malloc.free(listPtr);
-    }
+    ffmpegKitBackend.setFontDirectoryList(
+      fontDirectoryList,
+      mapping: fontMappings == null || fontMappings.isEmpty
+          ? null
+          : jsonEncode(fontMappings),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -1160,129 +739,32 @@ class FFmpegKitExtended {
   /// Converts [state] to its human-readable string name.
   static String sessionStateToString(SessionState state) {
     requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_config_session_state_to_string(
-          ffmpeg.FFmpegKitSessionState.fromValue(state.value),
-        ),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_session_state_to_string",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return ffmpegKitBackend.sessionStateToString(state.value);
   }
 
   /// Converts [level] to its human-readable string name, or `null` if
   /// unrecognised.
   static String? logLevelToString(LogLevel level) {
     requireInitialized();
-    try {
-      final ptr = ffmpeg.ffmpeg_kit_config_log_level_to_string(
-        ffmpeg.FFmpegKitLogLevel.fromValue(level.value),
-      );
-      if (ptr == nullptr) return null;
-      final result = ptr.cast<Utf8>().toDartString();
-      ffmpeg.ffmpeg_kit_free(ptr.cast());
-      return result;
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_log_level_to_string",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return ffmpegKitBackend.logLevelToString(level.value);
   }
 
   /// Parses [command] into an argument list.
   static List<String> parseArguments(String command) {
     requireInitialized();
-    final cmdPtr = command.toNativeUtf8();
-    final countPtr = malloc<Int64>();
-    try {
-      final argsPtr = ffmpeg.ffmpeg_kit_config_parse_arguments(
-        cmdPtr.cast(),
-        countPtr.cast(),
-      );
-      if (argsPtr == nullptr) return const [];
-
-      final count = countPtr.value;
-      final result = <String>[];
-      for (int i = 0; i < count; i++) {
-        final arg = argsPtr[i];
-        if (arg != nullptr) {
-          result.add(arg.cast<Utf8>().toDartString());
-          ffmpeg.ffmpeg_kit_free(arg.cast());
-        }
-      }
-      // Free the outer char** array (individual strings already freed above).
-      ffmpeg.ffmpeg_kit_free(argsPtr.cast());
-      return result;
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_parse_arguments",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    } finally {
-      malloc.free(cmdPtr);
-      malloc.free(countPtr);
-    }
+    return ffmpegKitBackend.parseArguments(command);
   }
 
   /// Joins [arguments] back into a single command string.
   static String argumentsToString(List<String> arguments) {
     requireInitialized();
-    final count = arguments.length;
-    final argsPtr = malloc<Pointer<Char>>(count);
-    final strings = <Pointer<Utf8>>[];
-    try {
-      for (int i = 0; i < count; i++) {
-        final s = arguments[i].toNativeUtf8();
-        strings.add(s);
-        argsPtr[i] = s.cast();
-      }
-      final resPtr = ffmpeg.ffmpeg_kit_config_arguments_to_string(
-        argsPtr.cast(),
-        count,
-      );
-      if (resPtr == nullptr) return '';
-      final result = resPtr.cast<Utf8>().toDartString();
-      ffmpeg.ffmpeg_kit_free(resPtr.cast());
-      return result;
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_arguments_to_string",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    } finally {
-      for (final s in strings) {
-        malloc.free(s);
-      }
-      malloc.free(argsPtr);
-    }
+    return ffmpegKitBackend.argumentsToString(arguments);
   }
 
   /// Returns the number of log/stats messages buffered for [sessionId].
   static int messagesInTransmit(int sessionId) {
     requireInitialized();
-    try {
-      return ffmpeg.ffmpeg_kit_config_messages_in_transmit(sessionId);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_messages_in_transmit",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return ffmpegKitBackend.messagesInTransmit(sessionId);
   }
 
   // ---------------------------------------------------------------------------
@@ -1292,78 +774,31 @@ class FFmpegKitExtended {
   /// Enables per-session debug logging for [session].
   static void enableDebugLog(Session session) {
     requireInitialized();
-    try {
-      ffmpeg.ffmpeg_kit_config_enable_debug_log(session.handle);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_enable_debug_log",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    ffmpegKitBackend.enableDebugLog(session.handle);
   }
 
   /// Disables per-session debug logging for [session].
   static void disableDebugLog(Session session) {
     requireInitialized();
-    try {
-      ffmpeg.ffmpeg_kit_config_disable_debug_log(session.handle);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_disable_debug_log",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    ffmpegKitBackend.disableDebugLog(session.handle);
   }
 
   /// Returns `true` if per-session debug logging is enabled for [session].
   static bool isDebugLogEnabled(Session session) {
     requireInitialized();
-    try {
-      return ffmpeg.ffmpeg_kit_config_is_debug_log_enabled(session.handle);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_is_debug_log_enabled",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return ffmpegKitBackend.isDebugLogEnabled(session.handle);
   }
 
   /// Returns the accumulated debug log for [session].
   static String getDebugLog(Session session) {
     requireInitialized();
-    try {
-      return _nativeStringOrEmpty(
-        ffmpeg.ffmpeg_kit_config_get_debug_log(session.handle),
-      );
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_get_debug_log",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    return ffmpegKitBackend.getDebugLog(session.handle) ?? '';
   }
 
   /// Clears the debug log for [session].
   static void clearDebugLog(Session session) {
     requireInitialized();
-    try {
-      ffmpeg.ffmpeg_kit_config_clear_debug_log(session.handle);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_config_clear_debug_log",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
+    ffmpegKitBackend.clearDebugLog(session.handle);
   }
 
   // ---------------------------------------------------------------------------
@@ -1378,48 +813,12 @@ class FFmpegKitExtended {
     }
   }
 
-  /// Converts a heap-allocated `char*` to a Dart [String], frees it, and
-  /// returns the string.  Returns `''` when [ptr] is the null pointer.
-  ///
-  /// Centralising this pattern eliminates the eight copies of the same
-  /// three-line idiom that existed across the class.
-  static String _nativeStringOrEmpty(Pointer<Char> ptr) {
-    requireInitialized();
-    if (ptr == nullptr) return '';
-    final result = ptr.cast<Utf8>().toDartString();
-    try {
-      ffmpeg.ffmpeg_kit_free(ptr.cast());
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_free",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-    return result;
-  }
-
   /// Reads the command string from a session [handle].
   ///
   /// Returns `''` for a null handle or a null command pointer.
-  static String _getSessionCommand(Pointer<Void> handle) {
+  static String _getSessionCommand(SessionHandle handle) {
     requireInitialized();
-    if (handle == nullptr) return '';
-    final cmdPtr = ffmpeg.ffmpeg_kit_session_get_command(handle);
-    if (cmdPtr == nullptr) return '';
-    final cmd = cmdPtr.cast<Utf8>().toDartString();
-    try {
-      ffmpeg.ffmpeg_kit_free(cmdPtr.cast());
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function ffmpeg_kit_free",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-    return cmd;
+    return ffmpegKitBackend.getCommand(handle) ?? '';
   }
 
   /// Wraps [handle] into the most-specific [Session] subclass.
@@ -1432,153 +831,219 @@ class FFmpegKitExtended {
   /// The priority order — MediaInformation before FFprobe — is deliberate:
   /// [MediaInformationSession] extends [FFprobeSession], so its type flag is
   /// checked first to avoid mis-classifying it as a plain [FFprobeSession].
-  static Session? _wrapSession(Pointer<Void> handle) {
+  static Session? _wrapSession(SessionHandle handle) {
     requireInitialized();
-    if (handle == nullptr) return null;
+    var ownershipDelegated = false;
+    var duplicateReleaseAttempted = false;
+    try {
+      final sessionId = ffmpegKitBackend.getSessionId(handle);
+      final manager = callback_manager.CallbackManager();
 
-    final sessionId = ffmpeg.ffmpeg_kit_session_get_session_id(handle);
+      // Prefer the live Dart object from CallbackManager when available — it
+      // carries callbacks and execution state that a fresh fromHandle would lack.
+      final existing =
+          manager.ffmpegSessions[sessionId] ??
+          manager.mediaInformationSessions[sessionId] ??
+          manager.ffprobeSessions[sessionId] ??
+          manager.ffplaySessions[sessionId];
+      if (existing != null) {
+        // History projection normally avoids acquiring a second handle for an
+        // active session. Keep this defensive path ownership-safe as well:
+        // terminal/Created handles can be released immediately, while a live
+        // handle must remain deferred until its native state is terminal.
+        final state = existing.getState();
+        if (state == SessionState.created ||
+            state == SessionState.completed ||
+            state == SessionState.failed) {
+          duplicateReleaseAttempted = true;
+          ffmpegKitBackend.releaseSession(handle);
+        } else {
+          _deferredHistoryHandles[sessionId] = handle;
+        }
+        return existing;
+      }
+
+      final cmd = _getSessionCommand(handle);
+
+      // MediaInformation must be checked before FFprobe because
+      // MediaInformationSession IS-A FFprobeSession; the FFprobe flag would
+      // also match for a MediaInformation handle.
+      final isMediaInfoSession = ffmpegKitBackend.isMediaInformationSession(
+        handle,
+      );
+      if (isMediaInfoSession) {
+        ownershipDelegated = true;
+        return MediaInformationSession.fromHandle(handle, cmd);
+      }
+      final isFfmpegSession = ffmpegKitBackend.isFFmpegSession(handle);
+      if (isFfmpegSession) {
+        ownershipDelegated = true;
+        return FFmpegSession.fromHandle(handle, cmd);
+      }
+      final isFfprobeSession = ffmpegKitBackend.isFFprobeSession(handle);
+      if (isFfprobeSession) {
+        ownershipDelegated = true;
+        return FFprobeSession.fromHandle(handle, cmd);
+      }
+      final isFfplaySession = ffmpegKitBackend.isFFplaySession(handle);
+      if (isFfplaySession) {
+        ownershipDelegated = true;
+        return FFplaySession.fromHandle(handle, cmd);
+      }
+
+      // Unknown type is not safe to wrap as FFmpeg: the subclass controls
+      // callback routing, cleanup, and native operations. Release the still-
+      // untransferred token and fail closed with the classification evidence.
+      duplicateReleaseAttempted = true;
+      _releaseUntransferredHandle(handle);
+      throw StateError(
+        'Session $sessionId returned an unknown native session type; '
+        'refusing to adopt its handle.',
+      );
+    } catch (error, stackTrace) {
+      if (!ownershipDelegated && !duplicateReleaseAttempted) {
+        _releaseUntransferredHandle(handle);
+      }
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+  }
+
+  static final Map<int, SessionHandle> _deferredHistoryHandles = {};
+
+  /// Registers a newly created wrapper at the native creation boundary.
+  ///
+  /// Public helpers and direct session constructors share this method so an
+  /// argument-based, synchronous, asynchronous, or specialised session cannot
+  /// bypass creation-order tracking. Repeated adoption of an existing identity
+  /// remains idempotent in [SessionHistoryIndex].
+  static void registerCreatedSession(Session session) {
+    if (_sessionHistoryIndex.isAbandoned(session.sessionId)) return;
+    _sessionHistoryIndex.record(
+      session.sessionId,
+      _historyType(session),
+      wrapper: session,
+    );
+  }
+
+  static SessionHistoryType _historyType(Session session) {
+    if (session is MediaInformationSession) {
+      return SessionHistoryType.mediaInformation;
+    }
+    if (session is FFmpegSession) return SessionHistoryType.ffmpeg;
+    if (session is FFprobeSession) return SessionHistoryType.ffprobe;
+    return SessionHistoryType.ffplay;
+  }
+
+  static Session? _liveSession(int sessionId) =>
+      callback_manager.CallbackManager().sessionForId(sessionId);
+
+  static void _synchronizeLiveSessions() {
     final manager = callback_manager.CallbackManager();
-
-    // Prefer the live Dart object from CallbackManager when available — it
-    // carries callbacks and execution state that a fresh fromHandle would lack.
-    final existing =
-        manager.ffmpegSessions[sessionId] ??
-        manager.mediaInformationSessions[sessionId] ??
-        manager.ffprobeSessions[sessionId] ??
-        manager.ffplaySessions[sessionId];
-    if (existing != null) return existing;
-
-    final cmd = _getSessionCommand(handle);
-
-    // MediaInformation must be checked before FFprobe because
-    // MediaInformationSession IS-A FFprobeSession; the FFprobe flag would
-    // also match for a MediaInformation handle.
-    bool isMediaInfoSession;
-    try {
-      isMediaInfoSession = ffmpeg.session_is_media_information_session(handle);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function session_is_media_information_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
+    for (final session in [
+      ...manager.ffmpegSessions.values,
+      ...manager.ffprobeSessions.values,
+      ...manager.ffplaySessions.values,
+      ...manager.mediaInformationSessions.values,
+    ]) {
+      registerCreatedSession(session);
     }
-    if (isMediaInfoSession) {
-      return MediaInformationSession.fromHandle(handle, cmd);
-    }
-    bool isFfmpegSession;
-    try {
-      isFfmpegSession = ffmpeg.session_is_ffmpeg_session(handle);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function session_is_ffmpeg_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-    if (isFfmpegSession) {
-      return FFmpegSession.fromHandle(handle, cmd);
-    }
-    bool isFfprobeSession;
-    try {
-      isFfprobeSession = ffmpeg.session_is_ffprobe_session(handle);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function session_is_ffprobe_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-    if (isFfprobeSession) {
-      return FFprobeSession.fromHandle(handle, cmd);
-    }
-    bool isFfplaySession;
-    try {
-      isFfplaySession = ffmpeg.session_is_ffplay_session(handle);
-    } catch (e, stack) {
-      log(
-        "FFmpegKitExtended: Failed to call native function session_is_ffplay_session",
-        error: e,
-        stackTrace: stack,
-      );
-      rethrow;
-    }
-    if (isFfplaySession) {
-      return FFplaySession.fromHandle(handle, cmd);
-    }
-
-    // Unknown type — fall back to FFmpegSession as the most general wrapper.
-    return FFmpegSession.fromHandle(handle, cmd);
   }
 
-  /// Iterates a null-terminated handle array returned by the C layer,
-  /// wraps each entry using [wrap], releases each handle individually, then
-  /// frees the array itself.
-  static List<T> _collectTypedSessions<T extends Session>(
-    Pointer<Pointer<Void>> ptr,
-    T Function(Pointer<Void> handle, String cmd) wrap,
-  ) {
-    requireInitialized();
-    if (ptr == nullptr) return const [];
-
-    final result = <T>[];
-    try {
-      for (int i = 0; ; i++) {
-        final handle = ptr[i];
-        if (handle == nullptr) break;
-        // fromHandle attaches a NativeFinalizer for this handle, so we do not
-        // call [FFmpegKitExtended].releaseHandle here directly.
-        result.add(wrap(handle, _getSessionCommand(handle)));
-      }
-    } finally {
-      // Free only the array allocation; individual handles are owned by the
-      // NativeFinalizer on each returned Session object.
-      try {
-        ffmpeg.ffmpeg_kit_free(ptr.cast());
-      } catch (e, stack) {
-        log(
-          "FFmpegKitExtended: Failed to call native function ffmpeg_kit_free",
-          error: e,
-          stackTrace: stack,
-        );
-        rethrow;
-      }
-    }
-    return result;
+  static void _pruneTerminalHistory(int capacity) {
+    _sessionHistoryIndex.pruneTerminal(capacity);
   }
 
-  /// Variant of [_collectTypedSessions] that uses [_wrapSession] to produce
-  /// the most-specific [Session] subtype for each handle.
-  static List<Session> _collectSessions(
-    Pointer<Pointer<Void>> ptr,
-    Session? Function(Pointer<Void>) wrap,
+  static bool _matchesExpectedKind(
+    SessionHistoryEntry entry,
+    _ExpectedSessionKind expectedKind,
   ) {
-    requireInitialized();
-    if (ptr == nullptr) return const [];
+    switch (expectedKind) {
+      case _ExpectedSessionKind.any:
+        return true;
+      case _ExpectedSessionKind.ffmpeg:
+        return entry.type == SessionHistoryType.ffmpeg;
+      case _ExpectedSessionKind.ffprobe:
+        return entry.type == SessionHistoryType.ffprobe;
+      case _ExpectedSessionKind.ffplay:
+        return entry.type == SessionHistoryType.ffplay;
+      case _ExpectedSessionKind.mediaInformation:
+        return entry.type == SessionHistoryType.mediaInformation;
+    }
+  }
 
-    final result = <Session>[];
-    try {
-      for (int i = 0; ; i++) {
-        final handle = ptr[i];
-        if (handle == nullptr) break;
-        final session = wrap(handle);
-        if (session != null) result.add(session);
+  static Session? _resolveHistoryEntry(SessionHistoryEntry entry) {
+    final cached = entry.wrapper;
+    if (cached is Session && !cached.isDisposed) return cached;
+    if (cached != null) entry.clearWrapper();
+
+    final live = _liveSession(entry.sessionId);
+    if (live != null) {
+      entry.cacheWrapper(live);
+      return live;
+    }
+
+    final handle = ffmpegKitBackend.getSessionById(entry.sessionId);
+    if (handle == null) {
+      _sessionHistoryIndex.remove(entry.sessionId);
+      return null;
+    }
+    final session = _wrapSession(handle);
+    if (session == null) {
+      _sessionHistoryIndex.remove(entry.sessionId);
+      return null;
+    }
+    entry.cacheWrapper(session);
+    return session;
+  }
+
+  static List<T> _projectHistory<T extends Session>({
+    _ExpectedSessionKind expectedKind = _ExpectedSessionKind.any,
+  }) {
+    _synchronizeLiveSessions();
+    final sessions = <T>[];
+    for (final entry in _sessionHistoryIndex.entries.toList()) {
+      if (!entry.visible || !_matchesExpectedKind(entry, expectedKind)) {
+        continue;
       }
-    } finally {
+      final session = _resolveHistoryEntry(entry);
+      if (session == null) continue;
+      if (session is! T) continue;
+      sessions.add(session);
+    }
+    _releaseDeferredHistoryHandles();
+    return sessions;
+  }
+
+  static void _releaseDeferredHistoryHandles() {
+    for (final entry in _deferredHistoryHandles.entries.toList()) {
+      final live = _liveSession(entry.key);
+      if (live == null) {
+        _deferredHistoryHandles.remove(entry.key);
+        ffmpegKitBackend.releaseSession(entry.value);
+        continue;
+      }
       try {
-        ffmpeg.ffmpeg_kit_free(ptr.cast());
-      } catch (e, stack) {
-        log(
-          "FFmpegKitExtended: Failed to call native function ffmpeg_kit_free",
-          error: e,
-          stackTrace: stack,
-        );
-        rethrow;
+        final state = live.getState();
+        if (state == SessionState.completed || state == SessionState.failed) {
+          _deferredHistoryHandles.remove(entry.key);
+          ffmpegKitBackend.releaseSession(entry.value);
+        }
+      } catch (_) {
+        // Keep the ownership deferred while the live session is still
+        // authoritative; the next history read retries the terminal check.
       }
     }
-    return result;
+  }
+
+  static void _releaseUntransferredHandle(SessionHandle handle) {
+    try {
+      ffmpegKitBackend.releaseSession(handle);
+    } catch (cleanupError, cleanupStackTrace) {
+      log(
+        'FFmpegKitExtended: failed to release an untransferred session handle',
+        error: cleanupError,
+        stackTrace: cleanupStackTrace,
+      );
+    }
   }
 }

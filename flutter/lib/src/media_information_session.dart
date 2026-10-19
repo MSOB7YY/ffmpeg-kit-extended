@@ -19,21 +19,41 @@
 
 import 'dart:async';
 import 'dart:developer';
-import 'dart:ffi';
-import 'dart:io';
 
-import 'package:ffi/ffi.dart';
 import 'package:meta/meta.dart';
 
 import '../ffmpeg_kit_extended_flutter.dart';
 import 'callback_manager.dart';
-import 'generated/ffmpeg_kit_bindings.dart' as ffmpeg;
+import 'platform/backend.dart';
+import 'platform/backend_selector.dart';
+
+/// Awaits a media-information execution and preserves the original backend
+/// or transport error for the caller.
+@visibleForTesting
+Future<void> awaitMediaInformationExecution(
+  Future<void> execution,
+  int sessionId,
+) async {
+  try {
+    await execution;
+  } catch (e, st) {
+    log(
+      'MediaInformationSession: error awaiting session $sessionId',
+      error: e,
+      stackTrace: st,
+    );
+    rethrow;
+  }
+}
 
 /// A specialised [FFprobeSession] for retrieving detailed media information.
 ///
 /// Internally runs an ffprobe command with `-print_format json -show_format
 /// -show_streams -show_chapters` and parses the result into a [MediaInformation]
 /// object that can be retrieved via [getMediaInformation].
+/// [execute] blocks until parsing and cleanup complete, so callers can inspect
+/// media information immediately. Use [executeAsync] for long work on the
+/// Flutter UI isolate; that path is managed by [SessionQueueManager].
 class MediaInformationSession extends FFprobeSession {
   MediaInformationSessionCompleteCallback? _mediaInfoCompleteCallback;
 
@@ -81,15 +101,33 @@ class MediaInformationSession extends FFprobeSession {
   void setMediaInfoCompleteCallback(
     MediaInformationSessionCompleteCallback? cb,
   ) {
+    final previous = _mediaInfoCompleteCallback;
+    final hadBridgeLease = hasBridgeLease(completionBridgeKind);
     _mediaInfoCompleteCallback = cb;
-    ensureRegistered();
+    if (cb == null) {
+      syncCompletionBridgeLease();
+      unregisterIfIdle();
+    } else {
+      try {
+        ensureRegisteredForSinkDemand();
+        syncCompletionBridgeLease();
+      } catch (_) {
+        _mediaInfoCompleteCallback = previous;
+        if (!hadBridgeLease) {
+          releaseBridgeLease(completionBridgeKind);
+        }
+        unregisterIfIdle();
+        rethrow;
+      }
+    }
   }
 
   /// Clears the completion callback and unregisters from [CallbackManager]
   /// if no other log-delivery sinks remain attached.
   void removeMediaInfoCompleteCallback() {
     _mediaInfoCompleteCallback = null;
-    _unregisterIfIdle();
+    syncCompletionBridgeLease();
+    unregisterIfIdle();
   }
 
   /// Kept for API compatibility with callers that hold an [FFprobeSession]
@@ -121,6 +159,22 @@ class MediaInformationSession extends FFprobeSession {
   // Constructors
   // ---------------------------------------------------------------------------
 
+  /// Creates an in-memory media-information session for lifecycle tests.
+  @visibleForTesting
+  MediaInformationSession.test({
+    int sessionId = 1,
+    String command = 'test',
+    MediaInformationSessionCompleteCallback? completeCallback,
+    this._timeout = 500,
+    // This test-only factory must preserve the base's no-finalizer test seam.
+    // ignore: invalid_use_of_visible_for_testing_member
+  }) : super.internalNoFinalizer() {
+    handle = const SessionHandle(Object());
+    this.sessionId = sessionId;
+    this.command = command;
+    _mediaInfoCompleteCallback = completeCallback;
+  }
+
   /// Creates a [MediaInformationSession] from a custom ffprobe [command].
   ///
   /// [command] is prefixed with `-v error -hide_banner` before being sent to
@@ -128,42 +182,34 @@ class MediaInformationSession extends FFprobeSession {
   MediaInformationSession(
     String command, {
     MediaInformationSessionCompleteCallback? completeCallback,
-    int timeout = 500,
-  }) : _timeout = timeout,
-       super.internal() {
+    this._timeout = 500,
+  }) : super.internal() {
     FFmpegKitExtended.requireInitialized();
     final finalCommand = '$_defaultCommandPrefix $command';
     this.command = finalCommand;
 
-    final cmdPtr = finalCommand.toNativeUtf8(allocator: calloc);
     try {
-      try {
-        handle = ffmpeg.media_information_create_session(cmdPtr.cast());
-      } catch (e, st) {
-        log(
-          'MediaInformationSession: error creating session media_information_create_session $finalCommand',
-          error: e,
-          stackTrace: st,
-        );
-        rethrow;
-      }
-      try {
-        sessionId = ffmpeg.ffmpeg_kit_session_get_session_id(handle);
-      } catch (e, st) {
-        log(
-          'MediaInformationSession: error getting session id for ffmpeg_kit_session_get_session_id $finalCommand',
-          error: e,
-          stackTrace: st,
-        );
-        rethrow;
-      }
-      registerFinalizer();
-    } finally {
-      calloc.free(cmdPtr);
+      final ownedHandle = ffmpegKitBackend.createMediaInformationSession(
+        finalCommand,
+      );
+      adoptOwnedHandle(
+        ownedHandle,
+        readSessionId: ffmpegKitBackend.getSessionId,
+      );
+    } catch (e, st) {
+      log(
+        'MediaInformationSession: error creating session $finalCommand',
+        error: e,
+        stackTrace: st,
+      );
+      rethrow;
     }
 
     _mediaInfoCompleteCallback = completeCallback;
-    ensureRegistered();
+    FFmpegKitExtended.registerCreatedSession(this);
+    if (completeCallback != null) {
+      ensureRegisteredForSinkDemand();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -178,9 +224,8 @@ class MediaInformationSession extends FFprobeSession {
   MediaInformationSession.fromArguments(
     List<String> arguments, {
     MediaInformationSessionCompleteCallback? completeCallback,
-    int timeout = 500,
-  }) : _timeout = timeout,
-       super.internal() {
+    this._timeout = 500,
+  }) : super.internal() {
     FFmpegKitExtended.requireInitialized();
     final finalArguments = <String>[
       ..._defaultCommandPrefixArguments,
@@ -188,32 +233,13 @@ class MediaInformationSession extends FFprobeSession {
     ];
     command = finalArguments.join(' ');
 
-    using((Arena arena) {
-      final argv = arena<Pointer<Char>>(finalArguments.length);
-      for (var i = 0; i < finalArguments.length; i++) {
-        argv[i] = finalArguments[i]
-            .toNativeUtf8(allocator: arena)
-            .cast<Char>();
-      }
-
-      try {
-        handle = ffmpeg.media_information_create_session_from_argv(
-          finalArguments.length,
-          argv,
-        );
-      } catch (e, st) {
-        log(
-          'MediaInformationSession.fromArguments: error creating session '
-          'media_information_create_session_from_argv $command',
-          error: e,
-          stackTrace: st,
-        );
-        rethrow;
-      }
-    });
-
     try {
-      sessionId = ffmpeg.ffmpeg_kit_session_get_session_id(handle);
+      final ownedHandle = ffmpegKitBackend
+          .createMediaInformationSessionFromArguments(finalArguments);
+      adoptOwnedHandle(
+        ownedHandle,
+        readSessionId: ffmpegKitBackend.getSessionId,
+      );
     } catch (e, st) {
       log(
         'MediaInformationSession.fromArguments: error getting session id '
@@ -223,22 +249,29 @@ class MediaInformationSession extends FFprobeSession {
       );
       rethrow;
     }
-    registerFinalizer();
-
     _mediaInfoCompleteCallback = completeCallback;
-    ensureRegistered();
+    FFmpegKitExtended.registerCreatedSession(this);
+    if (completeCallback != null) {
+      ensureRegisteredForSinkDemand();
+    }
   }
 
   /// Restores a [MediaInformationSession] from a native [handle].
-  MediaInformationSession.fromHandle(Pointer<Void> handle, String command)
+  MediaInformationSession.fromHandle(Object handle, String command)
     : _timeout = 500,
       super.internal() {
     FFmpegKitExtended.requireInitialized();
-    this.handle = handle;
+    final ownedHandle = handle is SessionHandle
+        ? handle
+        : SessionHandle(handle);
     this.command = command;
 
     try {
-      sessionId = ffmpeg.ffmpeg_kit_session_get_session_id(handle);
+      adoptOwnedHandle(
+        ownedHandle,
+        readSessionId: ffmpegKitBackend.getSessionId,
+        restoredSession: true,
+      );
     } catch (e, st) {
       log(
         'MediaInformationSession.fromHandle: error getting session id for ffmpeg_kit_session_get_session_id $command',
@@ -247,7 +280,6 @@ class MediaInformationSession extends FFprobeSession {
       );
       rethrow;
     }
-    registerFinalizer();
     // No callback registration: restored sessions have no active callbacks.
   }
 
@@ -256,14 +288,17 @@ class MediaInformationSession extends FFprobeSession {
   /// The file path is passed as one native argument, so whitespace and literal
   /// quote characters in the filename require no caller-side escaping.
   factory MediaInformationSession.fromFile(
-    File file, {
+    Object file, {
     MediaInformationSessionCompleteCallback? completeCallback,
     int timeout = 500,
-  }) => MediaInformationSession.fromArguments(
-    [..._defaultMediaInformationArguments, file.path],
-    completeCallback: completeCallback,
-    timeout: timeout,
-  );
+  }) {
+    final path = file is String ? file : (file as dynamic).path as String;
+    return MediaInformationSession.fromArguments(
+      [..._defaultMediaInformationArguments, path],
+      completeCallback: completeCallback,
+      timeout: timeout,
+    );
+  }
 
   /// Creates a [MediaInformationSession] for a network [uri].
   ///
@@ -297,7 +332,7 @@ class MediaInformationSession extends FFprobeSession {
       );
     }
     return MediaInformationSession.fromFile(
-      File(path),
+      path,
       completeCallback: completeCallback,
       timeout: timeout,
     );
@@ -345,49 +380,67 @@ class MediaInformationSession extends FFprobeSession {
   // Execution
   // ---------------------------------------------------------------------------
 
-  /// Enqueues this session for synchronous native execution and returns `this`
-  /// immediately (fire-and-forget).
+  /// Executes this session synchronously and returns only after native work and
+  /// cleanup have completed. Backend failures are rethrown after cleanup.
   @override
   MediaInformationSession execute() {
-    SessionQueueManager()
-        .executeSession(this, () async {
-          enableNativeLogCallback();
-          try {
-            ffmpeg.media_information_session_execute(handle, _timeout);
-          } catch (e, st) {
-            log(
-              'MediaInformationSession.execute: error executing media_information_session_execute $command',
-              error: e,
-              stackTrace: st,
-            );
-            rethrow;
-          }
-          dispatchPendingLogs();
-          try {
-            _mediaInfoCompleteCallback?.call(this);
-          } catch (e, st) {
-            log(
-              'MediaInformationSession.execute: error in completeCallback',
-              error: e,
-              stackTrace: st,
-            );
-            rethrow;
-          } finally {
-            closeLogStreams();
-            unregister();
-          }
-        })
-        .catchError((Object e, StackTrace st) {
-          log(
-            'MediaInformationSession.execute: queue error',
-            error: e,
-            stackTrace: st,
-          );
-        });
+    claimExecutionSubmission();
+    requireInitializedForExecution();
+    ensureRegistered();
+
+    Object? primaryError;
+    StackTrace? primaryStackTrace;
+    void recordCleanupFailure(Object error, StackTrace stackTrace) {
+      if (primaryError == null) {
+        primaryError = error;
+        primaryStackTrace = stackTrace;
+      } else {
+        log(
+          'MediaInformationSession.execute: cleanup failed after primary error for session $sessionId',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+    }
+
+    try {
+      enableNativeLogCallback();
+      configureSynchronousNativeCallbacks();
+      markExecutionStarted();
+      executeSynchronously();
+      dispatchPendingLogs();
+      commitTerminalHistory();
+      CallbackManager().dispatchMediaInformationComplete(sessionId);
+    } catch (error, stackTrace) {
+      primaryError = error;
+      primaryStackTrace = stackTrace;
+      log(
+        'MediaInformationSession.execute: synchronous execution failed for session $sessionId',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    } finally {
+      try {
+        closeLogStreams();
+      } catch (error, stackTrace) {
+        recordCleanupFailure(error, stackTrace);
+      }
+      try {
+        unregister();
+      } catch (error, stackTrace) {
+        recordCleanupFailure(error, stackTrace);
+      } finally {
+        markExecutionSettled();
+      }
+    }
+
+    if (primaryError != null) {
+      Error.throwWithStackTrace(primaryError!, primaryStackTrace!);
+    }
     return this;
   }
 
-  /// Creates and enqueues a session for synchronous execution.
+  /// Creates and executes a session synchronously.
   static MediaInformationSession executeCommand(
     String command, {
     MediaInformationSessionCompleteCallback? completeCallback,
@@ -405,6 +458,7 @@ class MediaInformationSession extends FFprobeSession {
     FFprobeSessionCompleteCallback? completeCallback,
     FFmpegLogCallback? logCallback,
   }) async {
+    claimExecutionSubmission();
     // Accept the base-class typed callback for call-site compatibility;
     // wrap it into the correct MediaInformation type.
     if (completeCallback != null) {
@@ -413,7 +467,6 @@ class MediaInformationSession extends FFprobeSession {
     if (logCallback != null) {
       setLogCallback(logCallback);
     }
-    ensureRegistered();
 
     await SessionQueueManager().executeSession(this, _runAsyncMediaInfo);
     return this;
@@ -430,151 +483,58 @@ class MediaInformationSession extends FFprobeSession {
   @override
   MediaInformation? getMediaInformation() {
     FFmpegKitExtended.requireInitialized();
-    final mediaInfoHandle = ffmpeg
-        .media_information_session_get_media_information(handle);
-    if (mediaInfoHandle == nullptr) return null;
-
-    try {
-      // ---------- chapters ----------
-      final chaptersCount = ffmpeg.media_information_get_chapters_count(
-        mediaInfoHandle,
-      );
-      final chapters = <ChapterInformation>[];
-      for (int i = 0; i < chaptersCount; i++) {
-        final chapterHandle = ffmpeg.media_information_get_chapter_at(
-          mediaInfoHandle,
-          i,
-        );
-        if (chapterHandle == nullptr) continue;
-        try {
-          chapters.add(
-            ChapterInformation(
-              id: ffmpeg.chapter_get_id(chapterHandle),
-              timeBase: _str(ffmpeg.chapter_get_time_base(chapterHandle)),
-              start: ffmpeg.chapter_get_start(chapterHandle),
-              startTime: _str(ffmpeg.chapter_get_start_time(chapterHandle)),
-              end: ffmpeg.chapter_get_end(chapterHandle),
-              endTime: _str(ffmpeg.chapter_get_end_time(chapterHandle)),
-              tagsJson: _str(ffmpeg.chapter_get_tags_json(chapterHandle)),
-              allPropertiesJson: _str(
-                ffmpeg.chapter_get_all_properties_json(chapterHandle),
-              ),
+    final snapshot = ffmpegKitBackend.getMediaInformation(handle);
+    if (snapshot == null) return null;
+    return MediaInformation(
+      filename: snapshot.filename,
+      format: snapshot.format,
+      longFormat: snapshot.longFormat,
+      duration: snapshot.duration,
+      startTime: snapshot.startTime,
+      bitrate: snapshot.bitrate,
+      size: snapshot.size,
+      tagsJson: snapshot.tagsJson,
+      allPropertiesJson: snapshot.allPropertiesJson,
+      streams: snapshot.streams
+          .map(
+            (stream) => StreamInformation(
+              index: stream.index,
+              type: stream.type,
+              codec: stream.codec,
+              codecLong: stream.codecLong,
+              format: stream.format,
+              width: stream.width,
+              height: stream.height,
+              bitrate: stream.bitrate,
+              sampleRate: stream.sampleRate,
+              sampleFormat: stream.sampleFormat,
+              channelLayout: stream.channelLayout,
+              sampleAspectRatio: stream.sampleAspectRatio,
+              displayAspectRatio: stream.displayAspectRatio,
+              averageFrameRate: stream.averageFrameRate,
+              realFrameRate: stream.realFrameRate,
+              timeBase: stream.timeBase,
+              codecTimeBase: stream.codecTimeBase,
+              tagsJson: stream.tagsJson,
+              allPropertiesJson: stream.allPropertiesJson,
             ),
-          );
-        } catch (e, st) {
-          log(
-            'MediaInformationSession: error reading chapter $i',
-            error: e,
-            stackTrace: st,
-          );
-        } finally {
-          ffmpeg.ffmpeg_kit_handle_release(chapterHandle);
-        }
-      }
-
-      // ---------- streams ----------
-      final streamsCount = ffmpeg.media_information_get_streams_count(
-        mediaInfoHandle,
-      );
-      final streams = <StreamInformation>[];
-      for (int i = 0; i < streamsCount; i++) {
-        final streamHandle = ffmpeg.media_information_get_stream_at(
-          mediaInfoHandle,
-          i,
-        );
-        if (streamHandle == nullptr) continue;
-        try {
-          streams.add(
-            StreamInformation(
-              index: ffmpeg.stream_information_get_index(streamHandle),
-              type: _str(ffmpeg.stream_information_get_type(streamHandle)),
-              codec: _str(ffmpeg.stream_information_get_codec(streamHandle)),
-              codecLong: _str(
-                ffmpeg.stream_information_get_codec_long(streamHandle),
-              ),
-              format: _str(ffmpeg.stream_information_get_format(streamHandle)),
-              width: ffmpeg.stream_information_get_width(streamHandle),
-              height: ffmpeg.stream_information_get_height(streamHandle),
-              bitrate: _str(
-                ffmpeg.stream_information_get_bitrate(streamHandle),
-              ),
-              sampleRate: _str(
-                ffmpeg.stream_information_get_sample_rate(streamHandle),
-              ),
-              sampleFormat: _str(
-                ffmpeg.stream_information_get_sample_format(streamHandle),
-              ),
-              channelLayout: _str(
-                ffmpeg.stream_information_get_channel_layout(streamHandle),
-              ),
-              sampleAspectRatio: _str(
-                ffmpeg.stream_information_get_sample_aspect_ratio(streamHandle),
-              ),
-              displayAspectRatio: _str(
-                ffmpeg.stream_information_get_display_aspect_ratio(
-                  streamHandle,
-                ),
-              ),
-              averageFrameRate: _str(
-                ffmpeg.stream_information_get_average_frame_rate(streamHandle),
-              ),
-              realFrameRate: _str(
-                ffmpeg.stream_information_get_real_frame_rate(streamHandle),
-              ),
-              timeBase: _str(
-                ffmpeg.stream_information_get_time_base(streamHandle),
-              ),
-              codecTimeBase: _str(
-                ffmpeg.stream_information_get_codec_time_base(streamHandle),
-              ),
-              tagsJson: _str(
-                ffmpeg.stream_information_get_tags_json(streamHandle),
-              ),
-              allPropertiesJson: _str(
-                ffmpeg.stream_information_get_all_properties_json(streamHandle),
-              ),
+          )
+          .toList(),
+      chapters: snapshot.chapters
+          .map(
+            (chapter) => ChapterInformation(
+              id: chapter.id,
+              timeBase: chapter.timeBase,
+              start: chapter.start,
+              startTime: chapter.startTime,
+              end: chapter.end,
+              endTime: chapter.endTime,
+              tagsJson: chapter.tagsJson,
+              allPropertiesJson: chapter.allPropertiesJson,
             ),
-          );
-        } catch (e, st) {
-          log(
-            'MediaInformationSession: error reading stream $i',
-            error: e,
-            stackTrace: st,
-          );
-        } finally {
-          ffmpeg.ffmpeg_kit_handle_release(streamHandle);
-        }
-      }
-
-      return MediaInformation(
-        filename: _str(ffmpeg.media_information_get_filename(mediaInfoHandle)),
-        format: _str(ffmpeg.media_information_get_format(mediaInfoHandle)),
-        longFormat: _str(
-          ffmpeg.media_information_get_long_format(mediaInfoHandle),
-        ),
-        duration: _str(ffmpeg.media_information_get_duration(mediaInfoHandle)),
-        startTime: _str(
-          ffmpeg.media_information_get_start_time(mediaInfoHandle),
-        ),
-        bitrate: _str(ffmpeg.media_information_get_bitrate(mediaInfoHandle)),
-        size: _str(ffmpeg.media_information_get_size(mediaInfoHandle)),
-        tagsJson: _str(ffmpeg.media_information_get_tags_json(mediaInfoHandle)),
-        allPropertiesJson: _str(
-          ffmpeg.media_information_get_all_properties_json(mediaInfoHandle),
-        ),
-        streams: streams,
-        chapters: chapters,
-      );
-    } catch (e, st) {
-      log(
-        'MediaInformationSession.getMediaInformation',
-        error: e,
-        stackTrace: st,
-      );
-      rethrow;
-    } finally {
-      ffmpeg.ffmpeg_kit_handle_release(mediaInfoHandle);
-    }
+          )
+          .toList(),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -601,57 +561,102 @@ class MediaInformationSession extends FFprobeSession {
   // Private helpers
   // ---------------------------------------------------------------------------
 
+  /// Configures the media-information completion callback for sync execution.
+  @override
+  @protected
+  void configureSynchronousNativeCallbacks() {
+    // Synchronous completion is dispatched by the blocking return path and
+    // does not need a process-global native completion callback.
+  }
+
+  @override
+  @protected
+  CallbackBridgeKind get completionBridgeKind =>
+      CallbackBridgeKind.mediaInformationCompletion;
+
+  /// Invokes the blocking media-information backend operation.
+  @override
+  @protected
+  void executeSynchronously() {
+    ffmpegKitBackend.executeMediaInformationSession(handle, _timeout);
+  }
+
   /// Executes this session asynchronously and invokes the complete callback when done.
   Future<void> _runAsyncMediaInfo() async {
     FFmpegKitExtended.requireInitialized();
+    validateExecutionHandoff();
+    ensureRegistered();
     final sessionCompleter = Completer<void>();
+    trackExecution(sessionCompleter);
     final userCb = _mediaInfoCompleteCallback;
 
-    _mediaInfoCompleteCallback = (MediaInformationSession s) {
-      dispatchPendingLogs();
-      // Restore and unregister before calling user code or completing the
-      // future, so the session is fully settled from any observer's perspective.
+    var completionHandled = false;
+    void handleExecutionError(Object error, StackTrace stackTrace) {
+      if (completionHandled) return;
+      completionHandled = true;
+      clearExecutionErrorHandler();
       _mediaInfoCompleteCallback = userCb;
-      closeLogStreams();
-      unregister();
+      completeExecutionWithError(
+        completer: sessionCompleter,
+        error: error,
+        stackTrace: stackTrace,
+        cleanup: () {
+          try {
+            closeLogStreams();
+          } finally {
+            try {
+              unregister();
+            } finally {
+              releaseAllBridgeLeases();
+            }
+          }
+        },
+      );
+    }
+
+    registerExecutionErrorHandler(handleExecutionError);
+    _mediaInfoCompleteCallback = (MediaInformationSession s) {
+      if (completionHandled) return;
+      completionHandled = true;
+      clearExecutionErrorHandler();
 
       try {
-        userCb?.call(s);
+        if (hasLogDemand) dispatchPendingLogs();
       } catch (e, st) {
         log(
-          'MediaInformationSession: error in completeCallback for session '
-          '$sessionId',
+          'MediaInformationSession: error flushing logs for session $sessionId',
           error: e,
           stackTrace: st,
         );
+      } finally {
+        // Restore and unregister before calling user code or completing the
+        // future, so the session is fully settled from any observer's
+        // perspective.
+        _mediaInfoCompleteCallback = userCb;
+        try {
+          closeLogStreams();
+        } finally {
+          try {
+            unregister();
+          } finally {
+            releaseAllBridgeLeases();
+            commitTerminalHistory();
+            CallbackManager().invokeSafely(
+              'Media-information completion callback',
+              sessionId,
+              () => userCb?.call(s),
+            );
+            // Complete last — callback failures are reported separately and
+            // never prevent the execution future from settling.
+            if (!sessionCompleter.isCompleted) sessionCompleter.complete();
+          }
+        }
       }
-
-      // Complete last — everything is torn down, so any awaiter gets a fully
-      // settled session.
-      if (!sessionCompleter.isCompleted) sessionCompleter.complete();
     };
 
-    enableNativeLogCallback();
-
-    // Register the global native callback for media information completion.
     try {
-      ffmpeg
-          .ffmpeg_kit_config_enable_media_information_session_complete_callback(
-            nativeMediaInfoComplete.nativeFunction,
-            nullptr,
-          );
-    } catch (e, st) {
-      log(
-        'MediaInformationSession: error registering global callback for session ffmpeg_kit_config_enable_media_information_session_complete_callback '
-        '$sessionId',
-        error: e,
-        stackTrace: st,
-      );
-      rethrow;
-    }
-
-    try {
-      ffmpeg.media_information_session_execute_async(handle, _timeout);
+      acquireExecutionBridgeLeases();
+      ffmpegKitBackend.executeMediaInformationSessionAsync(handle, _timeout);
     } catch (e, st) {
       log(
         'MediaInformationSession: error starting async session for media_information_session_execute_async '
@@ -659,23 +664,33 @@ class MediaInformationSession extends FFprobeSession {
         error: e,
         stackTrace: st,
       );
+      clearExecutionErrorHandler();
+      _mediaInfoCompleteCallback = userCb;
       closeLogStreams();
-      unregister();
+      try {
+        unregister();
+      } finally {
+        releaseAllBridgeLeases();
+      }
       if (!sessionCompleter.isCompleted) sessionCompleter.complete();
       rethrow;
     }
 
-    try {
-      await sessionCompleter.future;
-    } catch (e, st) {
-      log(
-        'MediaInformationSession: error awaiting session '
-        '$sessionId',
-        error: e,
-        stackTrace: st,
-      );
-    }
+    await awaitMediaInformationExecution(sessionCompleter.future, sessionId);
     // No post-await restore needed — already done inside the callback above.
+  }
+
+  @override
+  void onDispose() {
+    _mediaInfoCompleteCallback = null;
+    super.onDispose();
+  }
+
+  @override
+  @protected
+  void onCancelledBeforeStart() {
+    closeLogStreams();
+    unregister();
   }
 
   /// Routes registration through [CallbackManager.registerMediaInformationSession]
@@ -686,6 +701,7 @@ class MediaInformationSession extends FFprobeSession {
   @override
   @protected
   void ensureRegistered() {
+    if (isDisposed) return;
     if (isRegistered) return;
     CallbackManager().registerMediaInformationSession(this);
     markRegistered(true);
@@ -705,19 +721,13 @@ class MediaInformationSession extends FFprobeSession {
 
   /// Unregisters this session only if no complete callback or log-delivery
   /// sink (log callback / batch stream listener) remains attached.
-  void _unregisterIfIdle() {
-    if (_mediaInfoCompleteCallback == null && !hasActiveLogDelivery) {
+  @override
+  @protected
+  void unregisterIfIdle() {
+    if (_mediaInfoCompleteCallback == null &&
+        !hasActiveLogDelivery &&
+        !hasPendingExecutionRouting) {
       unregister();
     }
-  }
-
-  /// Reads a heap-allocated C string into a Dart [String] and frees it.
-  /// Returns `null` for a null pointer.
-  static String? _str(Pointer<Char> ptr) {
-    FFmpegKitExtended.requireInitialized();
-    if (ptr == nullptr) return null;
-    final result = ptr.cast<Utf8>().toDartString();
-    ffmpeg.ffmpeg_kit_free(ptr.cast());
-    return result;
   }
 }

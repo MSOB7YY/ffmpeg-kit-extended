@@ -19,18 +19,21 @@
 
 import 'dart:async';
 import 'dart:developer';
-import 'dart:ffi';
 
-import 'package:ffi/ffi.dart';
 import 'package:meta/meta.dart';
 
 import '../ffmpeg_kit_extended_flutter.dart';
 import 'callback_manager.dart';
-import 'generated/ffmpeg_kit_bindings.dart' as ffmpeg;
+import 'platform/backend.dart';
+import 'platform/backend_selector.dart';
 
 /// A session for executing FFprobe commands.
 ///
 /// Use this class to retrieve media metadata and stream information.
+/// [execute] blocks until native execution and Dart-side cleanup complete, so
+/// terminal state and output are available when it returns. Do not use the
+/// blocking path for long work on the Flutter UI isolate. [executeAsync] is the
+/// Future-based path managed by [SessionQueueManager].
 class FFprobeSession extends Session {
   FFprobeSessionCompleteCallback? _completeCallback;
   FFmpegLogCallback? _logCallback;
@@ -43,6 +46,21 @@ class FFprobeSession extends Session {
   // Constructors
   // ---------------------------------------------------------------------------
 
+  /// Creates an in-memory FFprobe session for lifecycle tests.
+  @visibleForTesting
+  FFprobeSession.test({
+    int sessionId = 1,
+    String command = 'test',
+    FFprobeSessionCompleteCallback? completeCallback,
+    FFmpegLogCallback? logCallback,
+  }) : super.noFinalizer() {
+    handle = const SessionHandle(Object());
+    this.sessionId = sessionId;
+    this.command = command;
+    _completeCallback = completeCallback;
+    _logCallback = logCallback;
+  }
+
   /// Creates a new [FFprobeSession] for [command].
   ///
   /// - [completeCallback]: Invoked once when the command finishes.
@@ -51,57 +69,43 @@ class FFprobeSession extends Session {
     FFprobeSessionCompleteCallback? completeCallback,
   }) {
     FFmpegKitExtended.requireInitialized();
-    final cmdPtr = command.toNativeUtf8(allocator: calloc);
     try {
-      try {
-        handle = ffmpeg.ffprobe_kit_create_session(cmdPtr.cast());
-      } catch (e, st) {
-        log(
-          'FFprobeSession: error creating session ffprobe_kit_create_session $command',
-          error: e,
-          stackTrace: st,
-        );
-        rethrow;
-      }
+      final ownedHandle = ffmpegKitBackend.createFFprobeSession(command);
       this.command = command;
-      try {
-        sessionId = ffmpeg.ffmpeg_kit_session_get_session_id(handle);
-      } catch (e, st) {
-        log(
-          'FFprobeSession: error getting session id ffmpeg_kit_session_get_session_id $command',
-          error: e,
-          stackTrace: st,
-        );
-        rethrow;
-      }
-      registerFinalizer();
-    } finally {
-      calloc.free(cmdPtr);
-    }
-
-    _completeCallback = completeCallback;
-    CallbackManager().registerFFprobeSession(this);
-    _registered = true;
-  }
-
-  /// Restores an [FFprobeSession] from an existing native [handle].
-  ///
-  /// Used internally when wrapping handles from the session-history API.
-  FFprobeSession.fromHandle(Pointer<Void> handle, String command) {
-    FFmpegKitExtended.requireInitialized();
-    this.handle = handle;
-    this.command = command;
-    try {
-      sessionId = ffmpeg.ffmpeg_kit_session_get_session_id(handle);
+      adoptOwnedHandle(
+        ownedHandle,
+        readSessionId: ffmpegKitBackend.getSessionId,
+      );
     } catch (e, st) {
       log(
-        'FFprobeSession: error getting session id ffmpeg_kit_session_get_session_id $command',
+        'FFprobeSession: error creating session $command',
         error: e,
         stackTrace: st,
       );
       rethrow;
     }
-    registerFinalizer();
+
+    _completeCallback = completeCallback;
+    FFmpegKitExtended.registerCreatedSession(this);
+    if (completeCallback != null) {
+      ensureRegisteredForSinkDemand();
+    }
+  }
+
+  /// Restores an [FFprobeSession] from an existing native [handle].
+  ///
+  /// Used internally when wrapping handles from the session-history API.
+  FFprobeSession.fromHandle(Object handle, String command) {
+    FFmpegKitExtended.requireInitialized();
+    final ownedHandle = handle is SessionHandle
+        ? handle
+        : SessionHandle(handle);
+    this.command = command;
+    adoptOwnedHandle(
+      ownedHandle,
+      readSessionId: ffmpegKitBackend.getSessionId,
+      restoredSession: true,
+    );
   }
 
   /// Internal constructor used exclusively by [MediaInformationSession].
@@ -109,6 +113,11 @@ class FFprobeSession extends Session {
   /// Leaves [handle], [sessionId], and [command] uninitialised; the subclass
   /// constructor is responsible for filling them in before any method is called.
   FFprobeSession.internal() : super();
+
+  /// Internal no-finalizer constructor used by in-memory media-information
+  /// lifecycle tests.
+  @visibleForTesting
+  FFprobeSession.internalNoFinalizer() : super.noFinalizer();
 
   // ---------------------------------------------------------------------------
   // Static helpers
@@ -132,11 +141,16 @@ class FFprobeSession extends Session {
 
   /// A batched stream of buffered logs drained from the native session.
   Stream<List<Log>> get logBatchStream {
-    final controller =
-        _logBatchStreamController ??= StreamController<List<Log>>.broadcast(
+    final controller = _logBatchStreamController ??=
+        StreamController<List<Log>>.broadcast(
           onListen: () {
-            _ensureRegistered();
+            ensureRegisteredForSinkDemand();
+            _syncLogBridgeLease();
             dispatchPendingLogs();
+          },
+          onCancel: () {
+            _syncLogBridgeLease();
+            unregisterIfIdle();
           },
         );
     return controller.stream;
@@ -148,66 +162,128 @@ class FFprobeSession extends Session {
 
   /// Sets or replaces the completion callback.
   void setCompleteCallback(FFprobeSessionCompleteCallback? completeCallback) {
+    final previous = _completeCallback;
+    final hadBridgeLease = hasBridgeLease(completionBridgeKind);
     _completeCallback = completeCallback;
-    _ensureRegistered();
+    if (completeCallback == null) {
+      syncCompletionBridgeLease();
+      unregisterIfIdle();
+    } else {
+      try {
+        ensureRegisteredForSinkDemand();
+        syncCompletionBridgeLease();
+      } catch (_) {
+        _completeCallback = previous;
+        if (!hadBridgeLease) {
+          releaseBridgeLease(completionBridgeKind);
+        }
+        unregisterIfIdle();
+        rethrow;
+      }
+    }
   }
 
   /// Sets or replaces the log callback.
   void setLogCallback(FFmpegLogCallback? logCallback) {
+    final previous = _logCallback;
+    final hadBridgeLease = hasBridgeLease(CallbackBridgeKind.log);
     _logCallback = logCallback;
-    _ensureRegistered();
+    if (logCallback == null) {
+      _syncLogBridgeLease();
+      unregisterIfIdle();
+    } else {
+      try {
+        ensureRegisteredForSinkDemand();
+        _syncLogBridgeLease();
+      } catch (_) {
+        _logCallback = previous;
+        if (!hadBridgeLease) {
+          releaseBridgeLease(CallbackBridgeKind.log);
+        }
+        unregisterIfIdle();
+        rethrow;
+      }
+    }
   }
 
   /// Clears the completion callback and unregisters from [CallbackManager].
   void removeCompleteCallback() {
     _completeCallback = null;
-    _unregisterIfIdle();
+    syncCompletionBridgeLease();
+    unregisterIfIdle();
   }
 
   /// Clears the log callback.
   void removeLogCallback() {
     _logCallback = null;
-    _unregisterIfIdle();
+    _syncLogBridgeLease();
+    unregisterIfIdle();
   }
 
   // ---------------------------------------------------------------------------
   // Execution
   // ---------------------------------------------------------------------------
 
-  /// Enqueues this session for synchronous native execution and returns `this`
-  /// immediately (fire-and-forget).
+  /// Executes this session synchronously and returns only after native work and
+  /// cleanup have completed. Backend failures are rethrown after cleanup.
   FFprobeSession execute() {
-    SessionQueueManager()
-        .executeSession(this, () async {
-          FFmpegKitExtended.requireInitialized();
-          enableNativeLogCallback();
-          try {
-            ffmpeg.ffprobe_kit_session_execute(handle);
-          } catch (e, st) {
-            log(
-              'FFprobeSession.execute: error executing session ffprobe_kit_session_execute $command',
-              error: e,
-              stackTrace: st,
-            );
-            rethrow;
-          }
-          dispatchPendingLogs();
-          try {
-            _completeCallback?.call(this);
-          } catch (e, st) {
-            log('FFprobeSession.execute: error in completeCallback: $e\n$st');
-            rethrow;
-          }
-          closeLogStreams();
-          _unregister();
-        })
-        .catchError((Object e, StackTrace st) {
-          log('FFprobeSession.execute: queue error: $e\n$st');
-        });
+    claimExecutionSubmission();
+    requireInitializedForExecution();
+    ensureRegistered();
+
+    Object? primaryError;
+    StackTrace? primaryStackTrace;
+    void recordCleanupFailure(Object error, StackTrace stackTrace) {
+      if (primaryError == null) {
+        primaryError = error;
+        primaryStackTrace = stackTrace;
+      } else {
+        log(
+          'FFprobeSession.execute: cleanup failed after primary error for session $sessionId',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+    }
+
+    try {
+      _acquireOptionalBridgeLeases();
+      markExecutionStarted();
+      executeSynchronously();
+      if (_hasLogDemand) dispatchPendingLogs();
+      commitTerminalHistory();
+      CallbackManager().dispatchFFprobeComplete(sessionId);
+    } catch (error, stackTrace) {
+      primaryError = error;
+      primaryStackTrace = stackTrace;
+      log(
+        'FFprobeSession.execute: synchronous execution failed for session $sessionId',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    } finally {
+      try {
+        closeLogStreams();
+      } catch (error, stackTrace) {
+        recordCleanupFailure(error, stackTrace);
+      }
+      try {
+        unregister();
+      } catch (error, stackTrace) {
+        recordCleanupFailure(error, stackTrace);
+      } finally {
+        releaseAllBridgeLeases();
+        markExecutionSettled();
+      }
+    }
+
+    if (primaryError != null) {
+      Error.throwWithStackTrace(primaryError!, primaryStackTrace!);
+    }
     return this;
   }
 
-  /// Creates and enqueues a session for synchronous execution.
+  /// Creates and executes a session synchronously.
   static FFprobeSession executeCommand(
     String command, {
     FFprobeSessionCompleteCallback? completeCallback,
@@ -232,9 +308,9 @@ class FFprobeSession extends Session {
     FFprobeSessionCompleteCallback? completeCallback,
     FFmpegLogCallback? logCallback,
   }) async {
+    claimExecutionSubmission();
     if (completeCallback != null) _completeCallback = completeCallback;
     if (logCallback != null) _logCallback = logCallback;
-    _ensureRegistered();
 
     await SessionQueueManager().executeSession(this, _runAsync);
     return this;
@@ -288,55 +364,92 @@ class FFprobeSession extends Session {
   /// Core async execution body, called by [executeAsync] through the queue.
   Future<void> _runAsync() async {
     FFmpegKitExtended.requireInitialized();
+    validateExecutionHandoff();
+    ensureRegistered();
     final sessionCompleter = Completer<void>();
+    trackExecution(sessionCompleter);
     final userCompleteCallback = _completeCallback;
 
-    _completeCallback = (FFprobeSession s) {
-      dispatchPendingLogs();
-      // Restore and unregister before calling user code or completing the
-      // future, so the session is fully settled from any observer's perspective.
+    var completionHandled = false;
+    void handleExecutionError(Object error, StackTrace stackTrace) {
+      if (completionHandled) return;
+      completionHandled = true;
+      clearExecutionErrorHandler();
       _completeCallback = userCompleteCallback;
-      closeLogStreams();
-      _unregister();
-
-      try {
-        userCompleteCallback?.call(s);
-      } catch (e, st) {
-        log(
-          'FFprobeSession: error in completeCallback for session $sessionId: $e\n$st',
-        );
-        rethrow;
-      }
-
-      // Complete last — everything is torn down, so any awaiter gets a fully
-      // settled session.
-      if (!sessionCompleter.isCompleted) sessionCompleter.complete();
-    };
-    enableNativeLogCallback();
-    try {
-      ffmpeg.ffmpeg_kit_config_enable_ffprobe_session_complete_callback(
-        nativeFFprobeComplete.nativeFunction,
-        nullptr,
+      completeExecutionWithError(
+        completer: sessionCompleter,
+        error: error,
+        stackTrace: stackTrace,
+        cleanup: () {
+          try {
+            closeLogStreams();
+          } finally {
+            try {
+              _unregister();
+            } finally {
+              releaseAllBridgeLeases();
+            }
+          }
+        },
       );
-    } catch (e, st) {
-      log(
-        'FFprobeSession: error enabling ffprobe session complete callback $command',
-        error: e,
-        stackTrace: st,
-      );
-      rethrow;
     }
 
+    registerExecutionErrorHandler(handleExecutionError);
+    _completeCallback = (FFprobeSession s) {
+      if (completionHandled) return;
+      completionHandled = true;
+      clearExecutionErrorHandler();
+
+      try {
+        if (_hasLogDemand) dispatchPendingLogs();
+      } catch (e, st) {
+        log(
+          'FFprobeSession: error flushing logs for session $sessionId',
+          error: e,
+          stackTrace: st,
+        );
+      } finally {
+        // Restore and unregister before calling user code or completing the
+        // future, so the session is fully settled from any observer's
+        // perspective.
+        _completeCallback = userCompleteCallback;
+        try {
+          closeLogStreams();
+        } finally {
+          try {
+            _unregister();
+          } finally {
+            releaseAllBridgeLeases();
+            commitTerminalHistory();
+            CallbackManager().invokeSafely(
+              'FFprobe completion callback',
+              sessionId,
+              () => userCompleteCallback?.call(s),
+            );
+            // Complete last — callback failures are reported separately and
+            // never prevent the execution future from settling.
+            if (!sessionCompleter.isCompleted) sessionCompleter.complete();
+          }
+        }
+      }
+    };
     try {
-      ffmpeg.ffprobe_kit_session_execute_async(handle);
+      _acquireExecutionBridgeLeases();
+      ffmpegKitBackend.executeFFprobeSessionAsync(handle);
     } catch (e, st) {
       log(
         'FFprobeSession: error starting async session $sessionId',
         error: e,
         stackTrace: st,
       );
+      clearExecutionErrorHandler();
+      _completeCallback = userCompleteCallback;
       closeLogStreams();
-      _unregister();
+      try {
+        _unregister();
+      } finally {
+        releaseAllBridgeLeases();
+      }
       if (!sessionCompleter.isCompleted) sessionCompleter.complete();
       rethrow;
     }
@@ -356,13 +469,19 @@ class FFprobeSession extends Session {
   /// route registration through the correct [CallbackManager] map.
   @protected
   void ensureRegistered() {
+    if (isDisposed) return;
     if (_registered) return;
     CallbackManager().registerFFprobeSession(this);
     _registered = true;
   }
 
-  /// Backwards-compatible alias used throughout this file.
-  void _ensureRegistered() => ensureRegistered();
+  /// Registers a sink only for a pending local execution or a restored session
+  /// whose native state is currently running.
+  @protected
+  void ensureRegisteredForSinkDemand() {
+    if (isDisposed || _registered) return;
+    ensureRoutingForSinkDemand(ensureRegistered);
+  }
 
   /// Whether this session is currently registered with the [CallbackManager].
   ///
@@ -389,16 +508,16 @@ class FFprobeSession extends Session {
     }
 
     for (final logObj in batch) {
-      try {
-        CallbackManager().globalLogCallback?.call(logObj);
-        _logCallback?.call(logObj);
-      } catch (e, st) {
-        log(
-          'FFprobeSession: error dispatching log for session '
-          '$sessionId: $e\n$st',
-        );
-        rethrow;
-      }
+      CallbackManager().invokeSafely(
+        'FFprobe global log callback',
+        sessionId,
+        () => CallbackManager().globalLogCallback?.call(logObj),
+      );
+      CallbackManager().invokeSafely(
+        'FFprobe session log callback',
+        sessionId,
+        () => _logCallback?.call(logObj),
+      );
     }
   }
 
@@ -410,10 +529,7 @@ class FFprobeSession extends Session {
   @protected
   void enableNativeLogCallback() {
     try {
-      ffmpeg.ffmpeg_kit_config_enable_log_callback(
-        nativeFFmpegLog.nativeFunction,
-        nullptr,
-      );
+      ffmpegKitBackend.enableFFprobeLogCallback();
     } catch (e, st) {
       log(
         'FFprobeSession: error enabling ffmpeg log callback for session $sessionId',
@@ -422,6 +538,131 @@ class FFprobeSession extends Session {
       );
       rethrow;
     }
+  }
+
+  @protected
+  CallbackBridgeKind get completionBridgeKind =>
+      CallbackBridgeKind.ffprobeCompletion;
+
+  @protected
+  bool get hasLocalLogDemand =>
+      _logCallback != null || (_logBatchStreamController?.hasListener ?? false);
+
+  @protected
+  bool get hasLogDemand =>
+      hasLocalLogDemand || CallbackManager().globalLogCallback != null;
+
+  @protected
+  void acquireOptionalBridgeLeases() {
+    if (hasLocalLogDemand) {
+      acquireBridgeLease(
+        CallbackBridgeKind.log,
+        install: ffmpegKitBackend.configureLogCallback,
+        uninstall: ffmpegKitBackend.disableLogCallback,
+      );
+    }
+  }
+
+  @protected
+  void acquireExecutionBridgeLeases() {
+    acquireOptionalBridgeLeases();
+    final kind = completionBridgeKind;
+    acquireBridgeLease(
+      kind,
+      install: () {
+        switch (kind) {
+          case CallbackBridgeKind.ffprobeCompletion:
+            ffmpegKitBackend.configureFFprobeSessionCompleteCallback();
+          case CallbackBridgeKind.mediaInformationCompletion:
+            ffmpegKitBackend.configureMediaInformationSessionCompleteCallback();
+          default:
+            throw StateError('Unsupported FFprobe completion bridge: $kind');
+        }
+      },
+      uninstall: () {
+        switch (kind) {
+          case CallbackBridgeKind.ffprobeCompletion:
+            ffmpegKitBackend.disableFFprobeSessionCompleteCallback();
+          case CallbackBridgeKind.mediaInformationCompletion:
+            ffmpegKitBackend.disableMediaInformationSessionCompleteCallback();
+          default:
+            throw StateError('Unsupported FFprobe completion bridge: $kind');
+        }
+      },
+    );
+  }
+
+  @protected
+  void syncCompletionBridgeLease() {
+    final needsLease =
+        completeCallback != null &&
+        ((hasExecutionStarted && !hasExecutionSettled) ||
+            isRestoredObserverRunning);
+    if (needsLease) {
+      final kind = completionBridgeKind;
+      acquireBridgeLease(
+        kind,
+        install: () {
+          switch (kind) {
+            case CallbackBridgeKind.ffprobeCompletion:
+              ffmpegKitBackend.configureFFprobeSessionCompleteCallback();
+            case CallbackBridgeKind.mediaInformationCompletion:
+              ffmpegKitBackend
+                  .configureMediaInformationSessionCompleteCallback();
+            default:
+              throw StateError('Unsupported FFprobe completion bridge: $kind');
+          }
+        },
+        uninstall: () {
+          switch (kind) {
+            case CallbackBridgeKind.ffprobeCompletion:
+              ffmpegKitBackend.disableFFprobeSessionCompleteCallback();
+            case CallbackBridgeKind.mediaInformationCompletion:
+              ffmpegKitBackend.disableMediaInformationSessionCompleteCallback();
+            default:
+              throw StateError('Unsupported FFprobe completion bridge: $kind');
+          }
+        },
+      );
+    } else if (completeCallback == null ||
+        (isRestoredSession && hasTerminalCompletionBeenObserved)) {
+      releaseBridgeLease(completionBridgeKind);
+    }
+  }
+
+  @protected
+  void syncLogBridgeLease() {
+    final needsLease =
+        hasLocalLogDemand &&
+        ((hasExecutionStarted && !hasExecutionSettled) ||
+            isRestoredObserverRunning);
+    if (needsLease) {
+      acquireOptionalBridgeLeases();
+    } else if (!hasLocalLogDemand ||
+        (isRestoredSession && hasTerminalCompletionBeenObserved)) {
+      releaseBridgeLease(CallbackBridgeKind.log);
+    }
+  }
+
+  void _acquireOptionalBridgeLeases() => acquireOptionalBridgeLeases();
+
+  void _acquireExecutionBridgeLeases() => acquireExecutionBridgeLeases();
+
+  void _syncLogBridgeLease() => syncLogBridgeLease();
+
+  bool get _hasLogDemand => hasLogDemand;
+
+  /// Configures native completion callbacks for sync execution.
+  @protected
+  void configureSynchronousNativeCallbacks() {
+    // Synchronous completion is dispatched by the blocking return path and
+    // does not need a process-global native completion callback.
+  }
+
+  /// Invokes the blocking FFprobe backend operation.
+  @protected
+  void executeSynchronously() {
+    ffmpegKitBackend.executeFFprobeSession(handle);
   }
 
   /// Closes any open log stream controllers for this session.
@@ -435,6 +676,29 @@ class FFprobeSession extends Session {
     }
   }
 
+  @override
+  void onDispose() {
+    _completeCallback = null;
+    _logCallback = null;
+    closeLogStreams();
+    unregister();
+  }
+
+  @override
+  @protected
+  void onRestoredCompletionSettled() {
+    removeCompleteCallback();
+    releaseBridgeLease(completionBridgeKind);
+    releaseBridgeLease(CallbackBridgeKind.log);
+  }
+
+  @override
+  @protected
+  void onCancelledBeforeStart() {
+    closeLogStreams();
+    unregister();
+  }
+
   /// Returns `true` while any log-delivery sink (callback or batch stream
   /// listener) is still attached to this session.
   ///
@@ -443,8 +707,7 @@ class FFprobeSession extends Session {
   /// that considers inherited log-delivery state.
   @protected
   bool get hasActiveLogDelivery =>
-      _logCallback != null ||
-      (_logBatchStreamController?.hasListener ?? false);
+      _logCallback != null || (_logBatchStreamController?.hasListener ?? false);
 
   /// Unregisters this session from the callback manager.
   ///
@@ -460,11 +723,13 @@ class FFprobeSession extends Session {
   /// Backwards-compatible alias used throughout this file.
   void _unregister() => unregister();
 
-  void _unregisterIfIdle() {
+  @protected
+  void unregisterIfIdle() {
     if (_completeCallback == null &&
         _logCallback == null &&
-        !(_logBatchStreamController?.hasListener ?? false)) {
-      _unregister();
+        !(_logBatchStreamController?.hasListener ?? false) &&
+        !hasPendingExecutionRouting) {
+      unregister();
     }
   }
 }

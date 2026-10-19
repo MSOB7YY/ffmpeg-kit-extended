@@ -1,7 +1,7 @@
 {
   "name": "ffmpeg-kit-extended",
   "version": "1.0.1",
-  "description": "React Native TurboModule bindings for FFmpegKit Extended",
+  "description": "Ffmpeg-kit-extended is a comprehensive cross-platform React-Native plugin for executing FFmpeg, FFprobe, and FFplay commands",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
   "react-native": "./src/index.ts",

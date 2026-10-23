@@ -41,6 +41,10 @@ enum LogRedirectionStrategy {
   /// The integer value associated with the strategy.
   final int value;
   const LogRedirectionStrategy(this.value);
+
+  /// Returns the strategy for a native [value].
+  static LogRedirectionStrategy fromValue(int value) =>
+      values.firstWhere((strategy) => strategy.value == value);
 }
 
 /// FFmpeg log levels used for filtering or identifying log message severity.

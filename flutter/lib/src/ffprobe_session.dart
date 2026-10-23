@@ -92,6 +92,43 @@ class FFprobeSession extends Session {
     }
   }
 
+  /// Creates a new [FFprobeSession] from an explicit FFprobe argument list.
+  ///
+  /// The arguments reach FFprobe as they are, so paths with spaces or quotes
+  /// need no escaping.
+  ///
+  /// - [completeCallback]: Invoked once when the command finishes.
+  FFprobeSession.fromArguments(
+    List<String> arguments, {
+    FFprobeSessionCompleteCallback? completeCallback,
+  }) {
+    FFmpegKitExtended.requireInitialized();
+    final displayCommand = FFmpegKitExtended.argumentsToString(arguments);
+    try {
+      final ownedHandle = ffmpegKitBackend.createFFprobeSessionFromArguments(
+        arguments,
+      );
+      command = displayCommand;
+      adoptOwnedHandle(
+        ownedHandle,
+        readSessionId: ffmpegKitBackend.getSessionId,
+      );
+    } catch (e, st) {
+      log(
+        'FFprobeSession: error creating session $displayCommand',
+        error: e,
+        stackTrace: st,
+      );
+      rethrow;
+    }
+
+    _completeCallback = completeCallback;
+    FFmpegKitExtended.registerCreatedSession(this);
+    if (completeCallback != null) {
+      ensureRegisteredForSinkDemand();
+    }
+  }
+
   /// Restores an [FFprobeSession] from an existing native [handle].
   ///
   /// Used internally when wrapping handles from the session-history API.

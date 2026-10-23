@@ -20,6 +20,16 @@ Set or get the global log level for the library.
 - `logLevelToString(LogLevel)`: Converts a log-level enum to its native name,
   or returns `null` when the level is not recognized.
 
+### Console Printing
+
+Set when the logs of sessions created afterwards are also printed to the
+console (stdout, or logcat on Android). The default prints every log line of a
+session without log callbacks, so apps that only read session output use
+`LogRedirectionStrategy.neverPrintLogs`.
+
+- `setLogRedirectionStrategy(LogRedirectionStrategy)`
+- `getLogRedirectionStrategy()`
+
 ## Library Information
 
 Retrieve version and build information for FFmpeg and FFmpeg Kit.

@@ -284,6 +284,39 @@ FFmpegKitLogLevel ffmpeg_kit_config_get_log_level() {
   return FFmpegKitLogLevel.fromValue(_ffmpeg_kit_config_get_log_level());
 }
 
+/// Sets when session logs are also printed to the console (stdout, logcat on
+/// Android). Sessions created afterwards use it.
+///
+/// Defaults to printing them when no log callback is defined, which prints
+/// every line of a session nobody listens to.
+///
+/// @param strategy the strategy to use
+@ffi.Native<ffi.Void Function(ffi.UnsignedInt)>(
+  symbol: 'ffmpeg_kit_config_set_log_redirection_strategy',
+)
+external void _ffmpeg_kit_config_set_log_redirection_strategy(int strategy);
+
+void ffmpeg_kit_config_set_log_redirection_strategy(
+  FFmpegKitLogRedirectionStrategy strategy,
+) {
+  return _ffmpeg_kit_config_set_log_redirection_strategy(strategy.value);
+}
+
+/// Gets the strategy new sessions use to print their logs to the console.
+///
+/// @return the log redirection strategy
+@ffi.Native<ffi.UnsignedInt Function()>(
+  symbol: 'ffmpeg_kit_config_get_log_redirection_strategy',
+)
+external int _ffmpeg_kit_config_get_log_redirection_strategy();
+
+FFmpegKitLogRedirectionStrategy
+ffmpeg_kit_config_get_log_redirection_strategy() {
+  return FFmpegKitLogRedirectionStrategy.fromValue(
+    _ffmpeg_kit_config_get_log_redirection_strategy(),
+  );
+}
+
 /// Gets the version of FFmpegKit.
 ///
 /// @return the version of FFmpegKit

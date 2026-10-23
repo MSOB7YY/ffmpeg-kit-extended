@@ -730,6 +730,16 @@ final class WebFFmpegKitBackend implements FFmpegKitBackend {
   int getLogLevel() => bindings.ffmpeg_kit_config_get_log_level().value;
 
   @override
+  void setLogRedirectionStrategy(int strategy) => throw UnsupportedError(
+    'Log redirection strategies are not available in the Wasm runtime yet.',
+  );
+
+  @override
+  int getLogRedirectionStrategy() => throw UnsupportedError(
+    'Log redirection strategies are not available in the Wasm runtime yet.',
+  );
+
+  @override
   void enableRedirection() => bindings.ffmpeg_kit_config_enable_redirection();
 
   @override

@@ -12,9 +12,19 @@ import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 import 'package:yaml/yaml.dart';
 
+/// The builders repository whose releases hold the bundles: namida's fork, publishing the namida bundle.
+const String artifactRepository = "MSOB7YY/ffmpeg-kit-builders";
 const String _baseUrlTemplate =
-    "https://github.com/akashskypatel/ffmpeg-kit-builders/releases/download";
-const _validTypes = ['debug', 'base', 'full', 'audio', 'video', 'video_hw'];
+    "https://github.com/$artifactRepository/releases/download";
+const _validTypes = [
+  'debug',
+  'base',
+  'full',
+  'audio',
+  'video',
+  'video_hw',
+  'namida',
+];
 // This version is pinned per release. Changing this version manually may cause runtime failures. DO NOT CHANGE from official pinned version.
 const String version = "0.11.2";
 const String _extractMarkerFileName = '.extract_complete';
@@ -273,7 +283,7 @@ Future<void> stageWebRuntimeFiles({
 @visibleForTesting
 void validateWebBundleSelection(dynamic config) {
   if (artifactOverrideFor(config, 'web') != null) return;
-  final type = config['type']?.toString() ?? 'base';
+  final type = config['type']?.toString() ?? defaultBundleType;
   if (type == 'debug') {
     throw _exception(
       'The automatic prebuilt Flutter Web debug artifact is unsupported '
@@ -445,7 +455,7 @@ Future<WebRuntimeSource> _resolveWebArtifact(
     );
     return _webRuntimeSourceFromArtifact(artifact);
   } else {
-    var type = config['type']?.toString() ?? 'base';
+    var type = config['type']?.toString() ?? defaultBundleType;
     if (type == 'streaming') type = 'video';
     if (!_validTypes.contains(type)) {
       throw _exception('Invalid bundle type: $type');
@@ -754,6 +764,63 @@ Future<Directory> prepareExtractedArtifact(
   });
 }
 
+/// The release artifact of the configured bundle for [os] and [architecture].
+@visibleForTesting
+({String filename, String url}) nativeBundleArtifact({
+  required dynamic config,
+  required OS os,
+  required Architecture architecture,
+  void Function(String message)? log,
+}) {
+  String type = config['type']?.toString() ?? defaultBundleType;
+  if (type == 'streaming') type = 'video';
+  if (!_validTypes.contains(type)) {
+    throw _exception(
+      'Invalid bundle type: $type. Valid types are: ${_validTypes.join(', ')}',
+    );
+  }
+  if (type == 'full') {
+    log?.call(
+      'Full bundle is a heavyweight package and may increase your app size significantly. '
+      'Please review all included libraries to make sure you need all bundled features. '
+      'Bundle content: https://github.com/akashskypatel/ffmpeg-kit-extended#supported-external-libraries '
+      "If you don't need all the libraries included in full bundle, consider using other bundles for smaller app sizes.",
+    );
+  }
+  log?.call('Bundle: ${configDiagnosticSummary(config)}');
+  final platformName = os.name;
+  final license = config['gpl'] == true ? 'gpl' : 'lgpl';
+  final variantParts = [
+    if (type == 'debug') 'debug' else if (config['small'] == true) 'small',
+    license,
+  ];
+  final currentType = type == 'debug' ? 'base' : type;
+
+  final String filename;
+  if (os == OS.android) {
+    filename =
+        "${['bundle', currentType, 'shared', ...variantParts].join('-')}-release.aar";
+  } else if (os == OS.iOS || os == OS.macOS) {
+    filename =
+        "${['bundle', currentType, platformName, 'universal', ...variantParts].join('-')}.xcframework.zip";
+  } else {
+    final archStr = os == OS.windows
+        ? windowsArtifactArchitecture(architecture)
+        : linuxArtifactArchitecture(architecture);
+    filename =
+        "${['bundle', currentType, platformName, archStr, 'shared', ...variantParts].join('-')}.zip";
+  }
+  return (
+    filename: filename,
+    url: "$_baseUrlTemplate/v$version-$platformName/$filename",
+  );
+}
+
+/// The GitHub API url listing the assets (and their digests) of a release [tag].
+@visibleForTesting
+String releaseAssetsApiUrl(String tag) =>
+    'https://api.github.com/repos/$artifactRepository/releases/tags/$tag';
+
 Future<FFmpegArtifact?> _resolveArtifact(
   ConfigResult configResult,
   BuildInput input,
@@ -804,67 +871,14 @@ Future<FFmpegArtifact?> _resolveArtifact(
       );
     }
   } else {
-    String type = config['type']?.toString() ?? 'base';
-    if (type == 'streaming') type = 'video';
-    if (!_validTypes.contains(type)) {
-      _log(
-        'Invalid bundle type: $type. Valid types are: ${_validTypes.join(', ')}',
-      );
-      exit(1);
-    }
-    if (type == 'full') {
-      _log(
-        'Full bundle is a heavyweight package and may increase your app size significantly. '
-        'Please review all included libraries to make sure you need all bundled features. '
-        'Bundle content: https://github.com/akashskypatel/ffmpeg-kit-extended#supported-external-libraries '
-        "If you don't need all the libraries included in full bundle, consider using other bundles for smaller app sizes.",
-      );
-    }
-    final gpl = config['gpl'] == true;
-    final small = config['small'] == true;
-    _log('Bundle: ${configDiagnosticSummary(config)}');
-    final license = gpl ? 'gpl' : 'lgpl';
-    final currentType = type == 'debug' ? 'base' : type;
-
-    if (targetOS == OS.android) {
-      final parts = ['bundle', currentType, 'shared'];
-      if (type == 'debug') {
-        parts.add('debug');
-      } else if (small) {
-        parts.add('small');
-      }
-      parts.add(license);
-      final artifactId = parts.join('-');
-      filename = "$artifactId-release.aar";
-      final tag = "v$version-$platformName";
-      url = "$_baseUrlTemplate/$tag/$filename";
-    } else if (targetOS == OS.iOS || targetOS == OS.macOS) {
-      final parts = ['bundle', currentType, platformName, 'universal'];
-      if (type == 'debug') {
-        parts.add('debug');
-      } else if (small) {
-        parts.add('small');
-      }
-      parts.add(license);
-      filename = "${parts.join('-')}.xcframework.zip";
-      final tag = "v$version-$platformName";
-      url = "$_baseUrlTemplate/$tag/$filename";
-    } else {
-      // Windows, Linux
-      final archStr = targetOS == OS.windows
-          ? windowsArtifactArchitecture(targetArch)
-          : linuxArtifactArchitecture(targetArch);
-      final parts = ['bundle', currentType, platformName, archStr, 'shared'];
-      if (type == 'debug') {
-        parts.add('debug');
-      } else if (small) {
-        parts.add('small');
-      }
-      parts.add(license);
-      filename = "${parts.join('-')}.zip";
-      final tag = "v$version-$platformName";
-      url = "$_baseUrlTemplate/$tag/$filename";
-    }
+    final artifact = nativeBundleArtifact(
+      config: config,
+      os: targetOS,
+      architecture: targetArch,
+      log: _log,
+    );
+    filename = artifact.filename;
+    url = artifact.url;
   }
 
   _log('Artifact: $url');
@@ -1626,17 +1640,10 @@ Future<File> resolveRemoteOverrideToCache({
 Future<String?> _fetchSha256Hash(String url, {String? platformName}) async {
   final client = HttpClient();
   try {
-    // if github, use github api to get the file hash
-    // https://api.github.com/repos/akashskypatel/ffmpeg-kit-builders/releases/${id}
-    // https://api.github.com/repos/akashskypatel/ffmpeg-kit-builders/releases/${id}
-    // https://api.github.com/repos/akashskypatel/ffmpeg-kit-builders/releases/tags/${tag}
+    // the release api lists each asset with its sha256 digest
     final tag = "v$version-${platformName ?? targetOS.name}";
     final releaseName = p.basename(url);
-    final request = await client.getUrl(
-      Uri.parse(
-        'https://api.github.com/repos/akashskypatel/ffmpeg-kit-builders/releases/tags/$tag',
-      ),
-    );
+    final request = await client.getUrl(Uri.parse(releaseAssetsApiUrl(tag)));
     final response = await request.close();
     if (response.statusCode == 200) {
       //parse json response to extract asset url

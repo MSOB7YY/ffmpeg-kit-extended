@@ -201,6 +201,25 @@ class FFmpegKitExtended {
     return LogLevel.fromValue(ffmpegKitBackend.getLogLevel());
   }
 
+  /// Sets when the logs of sessions created afterwards are also printed to the
+  /// console (stdout, logcat on Android).
+  ///
+  /// The default prints every log line of sessions without log callbacks, so
+  /// apps that only read session output should use
+  /// [LogRedirectionStrategy.neverPrintLogs].
+  static void setLogRedirectionStrategy(LogRedirectionStrategy strategy) {
+    requireInitialized();
+    ffmpegKitBackend.setLogRedirectionStrategy(strategy.value);
+  }
+
+  /// Returns the strategy new sessions use to print their logs to the console.
+  static LogRedirectionStrategy getLogRedirectionStrategy() {
+    requireInitialized();
+    return LogRedirectionStrategy.fromValue(
+      ffmpegKitBackend.getLogRedirectionStrategy(),
+    );
+  }
+
   /// Enables process-wide redirection of FFmpeg logs to the system console.
   ///
   /// Callback bridge demand does not call this method implicitly.

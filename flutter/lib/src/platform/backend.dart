@@ -313,6 +313,10 @@ abstract interface class FFmpegKitBackend {
 
   int getLogLevel();
 
+  void setLogRedirectionStrategy(int strategy);
+
+  int getLogRedirectionStrategy();
+
   void enableRedirection();
 
   void disableRedirection();

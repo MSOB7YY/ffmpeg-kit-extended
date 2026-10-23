@@ -45,6 +45,15 @@ class FFmpegKitConfig {
   /// Gets the current global log level.
   static LogLevel getLogLevel() => FFmpegKitExtended.getLogLevel();
 
+  /// Sets when the logs of sessions created afterwards are also printed to the
+  /// console (stdout, logcat on Android).
+  static void setLogRedirectionStrategy(LogRedirectionStrategy strategy) =>
+      FFmpegKitExtended.setLogRedirectionStrategy(strategy);
+
+  /// Gets the strategy new sessions use to print their logs to the console.
+  static LogRedirectionStrategy getLogRedirectionStrategy() =>
+      FFmpegKitExtended.getLogRedirectionStrategy();
+
   /// Sets the directory for font files.
   static void setFontDirectory(String path, {String? mapping}) =>
       FFmpegKitExtended.setFontDirectory(path, mapping: mapping);

@@ -22,8 +22,11 @@ class ConfigResult {
   });
 }
 
+/// The bundle used when the app configures none, the one namida's builders fork publishes.
+const String defaultBundleType = 'namida';
+
 String configDiagnosticSummary(dynamic config) {
-  final type = config['type']?.toString() ?? 'base';
+  final type = config['type']?.toString() ?? defaultBundleType;
   final license = config['gpl'] == true ? 'GPL' : 'LGPL';
   final small = config['small'] == true;
   return '$type / $license / small=$small';
@@ -438,7 +441,7 @@ ConfigResult resolveConfig({
             'Warning: Dart Pub Workspace detected at $configRoot, but no '
             'dependent in-workspace package defines '
             'ffmpeg_kit_extended_config for $packageName. Falling back to '
-            'the default "base" '
+            'the default "$defaultBundleType" '
             'LGPL small build.',
           );
         } else {
@@ -446,8 +449,8 @@ ConfigResult resolveConfig({
             'Warning: Dart Pub Workspace detected at $configRoot, but no '
             'unique in-workspace package defines ffmpeg_kit_extended_config. '
             'Place one configuration in an in-workspace package or in '
-            '${rootPubspec.path}. Falling back to the default "base" LGPL '
-            'small build.',
+            '${rootPubspec.path}. Falling back to the default '
+            '"$defaultBundleType" LGPL small build.',
           );
         }
       } else {
@@ -483,10 +486,12 @@ ConfigResult resolveConfig({
 
   // Last resort: default configuration.
   if (!workspaceRootDetected) {
-    log('No configuration found. Using default "base" LGPL small build.');
+    log(
+      'No configuration found. Using default "$defaultBundleType" LGPL small build.',
+    );
   }
   return ConfigResult(
-    {'type': 'base', 'gpl': false, 'small': true},
+    {'type': defaultBundleType, 'gpl': false, 'small': true},
     normalizedPackageRoot,
     source: 'defaults',
   );

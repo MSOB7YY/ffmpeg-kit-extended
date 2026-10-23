@@ -226,7 +226,7 @@ ffmpeg_kit_extended_config:
       log: (_) {},
     );
 
-    expect(result.config['type'], equals('base'));
+    expect(result.config['type'], equals(defaultBundleType));
   });
 
   test('ignores configuration from a root with only a dev dependency', () {
@@ -270,7 +270,7 @@ ffmpeg_kit_extended_config:
       log: (_) {},
     );
 
-    expect(result.config['type'], equals('base'));
+    expect(result.config['type'], equals(defaultBundleType));
   });
 
   test('ignores configured packages outside the dependency closure', () {
@@ -322,7 +322,7 @@ ffmpeg_kit_extended_config:
       log: logs.add,
     );
 
-    expect(result.config['type'], equals('base'));
+    expect(result.config['type'], equals(defaultBundleType));
     expect(logs.join('\n'), contains('not package-graph roots'));
   });
 
@@ -407,13 +407,13 @@ workspace:
       log: logs.add,
     );
 
-    expect(result.config['type'], equals('base'));
+    expect(result.config['type'], equals(defaultBundleType));
     expect(result.config['gpl'], isFalse);
     expect(result.config['small'], isTrue);
     expect(logs.join('\n'), contains('Dart Pub Workspace detected'));
     expect(
       logs.join('\n'),
-      contains('Falling back to the default "base" LGPL small build.'),
+      contains('Falling back to the default "$defaultBundleType" LGPL small build.'),
     );
   });
 
@@ -453,7 +453,7 @@ ffmpeg_kit_extended_config:
       log: logs.add,
     );
 
-    expect(result.config['type'], equals('base'));
+    expect(result.config['type'], equals(defaultBundleType));
     expect(logs.join('\n'), contains('not package-graph roots'));
   });
 
@@ -524,7 +524,7 @@ ffmpeg_kit_extended_config:
       log: (_) {},
     );
 
-    expect(result.config['type'], equals('base'));
+    expect(result.config['type'], equals(defaultBundleType));
   });
 
   test('reports ambiguity when multiple workspace packages are configured', () {

@@ -692,6 +692,16 @@ final class NativeFFmpegKitBackend implements FFmpegKitBackend {
   int getLogLevel() => bindings.ffmpeg_kit_config_get_log_level().value;
 
   @override
+  void setLogRedirectionStrategy(int strategy) =>
+      bindings.ffmpeg_kit_config_set_log_redirection_strategy(
+        bindings.FFmpegKitLogRedirectionStrategy.fromValue(strategy),
+      );
+
+  @override
+  int getLogRedirectionStrategy() =>
+      bindings.ffmpeg_kit_config_get_log_redirection_strategy().value;
+
+  @override
   void enableRedirection() => bindings.ffmpeg_kit_config_enable_redirection();
 
   @override

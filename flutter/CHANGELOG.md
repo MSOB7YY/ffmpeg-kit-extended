@@ -1,5 +1,11 @@
 # FFmpegKit Extended Flutter Plugin CHANGELOG
 
+## namida fork
+
+- Downloads bundles from the builders fork (`MSOB7YY/ffmpeg-kit-builders`) and uses its `namida` bundle by default.
+- Added `FFprobeKit.createSessionFromArguments` and `FFprobeSession.fromArguments`, which pass arguments to FFprobe as they are.
+- Added `FFmpegKitConfig.setLogRedirectionStrategy` and `getLogRedirectionStrategy`, to stop printing the logs of sessions without callbacks.
+
 ## Version 1.0.0
 
 ### Added

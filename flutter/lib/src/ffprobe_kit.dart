@@ -76,6 +76,17 @@ class FFprobeKit {
       FFprobeSession(command, completeCallback: onComplete)
         ..setLogCallback(onLog);
 
+  /// Creates a new [FFprobeSession] from an explicit FFprobe argument list
+  /// without executing it. The arguments reach FFprobe as they are, so paths
+  /// with spaces or quotes need no escaping.
+  static FFprobeSession createSessionFromArguments(
+    List<String> arguments, {
+    callback_manager.FFprobeSessionCompleteCallback? onComplete,
+    callback_manager.FFmpegLogCallback? onLog,
+  }) =>
+      FFprobeSession.fromArguments(arguments, completeCallback: onComplete)
+        ..setLogCallback(onLog);
+
   /// Lists all retained FFprobe sessions in session history.
   static List<FFprobeSession> getFFprobeSessions() =>
       FFmpegKitExtended.getFFprobeSessions();

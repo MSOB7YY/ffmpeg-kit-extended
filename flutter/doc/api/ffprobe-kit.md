@@ -227,6 +227,32 @@ final session = FFprobeKit.createSession(
 
 ---
 
+### createSessionFromArguments
+
+Creates a new FFprobe session from an argument list without executing it. The
+arguments reach FFprobe as they are, so paths with spaces or quotes need no
+escaping.
+
+```dart
+static FFprobeSession createSessionFromArguments(
+  List<String> arguments, {
+  FFprobeSessionCompleteCallback? onComplete,
+  FFmpegLogCallback? onLog,
+})
+```
+
+**Example:**
+
+```dart
+final session = FFprobeKit.createSessionFromArguments(
+  ['-v', 'quiet', '-of', 'json', '-show_format', "it's a file.mp3"],
+);
+await session.executeAsync();
+print(session.getOutput());
+```
+
+---
+
 ### getFFprobeSessions
 
 Returns all retained FFprobe sessions in session history. Inspect

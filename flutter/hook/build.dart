@@ -26,7 +26,7 @@ const _validTypes = [
   'namida',
 ];
 // This version is pinned per release. Changing this version manually may cause runtime failures. DO NOT CHANGE from official pinned version.
-const String version = "0.11.2";
+const String version = "0.11.3";
 const String _extractMarkerFileName = '.extract_complete';
 const String _wasmPlatformName = 'wasm';
 const String _wasmArchitectureName = 'wasm32';
@@ -959,6 +959,24 @@ Future<FFmpegArtifact> _handleDownloadedFile(
   );
 }
 
+/// Lets the build hooks of packages depending on this one link their own
+/// native code against this FFmpeg instead of bundling a second copy. They
+/// read `input.metadata['ffmpeg_kit_extended_flutter']`:
+/// - `library_path`: `libffmpegkit` for the target (on Apple, the binary inside
+///   `ffmpegkit.framework`). It exports the whole public libav* API.
+/// - `include_directory`: the FFmpeg headers, when the bundle ships them
+///   (Windows and Linux).
+void _emitLinkMetadata(
+  BuildOutputBuilder output, {
+  required File library,
+  Directory? includeDirectory,
+}) {
+  output.metadata['library_path'] = library.absolute.path;
+  if (includeDirectory != null && includeDirectory.existsSync()) {
+    output.metadata['include_directory'] = includeDirectory.absolute.path;
+  }
+}
+
 Future<void> _emitAssets(
   FFmpegArtifact artifact,
   BuildInput input,
@@ -1008,6 +1026,8 @@ Future<void> _emitAssets(
       platform: 'Android ABI $abi',
     );
 
+    _emitLinkMetadata(output, library: mainLibrary);
+
     // Add the main library
     final mainName = p
         .basenameWithoutExtension(mainLibrary.path)
@@ -1040,6 +1060,7 @@ Future<void> _emitAssets(
       artifact: artifact,
       input: input,
     );
+    _emitLinkMetadata(output, library: runtimeLayout.frameworkBinary);
 
     output.assets.code.add(
       CodeAsset(
@@ -1112,6 +1133,11 @@ Future<void> _emitAssets(
       uniqueLibFiles,
       expectedBasename: expectedMainName,
       platform: targetOS == OS.windows ? 'Windows' : 'Linux',
+    );
+    _emitLinkMetadata(
+      output,
+      library: mainLibrary,
+      includeDirectory: Directory('${libDir.path}/include'),
     );
 
     // Add the main library

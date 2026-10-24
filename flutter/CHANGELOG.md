@@ -5,6 +5,8 @@
 - Downloads bundles from the builders fork (`MSOB7YY/ffmpeg-kit-builders`) and uses its `namida` bundle by default.
 - Added `FFprobeKit.createSessionFromArguments` and `FFprobeSession.fromArguments`, which pass arguments to FFprobe as they are.
 - Added `FFmpegKitConfig.setLogRedirectionStrategy` and `getLogRedirectionStrategy`, to stop printing the logs of sessions without callbacks.
+- The build hook passes `library_path` (and `include_directory` on Windows and Linux) to the hooks of dependent packages, so they can link their native code against the same `libffmpegkit`.
+- Uses builders 0.11.3, where the Linux and Android libraries always call their own FFmpeg, even when another FFmpeg is loaded in the same process.
 
 ## Version 1.0.0
 

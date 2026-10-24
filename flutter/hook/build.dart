@@ -34,7 +34,11 @@ const Duration _cacheLockPollInterval = Duration(milliseconds: 25);
 const Duration _cacheLockStaleAfter = Duration(minutes: 30);
 final Random _cacheTempRandom = Random();
 
-void _log(String message) => stderr.writeln('FFmpegKit [Build Hook]: $message');
+/// Off since web builds and the `flutter run` asset pass on any platform get
+/// the same hook input, so only a configured `web`/`wasm` runtime is staged.
+const bool _stageDefaultWebBundle = false;
+
+void _log(String message) => stdout.writeln('FFmpegKit [Build Hook]: $message');
 Exception _exception(Object e) => Exception('FFmpegKit [Build Hook]: $e');
 
 late final OS targetOS;
@@ -86,16 +90,8 @@ void main(List<String> args) async {
         'FFmpegKitExtended User Defines (small): ${input.userDefines['small']}',
       );
     }
-    if (!input.config.buildCodeAssets && input.config.buildAssetTypes.isEmpty) {
-      _log('Target: Web/WASM');
-      await _buildWasmAssets(input, output);
-      return;
-    }
     if (!input.config.buildCodeAssets) {
-      // Flutter can invoke a package hook for a host build with no requested
-      // asset types. There is no Web/Wasm target to stage in that invocation;
-      // selecting the shared web override here would make a macOS/iOS build
-      // depend on a host-specific Web artifact that is intentionally absent.
+      await _buildWasmAssets(input, output);
       return;
     }
     final packageName = input.packageName;
@@ -143,6 +139,9 @@ Future<void> _buildWasmAssets(
   BuildOutputBuilder output,
 ) async {
   final configResult = _loadConfig(input, output);
+  final webOverride = artifactOverrideFor(configResult.config, 'web');
+  if (webOverride == null && !_stageDefaultWebBundle) return;
+  _log('Target: Web/WASM');
   validateWebBundleSelection(configResult.config);
 
   final source = await _resolveWebArtifact(

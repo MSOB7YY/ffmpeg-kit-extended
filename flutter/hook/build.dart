@@ -26,7 +26,7 @@ const _validTypes = [
   'namida',
 ];
 // This version is pinned per release. Changing this version manually may cause runtime failures. DO NOT CHANGE from official pinned version.
-const String version = "0.11.3";
+const String version = "0.11.4";
 const String _extractMarkerFileName = '.extract_complete';
 const String _wasmPlatformName = 'wasm';
 const String _wasmArchitectureName = 'wasm32';

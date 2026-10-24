@@ -7,6 +7,7 @@
 - Added `FFmpegKitConfig.setLogRedirectionStrategy` and `getLogRedirectionStrategy`, to stop printing the logs of sessions without callbacks.
 - The build hook passes `library_path` (and `include_directory` on Windows and Linux) to the hooks of dependent packages, so they can link their native code against the same `libffmpegkit`.
 - Uses builders 0.11.3, where the Linux and Android libraries always call their own FFmpeg, even when another FFmpeg is loaded in the same process.
+- Uses builders 0.11.4, where the macOS and iOS frameworks export the FFmpeg API, so dependent packages can link against it there too.
 
 ## Version 1.0.0
 

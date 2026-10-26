@@ -8,6 +8,7 @@
 - The build hook passes `library_path` (and `include_directory` on Windows and Linux) to the hooks of dependent packages, so they can link their native code against the same `libffmpegkit`.
 - Uses builders 0.11.3, where the Linux and Android libraries always call their own FFmpeg, even when another FFmpeg is loaded in the same process.
 - Uses builders 0.11.4, where the macOS and iOS frameworks export the FFmpeg API, so dependent packages can link against it there too.
+- Uses builders 0.11.5, where the Windows DLL exports the FFmpeg API and ships an MSVC import library, and the Linux library versions its symbols so another FFmpeg in the process can't take its calls over. The build hook passes the import library as `import_library_path` on Windows.
 
 ## Version 1.0.0
 

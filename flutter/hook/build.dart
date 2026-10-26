@@ -26,7 +26,7 @@ const _validTypes = [
   'namida',
 ];
 // This version is pinned per release. Changing this version manually may cause runtime failures. DO NOT CHANGE from official pinned version.
-const String version = "0.11.4";
+const String version = "0.11.5";
 const String _extractMarkerFileName = '.extract_complete';
 const String _wasmPlatformName = 'wasm';
 const String _wasmArchitectureName = 'wasm32';
@@ -965,14 +965,19 @@ Future<FFmpegArtifact> _handleDownloadedFile(
 ///   `ffmpegkit.framework`). It exports the whole public libav* API.
 /// - `include_directory`: the FFmpeg headers, when the bundle ships them
 ///   (Windows and Linux).
+/// - `import_library_path`: the MSVC import library of the DLL (Windows).
 void _emitLinkMetadata(
   BuildOutputBuilder output, {
   required File library,
   Directory? includeDirectory,
+  File? importLibrary,
 }) {
   output.metadata['library_path'] = library.absolute.path;
   if (includeDirectory != null && includeDirectory.existsSync()) {
     output.metadata['include_directory'] = includeDirectory.absolute.path;
+  }
+  if (importLibrary != null && importLibrary.existsSync()) {
+    output.metadata['import_library_path'] = importLibrary.absolute.path;
   }
 }
 
@@ -1133,10 +1138,14 @@ Future<void> _emitAssets(
       expectedBasename: expectedMainName,
       platform: targetOS == OS.windows ? 'Windows' : 'Linux',
     );
+    final importLibrary = targetOS == OS.windows
+        ? File('${libDir.path}/lib/ffmpegkit.lib')
+        : null;
     _emitLinkMetadata(
       output,
       library: mainLibrary,
       includeDirectory: Directory('${libDir.path}/include'),
+      importLibrary: importLibrary,
     );
 
     // Add the main library

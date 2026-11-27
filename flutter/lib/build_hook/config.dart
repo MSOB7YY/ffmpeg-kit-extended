@@ -44,6 +44,7 @@ const _userDefineKeys = <String>[
   'ios',
   'macos',
   'linux',
+  'linux_arm64',
   'windows',
   'web',
   'wasm',
@@ -143,6 +144,7 @@ bool _isPlatformOverrideKey(String key) => const {
   'ios',
   'macos',
   'linux',
+  'linux_arm64',
   'windows',
   'web',
   'wasm',
@@ -150,10 +152,21 @@ bool _isPlatformOverrideKey(String key) => const {
 
 /// Selects the target's explicit source before automatic bundle selection.
 /// Web keeps `web` ahead of its `wasm` alias, including invalid empty values.
-String? artifactOverrideFor(dynamic config, String platformName) {
-  final value = platformName.contains(RegExp(r'web|wasm'))
-      ? config['web'] ?? config['wasm']
-      : config[platformName];
+/// A `<platform>_<architecture>` key (`linux_arm64`) comes before `<platform>`.
+String? artifactOverrideFor(
+  dynamic config,
+  String platformName, {
+  String? architectureName,
+}) {
+  final Object? value;
+  if (platformName.contains(RegExp(r'web|wasm'))) {
+    value = config['web'] ?? config['wasm'];
+  } else {
+    final architectureValue = architectureName == null
+        ? null
+        : config['${platformName}_$architectureName'];
+    value = architectureValue ?? config[platformName];
+  }
   if (value == null) return null;
   if (value is! String || value.trim().isEmpty) {
     throw ConfigResolutionException(

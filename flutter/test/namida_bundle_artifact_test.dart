@@ -37,6 +37,8 @@ void main() {
       ): 'v$version-windows/bundle-namida-windows-x86_64-shared-small-lgpl.zip',
       (OS.linux, Architecture.x64):
           'v$version-linux/bundle-namida-linux-x86_64-shared-small-lgpl.zip',
+      (OS.linux, Architecture.arm64):
+          'v$version-linux/bundle-namida-linux-aarch64-shared-small-lgpl.zip',
     };
     for (final MapEntry(key: (os, architecture), value: path)
         in expected.entries) {

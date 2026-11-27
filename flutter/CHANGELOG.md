@@ -9,6 +9,7 @@
 - Uses builders 0.11.3, where the Linux and Android libraries always call their own FFmpeg, even when another FFmpeg is loaded in the same process.
 - Uses builders 0.11.4, where the macOS and iOS frameworks export the FFmpeg API, so dependent packages can link against it there too.
 - Uses builders 0.11.5, where the Windows DLL exports the FFmpeg API and ships an MSVC import library, and the Linux library versions its symbols so another FFmpeg in the process can't take its calls over. The build hook passes the import library as `import_library_path` on Windows.
+- Linux arm64 builds use the `aarch64` bundle. The `linux_arm64` user define overrides the Linux bundle for arm64 only.
 
 ## Version 1.0.0
 

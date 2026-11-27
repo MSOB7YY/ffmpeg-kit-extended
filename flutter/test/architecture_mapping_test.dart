@@ -18,6 +18,7 @@ void main() {
   });
 
   test('maps supported Linux and Windows architectures explicitly', () {
+    expect(linuxArtifactArchitecture(Architecture.arm64), 'aarch64');
     expect(linuxArtifactArchitecture(Architecture.x64), 'x86_64');
     expect(windowsArtifactArchitecture(Architecture.x64), 'x86_64');
   });
@@ -78,7 +79,8 @@ void main() {
 
   test('rejects unsupported Linux and Windows architectures clearly', () {
     for (final architecture in Architecture.values) {
-      if (architecture != Architecture.x64) {
+      if (architecture != Architecture.arm64 &&
+          architecture != Architecture.x64) {
         expect(
           () => linuxArtifactArchitecture(architecture),
           throwsA(
@@ -89,6 +91,8 @@ void main() {
             ),
           ),
         );
+      }
+      if (architecture != Architecture.x64) {
         expect(
           () => windowsArtifactArchitecture(architecture),
           throwsA(
@@ -114,6 +118,10 @@ void main() {
     );
     expect(
       () => validateTargetArchitecture(OS.linux, Architecture.x64),
+      returnsNormally,
+    );
+    expect(
+      () => validateTargetArchitecture(OS.linux, Architecture.arm64),
       returnsNormally,
     );
     expect(

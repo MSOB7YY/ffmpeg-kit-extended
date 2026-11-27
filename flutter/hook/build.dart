@@ -827,7 +827,11 @@ Future<FFmpegArtifact?> _resolveArtifact(
 ) async {
   final config = configResult.config;
   final platformName = targetOS.name; // Use .name for stable keys
-  final overrideUrl = artifactOverrideFor(config, platformName);
+  final overrideUrl = artifactOverrideFor(
+    config,
+    platformName,
+    architectureName: targetArch.name,
+  );
 
   final cacheDir = Directory(
     p.fromUri(

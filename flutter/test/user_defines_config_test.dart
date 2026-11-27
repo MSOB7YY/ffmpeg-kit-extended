@@ -42,6 +42,26 @@ void main() {
     }
   });
 
+  test('an architecture override comes before the platform override', () {
+    const both = {'linux': 'x64.zip', 'linux_arm64': 'arm64.zip'};
+    expect(
+      artifactOverrideFor(both, 'linux', architectureName: 'arm64'),
+      'arm64.zip',
+    );
+    expect(
+      artifactOverrideFor(both, 'linux', architectureName: 'x64'),
+      'x64.zip',
+    );
+    expect(
+      artifactOverrideFor(
+        const {'linux': 'any.zip'},
+        'linux',
+        architectureName: 'arm64',
+      ),
+      'any.zip',
+    );
+  });
+
   test('Web alias selection rejects an empty explicit override', () {
     expect(artifactOverrideFor({'wasm': 'runtime.zip'}, 'web'), 'runtime.zip');
     expect(
@@ -148,6 +168,28 @@ void main() {
 
     expect(result!.config['ios'], equals(bundle.path));
     expect(result.configBaseDir, equals(p.normalize(workspaceRoot.path)));
+    expect(dependencies, contains(bundle.uri));
+  });
+
+  test('resolves relative local paths of architecture overrides', () {
+    final workspaceRoot = Directory(p.join(tempRoot.path, 'workspace'))
+      ..createSync();
+    final bundle = File(p.join(workspaceRoot.path, 'bundles', 'arm64.zip'))
+      ..createSync(recursive: true)
+      ..writeAsBytesSync([1, 2, 3]);
+    final dependencies = <Uri>[];
+
+    final result = resolveUserDefines(
+      read: (key) =>
+          <String, Object?>{'linux_arm64': 'bundles/arm64.zip'}[key],
+      readPath: (key) => key == 'linux_arm64' ? bundle.uri : null,
+      readBase: (_) => workspaceRoot.uri,
+      packageRoot: p.join(workspaceRoot.path, 'packages', 'ffmpeg'),
+      addDependency: dependencies.add,
+      log: (_) {},
+    );
+
+    expect(result!.config['linux_arm64'], equals(bundle.path));
     expect(dependencies, contains(bundle.uri));
   });
 

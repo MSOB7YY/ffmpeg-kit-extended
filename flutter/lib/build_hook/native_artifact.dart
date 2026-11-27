@@ -47,12 +47,14 @@ String macosArtifactArchitecture(Architecture architecture) {
 
 String linuxArtifactArchitecture(Architecture architecture) {
   switch (architecture) {
+    case Architecture.arm64:
+      return 'aarch64';
     case Architecture.x64:
       return 'x86_64';
     default:
       throw StateError(
         'Unsupported Linux target architecture "${architecture.name}"; '
-        'supported architecture: x64.',
+        'supported architectures: arm64, x64.',
       );
   }
 }
